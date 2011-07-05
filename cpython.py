@@ -11,9 +11,18 @@ MyDir = os.path.dirname(sys.argv[0])
 
 CPythonDir = MyDir + "/Python-2.7.1"
 
-# test
 import cparser
-state = cparser.parse(CPythonDir + "/Include/Python.h")
+state = cparser.State()
+state.autoSetupSystemMacros()
+
+def findIncludeFullFilename(filename, local):
+	fullfn = CPythonDir + "/Include/" + filename
+	if os.path.exists(fullfn): return fullfn
+	return filename
+
+state.findIncludeFullFilename = findIncludeFullFilename
+
+state = cparser.parse(CPythonDir + "/Modules/main.c", state)
 
 print "erros so far:"
 for m in state._errors:
