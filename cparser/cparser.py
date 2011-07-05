@@ -1201,6 +1201,7 @@ class CBody:
 		self.structs = {}
 		self.unions = {}
 		self.enums = {}
+		self.funcs = {}
 		self.vars = {}
 		self.enumconsts = {}
 		self.contentlist = []
@@ -1926,7 +1927,7 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 						stateStruct.error("cpre3 parse: unexpected '{' after " + str(curCObj))
 						curCObj = _CBaseWithOptBody(parent=parentCObj)
 				else:
-					if not parentObj.body is stateStruct: # not top level
+					if not parentCObj.body is stateStruct: # not top level
 						cpre3_parse_body(stateStruct, curCObj, input_iter)
 						curCObj.finalize(stateStruct)
 					curCObj = _CBaseWithOptBody(parent=parentCObj)
@@ -1960,9 +1961,10 @@ def cpre3_parse(stateStruct, input):
 	parentObj.body = stateStruct
 	cpre3_parse_body(stateStruct, parentObj, input_iter)
 
-def parse(filename):
-	state = State()
-	state.autoSetupSystemMacros()
+def parse(filename, state = None):
+	if state is None:
+		state = State()
+		state.autoSetupSystemMacros()
 
 	preprocessed = state.preprocess_file(filename, local=True)
 	tokens = cpre2_parse(state, preprocessed)
