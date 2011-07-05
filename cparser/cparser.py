@@ -966,6 +966,7 @@ class _CBase:
 	def asCCode(self): return self.content
 
 class CStr(_CBase):
+	def __repr__(self): return "<" + self.__class__.__name__ + " " + repr(self.content) + ">"
 	def asCCode(self): return '"' + escape_cstr(self.content) + '"'
 class CChar(_CBase):
 	def asCCode(self): return "'" + escape_cstr(self.content) + '"'
@@ -1262,7 +1263,7 @@ class _CBaseWithOptBody:
 		if t: l += [("type", t)]
 		if self.args: l += [("args", self.args)]
 		if self.arrayargs: l += [("arrayargs", self.arrayargs)]
-		if self.body is not None: l += [("body", self.body)]
+		if self.body is not None: l += [("body", "<...>")]
 		if self.value is not None: l += [("value", self.value)]
 		return \
 			self.__class__.__name__ + " " + \
@@ -1349,7 +1350,10 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None):
 				return
 	
 			if obj.name in d:
-				stateStruct.error("finalize " + obj.__class__.__name__ + " " + str(obj) + ": a previous equally named (" + obj.name + ") declaration exists")
+				# If the body is empty, it was a pre-declaration and it is ok to overwrite it now.
+				# Otherwise however, it is an error.
+				if d[obj.name].body is not None:
+					stateStruct.error("finalize " + obj.__class__.__name__ + " " + str(obj) + ": a previous equally named (" + obj.name + ") declaration exists")
 			d[obj.name] = obj
 		else:
 			assert listName is not None
@@ -1812,6 +1816,8 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 		if isinstance(token, CIdentifier):
 			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_handle_token(stateStruct, token)
+			elif isinstance(curCObj.body, CStatement):
+				curCObj.body._cpre3_handle_token(stateStruct, token)
 			elif token.content == "typedef":
 				CTypedef.overtake(curCObj)
 				cpre3_parse_typedef(stateStruct, curCObj, input_iter)
@@ -1852,6 +1858,8 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 				CStatement.overtake(curCObj)
 			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_handle_token(stateStruct, token)
+			elif isinstance(curCObj.body, CStatement) and token.content != ",":
+				curCObj.body._cpre3_handle_token(stateStruct, token)
 			else:
 				if token.content == "*":
 					if isinstance(curCObj, (CStruct,CUnion,CEnum)):
@@ -1869,15 +1877,21 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					oldObj.finalize(stateStruct)
 					if hasattr(curCObj, "bitsize"): delattr(curCObj, "bitsize")
 					curCObj.name = None
-				elif token.content == ":":
-					if curCObj:
+					curCObj.body = None
+				elif token.content == ":" and curCObj and curCObj._type_tokens and curCObj.name:
+					CVarDecl.overtake(curCObj)
+					curCObj.bitsize = None
+				elif token.content == "=" and curCObj and (isinstance(curCObj, CVarDecl) or not curCObj.isDerived()):
+					if not curCObj.isDerived():
 						CVarDecl.overtake(curCObj)
-						curCObj.bitsize = None
+					curCObj.body = CStatement(parent=curCObj)
 				else:
 					stateStruct.error("cpre3 parse: op '" + token.content + "' not expected in " + str(parentCObj) + " after " + str(curCObj))
 		elif isinstance(token, CNumber):
 			if isinstance(curCObj, CVarDecl) and hasattr(curCObj, "bitsize"):
 				curCObj.bitsize = token.content
+			elif isinstance(curCObj.body, CStatement):
+				curCObj.body._cpre3_handle_token(stateStruct, token)
 			else:
 				CStatement.overtake(curCObj)
 				curCObj._cpre3_handle_token(stateStruct, token)
@@ -1890,6 +1904,8 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					curCObj = _CBaseWithOptBody(parent=parentCObj)
 				else:
 					curCObj._cpre3_parse_brackets(stateStruct, token, input_iter)
+			elif isinstance(curCObj.body, CStatement):
+				curCObj.body._cpre3_parse_brackets(stateStruct, token, input_iter)
 			elif token.content == "(":
 				if len(curCObj._type_tokens) == 0:
 					CStatement.overtake(curCObj)
@@ -1946,6 +1962,16 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 				CVarDecl.overtake(curCObj)
 			curCObj.finalize(stateStruct)
 			curCObj = _CBaseWithOptBody(parent=parentCObj)
+		elif isinstance(token, CStr):
+			if isinstance(curCObj, CStatement):
+				curCObj._cpre3_handle_token(stateStruct, token)
+			elif isinstance(curCObj.body, CStatement):
+				curCObj.body._cpre3_handle_token(stateStruct, token)
+			elif not curCObj:
+				CStatement.overtake(curCObj)
+				curCObj._cpre3_handle_token(stateStruct, token)
+			else:
+				stateStruct.error("cpre3 parse: unexpected str " + str(token) + " after " + str(curCObj))
 		else:
 			stateStruct.error("cpre3 parse: unexpected token " + str(token))
 
