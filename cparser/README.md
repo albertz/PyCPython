@@ -4,7 +4,7 @@ PyCParser
 
 A **C** parser written in Python. Also includes an automatic ctypes interface generator.
 
-It is a bit loosely on the C grammer, i.e. it should support a superset of the C language in general.
+It is looser than the C grammar, i.e. it should support a superset of the C language in general.
 
 Some of the support may a bit incomplete or wrong at this point because I didn't really strictly followed the language specs but rather improved the parser by iteration on real-world source code.
 
@@ -39,7 +39,7 @@ TODOs / further directions
 
 * I'm quite sure that function pointer typedefs are handled incorrectly. E.g. `typedef void f();` and `typedef void (*f)();` are just the same right now. See `cpre3_parse_typedef` and do some testing if you want to fix this.
 * More testing.
-* Complete C support. Right now, most of the stuff in the function body is not really supported, i.e. function calls, expressions, if/while/for/etc control structure, and so on. Only very simple statements can be evaluated so far and it completely ignores operator priority right now. 
+* Complete C support. Right now, most of the stuff in the function body is not really supported, i.e. function calls, expressions, if/while/for/etc control structure, and so on. Only very simple statements can be evaluated so far and it completely ignores operator priority right now. Operator priority is also ignored for C preprocessor expressions. 
 * With complete C support, it is not so difficult anymore to write a C interpreter.
 * Maybe C++ support. :)
 
