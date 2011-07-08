@@ -27,3 +27,12 @@ state = cparser.parse(CPythonDir + "/Modules/main.c", state)
 print "erros so far:"
 for m in state._errors:
 	print m
+
+for f in state.contentlist:
+	if not isinstance(f, cparser.CFunc): continue
+	if not f.body: continue
+	
+	print
+	print "parsed content of " + str(f) + ":"
+	for c in f.body.contentlist:
+		print c
