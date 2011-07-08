@@ -9,14 +9,20 @@ LowercaseLetterChars = "abcdefghijklmnopqrstuvwxyz"
 LetterChars = LowercaseLetterChars + LowercaseLetterChars.upper()
 NumberChars = "0123456789"
 OpChars = "&|=!+-*/%<>^~?:,."
-LongOps = map(lambda c: c+"=", "&|=+-*/%<>^~") + ["--","++","->","<<",">>"]
+LongOps = map(lambda c: c+"=", "&|=+-*/%<>^~!") + ["--","++","->","<<",">>","&&","||"]
 OpeningBrackets = "[({"
 ClosingBrackets = "})]"
 
+# WARNING: this isn't really complete
 def simple_escape_char(c):
 	if c == "n": return "\n"
 	elif c == "t": return "\t"
-	else: return c
+	elif c == "0": return "\0"
+	elif c == "\n": return "\n"
+	else:
+		# Just to be sure so that users don't run into trouble.
+		assert False, "simple_escape_char: cannot handle " + repr(c) + " yet"
+		return c
 
 def escape_cstr(s):
 	return s.replace('"', '\\"')
@@ -122,6 +128,7 @@ class Macro:
 		self.args = args if (args is not None) else ()
 		self.rightside = rightside if (rightside is not None) else ""
 		self.defPos = state.curPosAsStr() if state else "<unknown>"
+		self._tokens = None
 	def __str__(self):
 		return "(" + ", ".join(self.args) + ") -> " + self.rightside
 	def __repr__(self):
@@ -136,11 +143,24 @@ class Macro:
 		if not isinstance(other, Macro): return False
 		return self.args == other.args and self.rightside == other.rightside
 	def __ne__(self, other): return not self == other
-	def getConstValue(self, stateStruct):
+	def _parseTokens(self, stateStruct):
 		assert len(self.args) == 0
+		if self._tokens is not None: return
 		preprocessed = stateStruct.preprocess(self.rightside, None, repr(self))
-		tokens = cpre2_parse(stateStruct, preprocessed)
+		self._tokens = list(cpre2_parse(stateStruct, preprocessed))		
+	def getSingleIdentifer(self, stateStruct):
+		assert self._tokens is not None
+		if len(self._tokens) == 1 and isinstance(self._tokens[0], CIdentifier):
+			return self._tokens[0].content
+		return None
+	def getCValue(self, stateStruct):
+		tokens = self._tokens
 		
+		if all([isinstance(t, (CIdentifier,COp)) for t in tokens]):
+			t = tuple([t.content for t in tokens])
+			if t in stateStruct.CBuiltinTypes:
+				return stateStruct.CBuiltinTypes[t].getCType(stateStruct)
+			
 		valueStmnt = CStatement()
 		input_iter = iter(tokens)
 		for token in input_iter:
@@ -299,7 +319,7 @@ class State:
 		return ":".join([l[1], str(l[2]), str(l[3])])
 	
 	def error(self, s):
-		self._errors += [self.curPosAsStr() + ": " + s]
+		self._errors.append(self.curPosAsStr() + ": " + s)
 
 	def findIncludeFullFilename(self, filename, local):
 		if local:
@@ -351,45 +371,6 @@ class State:
 		for c in cpreprocess_parse(self, reader):
 			yield c		
 		self._preprocessIncludeLevel = self._preprocessIncludeLevel[:-1]		
-
-	def getCWrapper(self, clib):
-		class CWrapper(object):
-			stateStruct = self
-			dll = clib
-			def __getattribute__(self, attrib):
-				if attrib in ("_cache","__dict__","__class__"):
-					return object.__getattribute__(self, attrib)
-				if not "_cache" in self.__dict__: self._cache = {}
-				cache = self._cache
-				if attrib in cache: return cache[attrib]
-				stateStruct = self.__class__.stateStruct
-				if attrib in stateStruct.macros and len(stateStruct.macros[attrib].args) == 0:
-					t = stateStruct.macros[attrib].getConstValue(stateStruct)
-				elif attrib in stateStruct.typedefs:
-					t = stateStruct.typedefs[attrib].getCType(stateStruct)
-				elif attrib in stateStruct.enumconsts:
-					t = stateStruct.enumconsts[attrib].value
-				elif attrib in stateStruct.funcs:
-					t = stateStruct.funcs[attrib].getCType(stateStruct)((attrib, clib))
-				else:
-					raise AttributeError, attrib + " not found in " + str(stateStruct)
-				cache[attrib] = t
-				return t
-		def iterAllAttribs():
-			for attrib in self.macros:
-				if len(self.macros[attrib].args) > 0: continue
-				yield attrib
-			for attrib in self.typedefs:
-				yield attrib
-			for attrib in self.enumconsts:
-				yield attrib
-			for attrib in self.funcs:
-				yield attrib
-		for attrib in iterAllAttribs():
-			if not hasattr(CWrapper, attrib):
-				setattr(CWrapper, attrib, None)
-		wrapper = CWrapper()
-		return wrapper
 
 def is_valid_defname(defname):
 	if not defname: return False
@@ -963,6 +944,7 @@ class _CBase:
 		return "<" + self.__class__.__name__ + " " + str(self.content) + ">"
 	def __eq__(self, other):
 		return self.__class__ is other.__class__ and self.content == other.content
+	def __hash__(self): return hash(self.__class__) + 31 * hash(self.content)
 	def asCCode(self): return self.content
 
 class CStr(_CBase):
@@ -1233,6 +1215,8 @@ def make_type_from_typetokens(stateStruct, type_tokens):
 	return t
 
 class _CBaseWithOptBody:
+	NameIsRelevant = True
+	
 	def __init__(self, **kwargs):
 		self._type_tokens = []
 		self._bracketlevel = None
@@ -1258,7 +1242,10 @@ class _CBaseWithOptBody:
 		return self.__class__ != _CBaseWithOptBody
 
 	def __str__(self):
-		name = ("'" + self.name + "'") if self.name else "<noname>"
+		if self.NameIsRelevant:
+			name = ("'" + self.name + "' ") if self.name else "<noname> "
+		else:
+			name = ("name: '" + self.name + "' ") if self.name else ""
 		t = self.type or self._type_tokens
 		l = []
 		if self.attribs: l += [("attribs", self.attribs)]
@@ -1270,7 +1257,7 @@ class _CBaseWithOptBody:
 		if self.defPos is not None: l += [("@", self.defPos)]
 		return \
 			self.__class__.__name__ + " " + \
-			name + " " + \
+			name + \
 			", ".join(map(lambda (a,b): a + ": " + str(b), l))
 
 	def __repr__(self): return "<" + str(self) + ">"
@@ -1284,7 +1271,7 @@ class _CBaseWithOptBody:
 			bool(self.arrayargs) or \
 			bool(self.body)
 	
-	def finalize(self, stateStruct, addToContent = True):
+	def finalize(self, stateStruct, addToContent = None):
 		if self._finalized:
 			stateStruct.error("internal error: " + str(self) + " finalized twice")
 			return
@@ -1293,8 +1280,11 @@ class _CBaseWithOptBody:
 			self.defPos = stateStruct.curPosAsStr()
 		if not self: return
 		
+		if addToContent is None: addToContent = True
+		
 		#print "finalize", self, "at", stateStruct.curPosAsStr()
-		if addToContent and self.parent.body: self.parent.body.contentlist += [self]
+		if addToContent and self.parent.body and hasattr(self.parent.body, "contentlist"):
+			self.parent.body.contentlist.append(self)
 	
 	def copy(self):
 		import copy
@@ -1323,13 +1313,13 @@ class CTypedef(_CBaseWithOptBody):
 	def getCType(self, stateStruct): return getCType(self.type, stateStruct)
 	
 class CFuncPointerDecl(_CBaseWithOptBody):
-	def finalize(self, stateStruct):
+	def finalize(self, stateStruct, addToContent=None):
 		if self._finalized:
 			stateStruct.error("internal error: " + str(self) + " finalized twice")
 			return
 		
 		self.type = make_type_from_typetokens(stateStruct, self._type_tokens)
-		_CBaseWithOptBody.finalize(self, stateStruct)
+		_CBaseWithOptBody.finalize(self, stateStruct, addToContent)
 		
 		if self.type is None:
 			stateStruct.error("finalize " + str(self) + ": type is unknown")
@@ -1339,15 +1329,18 @@ class CFuncPointerDecl(_CBaseWithOptBody):
 		argtypes = map(lambda a: getCType(a, stateStruct), self.args)
 		return ctypes.CFUNCTYPE(restype, *argtypes)
 		
-def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None):
+def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None, addToContent=None):
 	if obj._finalized:
 		stateStruct.error("internal error: " + str(obj) + " finalized twice")
 		return
 	
+	if addToContent is None:
+		addToContent = obj.name is not None
+
 	obj.type = make_type_from_typetokens(stateStruct, obj._type_tokens)
-	_CBaseWithOptBody.finalize(obj, stateStruct, addToContent = obj.name is not None)
+	_CBaseWithOptBody.finalize(obj, stateStruct, addToContent=addToContent)
 	
-	if hasattr(obj.parent, "body"):
+	if addToContent and hasattr(obj.parent, "body"):
 		d = getattr(obj.parent.body, dictName or listName)
 		if dictName:
 			if obj.name is None:
@@ -1357,7 +1350,7 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None):
 			# If the body is empty, it was a pre-declaration and it is ok to overwrite it now.
 			# Otherwise however, it is an error.
 			if obj.name in d and d[obj.name].body is not None:
-				stateStruct.error("finalize " + str(obj) + ": a previous equally named (" + obj.name + ") declaration exists")
+				stateStruct.error("finalize " + str(obj) + ": a previous equally named declaration exists: " + str(d[obj.name]))
 			else:
 				d[obj.name] = obj
 		else:
@@ -1396,17 +1389,17 @@ def _getCTypeStruct(baseClass, obj, stateStruct):
 	return ctype
 	
 class CStruct(_CBaseWithOptBody):
-	finalize = lambda *args: _finalizeBasicType(*args, dictName="structs")
+	finalize = lambda *args, **kwargs: _finalizeBasicType(*args, dictName="structs", **kwargs)
 	def getCType(self, stateStruct):
 		return _getCTypeStruct(ctypes.Structure, self, stateStruct)
 
 class CUnion(_CBaseWithOptBody):
-	finalize = lambda *args: _finalizeBasicType(*args, dictName="unions")
+	finalize = lambda *args, **kwargs: _finalizeBasicType(*args, dictName="unions", **kwargs)
 	def getCType(self, stateStruct):
 		return _getCTypeStruct(ctypes.Union, self, stateStruct)
 
 class CEnum(_CBaseWithOptBody):
-	finalize = lambda *args: _finalizeBasicType(*args, dictName="enums")
+	finalize = lambda *args, **kwargs: _finalizeBasicType(*args, dictName="enums", **kwargs)
 	def getNumRange(self):
 		a,b = 0,0
 		for c in self.body.contentlist:
@@ -1441,7 +1434,7 @@ class CEnum(_CBaseWithOptBody):
 		return EnumType
 	
 class CEnumConst(_CBaseWithOptBody):
-	def finalize(self, stateStruct):
+	def finalize(self, stateStruct, addToContent=None):
 		if self._finalized:
 			stateStruct.error("internal error: " + str(self) + " finalized twice")
 			return
@@ -1453,20 +1446,20 @@ class CEnumConst(_CBaseWithOptBody):
 			else:
 				self.value = 0
 
-		_CBaseWithOptBody.finalize(self, stateStruct)
+		_CBaseWithOptBody.finalize(self, stateStruct, addToContent)
 
 		if self.name:
 			# self.parent.parent is the parent of the enum
 			self.parent.parent.body.enumconsts[self.name] = self
 		
 class CFuncArgDecl(_CBaseWithOptBody):
-	def finalize(self, stateStruct):
+	def finalize(self, stateStruct, addToContent=False):
 		if self._finalized:
 			stateStruct.error("internal error: " + str(self) + " finalized twice")
 			return
-		
+			
 		self.type = make_type_from_typetokens(stateStruct, self._type_tokens)
-		_CBaseWithOptBody.finalize(self, stateStruct, addToContent = False)
+		_CBaseWithOptBody.finalize(self, stateStruct, addToContent=False)
 		
 		if self.type != CBuiltinType(CVoidType()):
 			self.parent.args += [self]
@@ -1479,8 +1472,12 @@ def _isBracketLevelOk(parentLevel, curLevel):
 	return curLevel[:len(parentLevel)] == parentLevel
 	
 class CStatement(_CBaseWithOptBody):
+	NameIsRelevant = False
+	def __nonzero__(self): return hasattr(self, "_tokens") and bool(self._tokens)
 	def __str__(self):
-		return "CStatement " + (str(self._tokens) if hasattr(self, "_tokens") else "()")
+		s = "CStatement " + (str(self._tokens) if hasattr(self, "_tokens") else "()")
+		if self.defPos is not None: s += " @: " + self.defPos
+		return s
 	def _cpre3_handle_token(self, stateStruct, token):
 		# TODO ...
 		if not hasattr(self, "_tokens"): self._tokens = []
@@ -1769,8 +1766,6 @@ def cpre3_parse_typedef(stateStruct, curCObj, input_iter):
 					else:
 						stateStruct.error("cpre3 parse in typedef: got unexpected identifier " + token.content)
 			elif token == COp("*"):
-				if typeObj is not None:
-					typeObj.finalize(stateStruct)
 				curCObj._type_tokens += ["*"]
 			elif isinstance(token, COpeningBracket):
 				curCObj._bracketlevel = list(token.brackets)
@@ -1807,7 +1802,7 @@ def cpre3_parse_typedef(stateStruct, curCObj, input_iter):
 					state = 11
 			elif isinstance(token, CSemicolon):
 				if typeObj is not None and not typeObj._finalized:
-					typeObj.finalize(stateStruct)
+					typeObj.finalize(stateStruct, addToContent = typeObj.body is not None)
 				curCObj.finalize(stateStruct)
 				return
 			else:
@@ -1824,13 +1819,15 @@ def cpre3_parse_typedef(stateStruct, curCObj, input_iter):
 	stateStruct.error("cpre3 parse typedef: incomplete, missing ';'")
 
 
-class CCodeBlock(_CBaseWithOptBody): pass
+class CCodeBlock(_CBaseWithOptBody):
+	NameIsRelevant = False
 class CGotoLabel(_CBaseWithOptBody): pass
 
-class _CControlStructure(_CBaseWithOptBody): pass
+class _CControlStructure(_CBaseWithOptBody):
+	NameIsRelevant = False
 class CForStatement(_CControlStructure):
 	Keyword = "for"
-class CDoWhileStatement(_CControlStructure):
+class CDoStatement(_CControlStructure):
 	Keyword = "do"
 class CWhileStatement(_CControlStructure):
 	Keyword = "while"
@@ -1851,7 +1848,7 @@ class CGotoStatement(_CControlStructure):
 
 CControlStructures = dict(map(lambda c: (c.Keyword, c), [
 	CForStatement,
-	CDoWhileStatement,
+	CDoStatement,
 	CWhileStatement,
 	CContinueStatement,
 	CBreakStatement,
@@ -1902,7 +1899,9 @@ def cpre3_parse_statements_in_brackets(stateStruct, parentCObj, sepToken, addToL
 
 				if not curCObj.isDerived():
 					if len(curCObj._type_tokens) == 0:
+						curCObj.name = None
 						CStatement.overtake(curCObj)
+						curCObj._cpre3_handle_token(stateStruct, token)
 					else:
 						CVarDecl.overtake(curCObj)
 		elif isinstance(token, COpeningBracket):
@@ -2032,6 +2031,15 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					curCObj = _CBaseWithOptBody(parent=parentCObj)
 				CControlStructures[token.content].overtake(curCObj)
 				curCObj.defPos = stateStruct.curPosAsStr()
+				if isinstance(curCObj, (CElseStatement,CDoStatement)):
+					curCObj._bracketlevel = list(parentCObj._bracketlevel)
+					lasttoken = cpre3_parse_single_next_statement(stateStruct, curCObj, input_iter)
+					# We finalize in any way, also for 'do'. We don't do any semantic checks here
+					# if there is a correct 'while' following or neither if the 'else' has a previous 'if'.
+					curCObj.finalize(stateStruct)
+					if isinstance(lasttoken, CClosingBracket) and lasttoken.brackets == parentCObj._bracketlevel:
+						return
+					curCObj = _CBaseWithOptBody(parent=parentCObj)					
 			elif (token.content,) in stateStruct.CBuiltinTypes:
 				curCObj._type_tokens += [token.content]
 			elif token.content in stateStruct.StdIntTypes:
@@ -2055,7 +2063,9 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 				
 				if not curCObj.isDerived():
 					if len(curCObj._type_tokens) == 0:
+						curCObj.name = None
 						CStatement.overtake(curCObj)
+						curCObj._cpre3_handle_token(stateStruct, token)
 					else:
 						CVarDecl.overtake(curCObj)					
 		elif isinstance(token, COp):
