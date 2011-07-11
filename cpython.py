@@ -34,18 +34,20 @@ def readLocalInclude(state, filename):
 			state.macros["SIZEOF_DOUBLE"] = sizeofMacro(ctypes.c_double)
 			state.macros["SIZEOF_FLOAT"] = sizeofMacro(ctypes.c_float)
 			state.macros["SIZEOF_VOID_P"] = sizeofMacro(ctypes.c_void_p)
+			state.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
 			state.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
 			state.macros["SIZEOF_PTHREAD_T"] = state.macros["SIZEOF_LONG"]
 			state.macros["SIZEOF_PID_T"] = state.macros["SIZEOF_INT"]
 			state.macros["SIZEOF_TIME_T"] = state.macros["SIZEOF_LONG"]
 			state.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
-			
 			return
 			yield None # make it a generator
 		return reader(), None
 	return cparser.State.readLocalInclude(state, filename)
 
 state.readLocalInclude = lambda fn: readLocalInclude(state, fn)
+
+state.autoSetupGlobalIncludeWrappers()
 
 state = cparser.parse(CPythonDir + "/Modules/main.c", state)
 
