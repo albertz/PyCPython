@@ -19,6 +19,8 @@ def simple_escape_char(c):
 	elif c == "t": return "\t"
 	elif c == "0": return "\0"
 	elif c == "\n": return "\n"
+	elif c == '"': return '"'
+	elif c == "'": return "'"
 	else:
 		# Just to be sure so that users don't run into trouble.
 		assert False, "simple_escape_char: cannot handle " + repr(c) + " yet"
@@ -83,7 +85,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
 				else: pass
 			elif state == 5: # escape in str
 				state = 4
-				ret += c
+				ret += simple_escape_char(c)
 			elif state == 6: # after "#"
 				if c in SpaceChars + LetterChars + "_":
 					lastidentifier = c.strip()
@@ -237,6 +239,7 @@ class State:
 		("short",): ctypes.c_short,
 		("unsigned", "short"): ctypes.c_ushort,
 		("int",): ctypes.c_int,
+		("signed",): ctypes.c_int,
 		("unsigned", "int"): ctypes.c_uint,
 		("unsigned",): ctypes.c_uint,
 		("long",): ctypes.c_long,
@@ -266,6 +269,7 @@ class State:
 		"extern",
 		"static",
 		"register",
+		"volatile",
 		"__inline__",
 	]
 	
@@ -870,6 +874,14 @@ def cpreprocess_parse(stateStruct, input):
 				elif c == "/":
 					state = 20
 					statebeforecomment = 2
+				elif c == '"':
+					state = 3
+					if arg is None: arg = ""
+					arg += c
+				elif c == "'":
+					state = 4
+					if arg is None: arg = ""
+					arg += c
 				elif c == "\\": state = 5 # escape next
 				elif c == "\n":
 					for c in handle_cpreprocess_cmd(stateStruct, cmd, arg): yield c
@@ -877,6 +889,26 @@ def cpreprocess_parse(stateStruct, input):
 				else:
 					if arg is None: cmd += c
 					else: arg += c
+			elif state == 3: # in '"' in arg in command
+				arg += c
+				if c == "\n":
+					stateStruct.error("preproc parse: unfinished str")
+					state = 0
+				elif c == "\\": state = 35
+				elif c == '"': state = 2
+			elif state == 35: # in esp in '"' in arg in command
+				arg += c
+				state = 3
+			elif state == 4: # in "'" in arg in command
+				arg += c
+				if c == "\n":
+					stateStruct.error("preproc parse: unfinished char str")
+					state = 0
+				elif c == "\\": state = 45
+				elif c == "'": state = 2
+			elif state == 45: # in esp in "'" in arg in command
+				arg += c
+				state = 4
 			elif state == 5: # after escape in arg in command
 				if c == "\n": state = 2
 				else: pass # ignore everything, wait for newline
@@ -934,8 +966,8 @@ def cpreprocess_parse(stateStruct, input):
 		else: stateStruct.incIncludeLineChar(char=1)
 
 class _CBase:
-	def __init__(self, data=None, rawstr=None, **kwargs):
-		self.content = data
+	def __init__(self, content=None, rawstr=None, **kwargs):
+		self.content = content
 		self.rawstr = rawstr
 		for k,v in kwargs.iteritems():
 			setattr(self, k, v)
@@ -1069,7 +1101,7 @@ def cpre2_parse(stateStruct, input, brackets = None):
 						state = 0
 						breakLoop = False
 			elif state == 31: # after macro identifier
-				if c in SpaceChars + "\n": pass
+				if not macrobrackets and c in SpaceChars + "\n": pass
 				elif c in OpeningBrackets:
 					if len(macrobrackets) == 0 and c != "(":
 						state = 32
@@ -1216,6 +1248,7 @@ def make_type_from_typetokens(stateStruct, type_tokens):
 
 class _CBaseWithOptBody:
 	NameIsRelevant = True
+	AutoAddToContent = True
 	
 	def __init__(self, **kwargs):
 		self._type_tokens = []
@@ -1280,7 +1313,7 @@ class _CBaseWithOptBody:
 			self.defPos = stateStruct.curPosAsStr()
 		if not self: return
 		
-		if addToContent is None: addToContent = True
+		if addToContent is None: addToContent = self.AutoAddToContent
 		
 		#print "finalize", self, "at", stateStruct.curPosAsStr()
 		if addToContent and self.parent.body and hasattr(self.parent.body, "contentlist"):
@@ -1453,6 +1486,7 @@ class CEnumConst(_CBaseWithOptBody):
 			self.parent.parent.body.enumconsts[self.name] = self
 		
 class CFuncArgDecl(_CBaseWithOptBody):
+	AutoAddToContent = False	
 	def finalize(self, stateStruct, addToContent=False):
 		if self._finalized:
 			stateStruct.error("internal error: " + str(self) + " finalized twice")
@@ -1470,27 +1504,170 @@ def _isBracketLevelOk(parentLevel, curLevel):
 	if parentLevel is None: parentLevel = []
 	if len(parentLevel) > len(curLevel): return False
 	return curLevel[:len(parentLevel)] == parentLevel
-	
+
+def _body_parent_chain(stateStruct, parentCObj):
+	yieldedStateStruct = False
+
+	for cobj in _obj_parent_chain(stateStruct, parentCObj):
+		body = cobj.body
+		if isinstance(body, CBody):
+			yieldedStateStruct |= body is stateStruct
+			yield body
+
+	if not yieldedStateStruct: yield stateStruct
+
+def _obj_parent_chain(stateStruct, parentCObj):
+	while parentCObj is not None:
+		yield parentCObj
+		parentCObj = parentCObj.parent
+		
+def getObjInBody(body, name):
+	if name in body.funcs:
+		return body.funcs[name]
+	elif name in body.typedefs:
+		return body.typedefs[name]
+	elif name in body.vars:
+		return body.vars[name]
+	elif name in body.enumconsts:
+		return body.enumconsts[name]
+	elif (name,) in getattr(body, "CBuiltinTypes", {}):
+		return body.CBuiltinTypes[(name,)]
+	elif name in getattr(body, "StdIntTypes", {}):
+		return body.StdIntTypes[name]
+	return None
+
+def findObjInNamespace(stateStruct, curCObj, name):
+	for cobj in _obj_parent_chain(stateStruct, curCObj):
+		if isinstance(cobj.body, (CBody,State)):
+			obj = getObjInBody(cobj.body, name)
+			if obj is not None: return obj
+		if isinstance(cobj, CFunc):
+			for arg in cobj.args:
+				assert isinstance(arg, CFuncArgDecl)
+				if arg.name is not None and arg.name == name:
+					return arg
+	return None
+
+class CFuncCall(_CBaseWithOptBody):
+	AutoAddToContent = False
+	base = None
+	def __nonzero__(self): return self.base is not None
+	def __str__(self): return self.__class__.__name__ + " " + str(self.base) + " " + str(self.args)
+
+class CArrayIndexRef(_CBaseWithOptBody):
+	AutoAddToContent = False
+	base = None
+	def __nonzero__(self): return self.base is not None
+	def __str__(self): return self.__class__.__name__ + " " + str(self.base) + " " + str(self.args)	
+
 class CStatement(_CBaseWithOptBody):
 	NameIsRelevant = False
 	def __nonzero__(self): return hasattr(self, "_tokens") and bool(self._tokens)
 	def __str__(self):
-		s = "CStatement " + (str(self._tokens) if hasattr(self, "_tokens") else "()")
+		s = self.__class__.__name__ + " " + (str(self._tokens) if hasattr(self, "_tokens") else "()")
 		if self.defPos is not None: s += " @: " + self.defPos
 		return s
+	def _initStatement(self):
+		self._state = 0
+		self._tokens = []
+		self._leftexpr = []
+		self._op = None
+		self._prefixOps = []
+	def __init__(self, **kwargs):
+		_CBaseWithOptBody.__init__(self, **kwargs)
+		self._initStatement()
+	@classmethod
+	def overtake(cls, obj):
+		obj.__class__ = cls
+		obj._initStatement()
 	def _cpre3_handle_token(self, stateStruct, token):
-		# TODO ...
-		if not hasattr(self, "_tokens"): self._tokens = []
 		self._tokens += [token]
+		
+		obj = None
+		if self._state == 0:
+			if isinstance(token, (CIdentifier,CNumber,CStr,CChar)):
+				if isinstance(token, CIdentifier):
+					if token.content == "struct":
+						self._state = 1
+						return
+					elif token.content == "union":
+						self._state = 2
+						return
+					elif token.content == "enum":
+						self._state = 3
+						return
+					else:
+						obj = findObjInNamespace(stateStruct, self.parent, token.content)
+						if obj is None:
+							stateStruct.error("statement parsing: identifier '" + token.content + "' unknown")
+							obj = CUnknownType(name=token.content)
+				else:
+					obj = token
+				self._leftexpr = obj
+				self._state = 5
+			elif isinstance(token, COp):
+				self._prefixOps += [token]
+			else:
+				stateStruct.error("statement parsing: didn't expected token " + str(token))
+		elif self._state in (1,2,3): # struct,union,enum
+			TName = {1:"struct", 2:"union", 3:"enum"}[self._state]
+			DictName = TName + "s"
+			if isinstance(token, CIdentifier):
+				for body in _body_parent_chain(stateStruct, self.parent):
+					d = getattr(body, DictName)
+					if token.content in d:
+						obj = d[token.content]
+						break
+				if obj is None:
+					stateStruct.error("statement parsing: " + TName + " '" + token.content + "' unknown")
+					obj = CUnknownType(name=token.content)
+				self._leftexpr = obj
+				self._state = 10
+			else:
+				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + TName)
+		elif self._state == 5: # after expr
+			if isinstance(token, COp):
+				self._op = token
+				self._state = 6
+			elif isinstance(self._leftexpr, CStr) and isinstance(token, CStr):
+				self._leftexpr = CStr(self._leftexpr.content + token.content)
+			else:
+				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + str(self._leftexpr))
+		elif self._state == 6: # after expr + op
+			pass
+		# TODO ...
 	def _cpre3_parse_brackets(self, stateStruct, openingBracketToken, input_iter):
-		subStatement = CStatement(parent=self.parent)
+		if self._state == 5: # after expr
+			ref = self._leftexpr
+			if openingBracketToken.content == "(":
+				funcCall = CFuncCall(parent=self)
+			elif openingBracketToken.content == "[":
+				funcCall = CArrayIndexRef(parent=self)
+			else:
+				stateStruct.error("cpre3 statement parse brackets after expr: didn't expected opening bracket '" + openingBracketToken.content + "'")
+				# fallback. handle just like '('
+				funcCall = CStatement(parent=self.parent)
+			funcCall.base = ref
+			funcCall._bracketlevel = list(openingBracketToken.brackets)
+			self._leftexpr = funcCall
+			cpre3_parse_statements_in_brackets(stateStruct, funcCall, COp(","), funcCall.args, input_iter)
+			funcCall.finalize(stateStruct)
+			return
+
+		if openingBracketToken.content == "(":
+			subStatement = CStatement(parent=self.parent)
+		elif openingBracketToken.content == "[":
+			subStatement = CArrayStatement(parent=self.parent)
+		else:
+			stateStruct.error("cpre3 statement parse brackets: didn't expected opening bracket '" + openingBracketToken.content + "'")
+			# fallback. handle just like '('
+			subStatement = CStatement(parent=self.parent)			
 		for token in input_iter:
 			if isinstance(token, COpeningBracket):
 				subStatement._cpre3_parse_brackets(stateStruct, token, input_iter)
 			elif isinstance(token, CClosingBracket):
 				if token.brackets == openingBracketToken.brackets:
-					subStatement.finalize(stateStruct)
-					if not hasattr(self, "_tokens"): self._tokens = []
+					subStatement.finalize(stateStruct, addToContent=False)
 					self._tokens += [subStatement]
 					return
 				else:
@@ -1534,6 +1711,9 @@ class CStatement(_CBaseWithOptBody):
 		
 	def getConstValue(self, stateStruct):
 		return self._tokensToConstValue(self._tokens if hasattr(self, "_tokens") else [], stateStruct)
+
+# only real difference is that this is inside of '[]'
+class CArrayStatement(CStatement): pass
 	
 def cpre3_parse_struct(stateStruct, curCObj, input_iter):
 	curCObj.body = CBody(parent=curCObj.parent.body)
@@ -1843,8 +2023,12 @@ class CSwitchStatement(_CControlStructure):
 	Keyword = "switch"
 class CCaseStatement(_CControlStructure):
 	Keyword = "case"
+class CCaseDefaultStatement(_CControlStructure):
+	Keyword = "default"
 class CGotoStatement(_CControlStructure):
 	Keyword = "goto"
+class CReturnStatement(_CControlStructure):
+	Keyword = "return"
 
 CControlStructures = dict(map(lambda c: (c.Keyword, c), [
 	CForStatement,
@@ -1856,7 +2040,9 @@ CControlStructures = dict(map(lambda c: (c.Keyword, c), [
 	CElseStatement,
 	CSwitchStatement,
 	CCaseStatement,
+	CCaseDefaultStatement,
 	CGotoStatement,
+	CReturnStatement,
 	]))
 
 def cpre3_parse_statements_in_brackets(stateStruct, parentCObj, sepToken, addToList, input_iter):
@@ -1956,6 +2142,30 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 				curCObj = CStatement(parent=parentCObj)
 			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_parse_brackets(stateStruct, token, input_iter)
+			elif curCObj is not None and isinstance(curCObj.body, CStatement):
+				curCObj.body._cpre3_parse_brackets(stateStruct, token, input_iter)
+			elif isinstance(curCObj, _CControlStructure):
+				curCObj._bracketlevel = list(token.brackets)
+				if token.content == "(":
+					cpre3_parse_statements_in_brackets(stateStruct, curCObj, sepToken=CSemicolon(), addToList=curCObj.args, input_iter=input_iter)
+					curCObj._bracketlevel = list(parentCObj._bracketlevel)
+					lasttoken = cpre3_parse_single_next_statement(stateStruct, curCObj, input_iter)
+					curCObj.finalize(stateStruct)
+					return lasttoken
+				elif token.content == "[":
+					stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got unexpected '['")
+					cpre3_parse_skipbracketcontent(stateStruct, list(token.brackets), input_iter)
+					return
+				elif token.content == "{":
+					if curCObj.body is not None:
+						stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got multiple bodies")
+					cpre3_parse_body(stateStruct, curCObj, input_iter)
+					curCObj.finalize(stateStruct)
+					return
+				else:
+					stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got unexpected/unknown opening bracket '" + token.content + "'")
+					cpre3_parse_skipbracketcontent(stateStruct, list(token.brackets), input_iter)
+					return
 			else:
 				stateStruct.error("cpre3 parse single: unexpected opening bracket '" + token.content + "' after " + str(curCObj))
 		elif isinstance(token, CClosingBracket):
@@ -1968,10 +2178,32 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 			if curCObj is not None:
 				curCObj.finalize(stateStruct)
 			return token
+		elif curCObj is None and isinstance(token, CIdentifier) and token.content in CControlStructures:
+			curCObj = CControlStructures[token.content](parent=parentCObj)
+			curCObj.defPos = stateStruct.curPosAsStr()
+			if isinstance(curCObj, (CElseStatement,CDoStatement)):
+				curCObj._bracketlevel = list(parentCObj._bracketlevel)
+				lasttoken = cpre3_parse_single_next_statement(stateStruct, curCObj, input_iter)
+				# We finalize in any way, also for 'do'. We don't do any semantic checks here
+				# if there is a correct 'while' following or neither if the 'else' has a previous 'if'.
+				curCObj.finalize(stateStruct)
+				return lasttoken
+			elif isinstance(curCObj, CReturnStatement):
+				curCObj.body = CStatement(parent=curCObj)
+		elif isinstance(curCObj, CGotoStatement):
+			if curCObj.name is None:
+				curCObj.name = token.content
+			else:
+				stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got second identifier '" + token.content + "'")
+		elif isinstance(curCObj, CStatement):
+			curCObj._cpre3_handle_token(stateStruct, token)
+		elif curCObj is not None and isinstance(curCObj.body, CStatement):
+			curCObj.body._cpre3_handle_token(stateStruct, token)
+		elif isinstance(curCObj, _CControlStructure):
+			stateStruct.error("cpre3 parse after " + str(curCObj) + ": didn't expected identifier '" + token.content + "'")
 		else:
 			if curCObj is None:
 				curCObj = CStatement(parent=parentCObj)
-			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_handle_token(stateStruct, token)
 			else:
 				stateStruct.error("cpre3 parse single: got unexpected token " + str(token))
@@ -2039,7 +2271,9 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					curCObj.finalize(stateStruct)
 					if isinstance(lasttoken, CClosingBracket) and lasttoken.brackets == parentCObj._bracketlevel:
 						return
-					curCObj = _CBaseWithOptBody(parent=parentCObj)					
+					curCObj = _CBaseWithOptBody(parent=parentCObj)
+				elif isinstance(curCObj, CReturnStatement):
+					curCObj.body = CStatement(parent=curCObj)
 			elif (token.content,) in stateStruct.CBuiltinTypes:
 				curCObj._type_tokens += [token.content]
 			elif token.content in stateStruct.StdIntTypes:
@@ -2069,16 +2303,23 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					else:
 						CVarDecl.overtake(curCObj)					
 		elif isinstance(token, COp):
-			if len(curCObj._type_tokens) == 0:
+			if (not curCObj.isDerived() or isinstance(curCObj, CVarDecl)) and len(curCObj._type_tokens) == 0:
 				CStatement.overtake(curCObj)
 			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_handle_token(stateStruct, token)
 			elif isinstance(curCObj.body, CStatement) and token.content != ",":
 				curCObj.body._cpre3_handle_token(stateStruct, token)
-			elif token.content != ":" and isinstance(curCObj, CCaseStatement):
-				if not curCObj.args or not isinstance(curCObj.args[-1], CStatement):
-					curCObj.args.append(CStatement(parent=parentCObj))
-				curCObj.args[-1]._cpre3_handle_token(stateStruct, token)
+			elif isinstance(curCObj, CCaseStatement):
+				if token.content == ":":
+					curCObj.finalize(stateStruct)
+					curCObj = _CBaseWithOptBody(parent=parentCObj)
+				else:
+					if not curCObj.args or not isinstance(curCObj.args[-1], CStatement):
+						curCObj.args.append(CStatement(parent=parentCObj))
+					curCObj.args[-1]._cpre3_handle_token(stateStruct, token)
+			elif isinstance(curCObj, CCaseDefaultStatement) and token.content == ":":
+				curCObj.finalize(stateStruct)
+				curCObj = _CBaseWithOptBody(parent=parentCObj)
 			elif isinstance(curCObj, _CControlStructure):
 				stateStruct.error("cpre3 parse after " + str(curCObj) + ": didn't expected op '" + token.content + "'")
 			else:
@@ -2099,9 +2340,6 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					if hasattr(curCObj, "bitsize"): delattr(curCObj, "bitsize")
 					curCObj.name = None
 					curCObj.body = None
-				elif token.content == ":" and isinstance(curCObj, CCaseStatement):
-					curCObj.finalize(stateStruct)
-					curCObj = _CBaseWithOptBody(parent=parentCObj)					
 				elif token.content == ":" and curCObj and curCObj._type_tokens and curCObj.name:
 					CVarDecl.overtake(curCObj)
 					curCObj.bitsize = None
