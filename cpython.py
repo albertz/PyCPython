@@ -36,3 +36,11 @@ for f in state.contentlist:
 	print "parsed content of " + str(f) + ":"
 	for c in f.body.contentlist:
 		print c
+
+import cparser.interpreter
+
+r = cparser.interpreter.Interpreter()
+r.register(state)
+
+r.runFunc("Py_Main", len(sys.argv), sys.argv)
+
