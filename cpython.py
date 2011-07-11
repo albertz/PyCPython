@@ -22,6 +22,31 @@ def findIncludeFullFilename(filename, local):
 
 state.findIncludeFullFilename = findIncludeFullFilename
 
+def readLocalInclude(state, filename):
+	if filename == "pyconfig.h":
+		def reader():
+			import ctypes
+			sizeofMacro = lambda t: cparser.Macro(rightside=str(ctypes.sizeof(t)))
+			state.macros["SIZEOF_SHORT"] = sizeofMacro(ctypes.c_short)
+			state.macros["SIZEOF_INT"] = sizeofMacro(ctypes.c_int)
+			state.macros["SIZEOF_LONG"] = sizeofMacro(ctypes.c_long)
+			state.macros["SIZEOF_LONG_LONG"] = sizeofMacro(ctypes.c_longlong)
+			state.macros["SIZEOF_DOUBLE"] = sizeofMacro(ctypes.c_double)
+			state.macros["SIZEOF_FLOAT"] = sizeofMacro(ctypes.c_float)
+			state.macros["SIZEOF_VOID_P"] = sizeofMacro(ctypes.c_void_p)
+			state.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
+			state.macros["SIZEOF_PTHREAD_T"] = state.macros["SIZEOF_LONG"]
+			state.macros["SIZEOF_PID_T"] = state.macros["SIZEOF_INT"]
+			state.macros["SIZEOF_TIME_T"] = state.macros["SIZEOF_LONG"]
+			state.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
+			
+			return
+			yield None # make it a generator
+		return reader(), None
+	return cparser.State.readLocalInclude(state, filename)
+
+state.readLocalInclude = lambda fn: readLocalInclude(state, fn)
+
 state = cparser.parse(CPythonDir + "/Modules/main.c", state)
 
 print "erros so far:"
