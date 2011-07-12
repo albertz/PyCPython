@@ -51,6 +51,7 @@ OpPrecedences = {
 	"&&": 13,
 	"||": 14,
 	"?": 15, # a ? b : c
+	"?:": 15, # this is the internal op representation when we have got all three sub nodes
 	"=": 16,
 	"+=": 16,
 	"-=": 16,
@@ -1365,6 +1366,13 @@ def make_type_from_typetokens(stateStruct, type_tokens):
 class _CBaseWithOptBody:
 	NameIsRelevant = True
 	AutoAddToContent = True
+	StrOutAttribList = [
+		("args", bool, None, str),
+		("arrayargs", bool, None, str),
+		("body", None, None, lambda x: "<...>"),
+		("value", None, None, str),
+		("defPos", None, "@", str),
+	]
 	
 	def __init__(self, **kwargs):
 		self._type_tokens = []
@@ -1399,11 +1407,12 @@ class _CBaseWithOptBody:
 		l = []
 		if self.attribs: l += [("attribs", self.attribs)]
 		if t: l += [("type", t)]
-		if self.args: l += [("args", self.args)]
-		if self.arrayargs: l += [("arrayargs", self.arrayargs)]
-		if self.body is not None: l += [("body", "<...>")]
-		if self.value is not None: l += [("value", self.value)]
-		if self.defPos is not None: l += [("@", self.defPos)]
+		for attrName,addCheck,displayName,displayFunc in self.StrOutAttribList:
+			a = getattr(self, attrName)
+			if addCheck is None: addCheck = lambda x: x is not None
+			if addCheck(a):
+				if displayName is None: displayName = attrName
+				l += [(displayName, displayFunc(a))]
 		return \
 			self.__class__.__name__ + " " + \
 			name + \
@@ -1692,6 +1701,8 @@ def _create_cast_call(stateStruct, parent, base, token):
 	return funcCall
 
 def opsDoLeftToRight(stateStruct, op1, op2):
+	if op1 == "?": return False
+	
 	try: opprec1 = OpPrecedences[op1]
 	except:
 		stateStruct.error("internal error: statement parsing: op " + op1 + " unknown")
@@ -1716,11 +1727,18 @@ def getConstValue(stateStruct, obj):
 
 class CStatement(_CBaseWithOptBody):
 	NameIsRelevant = False
+	_leftexpr = None
+	_middleexpr = None
+	_rightexpr = None
+	_op = None
 	def __nonzero__(self): return bool(self._leftexpr) or bool(self._rightexpr)
 	def __repr__(self):
 		s = self.__class__.__name__
 		if self._leftexpr is not None: s += " " + repr(self._leftexpr)
-		if self._rightexpr is not None:
+		if self._op == COp("?:"):
+			s += " ? " + repr(self._middleexpr)
+			s += " : " + repr(self._rightexpr)
+		elif self._rightexpr is not None:
 			s += " "
 			s += str(self._op) if self._op is not None else "<None>"
 			s += " "
@@ -1731,9 +1749,6 @@ class CStatement(_CBaseWithOptBody):
 	def _initStatement(self):
 		self._state = 0
 		self._tokens = []
-		self._leftexpr = None
-		self._op = None
-		self._rightexpr = None
 		self._prefixOps = []
 	def __init__(self, **kwargs):
 		self._initStatement()
@@ -1823,11 +1838,13 @@ class CStatement(_CBaseWithOptBody):
 			elif token == COp("->"):
 				self._state = 22
 				self._rightexpr = CPtrAccessRef(parent=self, base=self._rightexpr)
-			elif self._op == COp("?"):
-				# TODO ...
-				pass
 			elif isinstance(token, COp):
-				if opsDoLeftToRight(stateStruct, self._op.content, token.content):
+				if self._op == COp("?") and token == COp(":"):
+					self._middleexpr = self._rightexpr
+					self._rightexpr = None
+					self._op = COp("?:")
+					self._state = 6
+				elif opsDoLeftToRight(stateStruct, self._op.content, token.content):
 					import copy
 					subStatement = copy.copy(self)
 					self._leftexpr = subStatement
@@ -1939,13 +1956,16 @@ class CStatement(_CBaseWithOptBody):
 	def getConstValue(self, stateStruct):
 		if self._leftexpr is None: # prefixed only
 			func = OpPrefixFuncs[self._op.content]
-			v = getConstValue(self._rightexpr)
+			v = getConstValue(stateStruct, self._rightexpr)
 			return func(v)
 		if self._op is None or self._rightexpr is None:
-			return getConstValue(self._leftexpr)
+			return getConstValue(stateStruct, self._leftexpr)
+		v1 = getConstValue(stateStruct, self._leftexpr)
+		v2 = getConstValue(stateStruct, self._rightexpr)
 		func = OpBinFuncs[self._op.content]
-		v1 = getConstValue(self._leftexpr)
-		v2 = getConstValue(self._rightexpr)
+		if self._op == COp("?:"):
+			v15 = getConstValue(stateStruct, self._middleexpr)
+			return func(v1, v15, v2)
 		return func(v1, v2)
 			
 # only real difference is that this is inside of '[]'
@@ -2241,20 +2261,82 @@ class CGotoLabel(_CBaseWithOptBody): pass
 
 class _CControlStructure(_CBaseWithOptBody):
 	NameIsRelevant = False
+	StrOutAttribList = [
+		("args", bool, None, str),
+		("body", None, None, lambda x: "<...>"),
+		("defPos", None, "@", str),
+	]
 class CForStatement(_CControlStructure):
 	Keyword = "for"
 class CDoStatement(_CControlStructure):
 	Keyword = "do"
+	StrOutAttribList = [
+		("body", None, None, lambda x: "<...>"),
+		("whilePart", None, None, repr),
+		("defPos", None, "@", str),
+	]
+	whilePart = None
 class CWhileStatement(_CControlStructure):
 	Keyword = "while"
+	def finalize(self, stateStruct, addToContent = None):
+		if self._finalized:
+			stateStruct.error("internal error: " + str(self) + " finalized twice")
+			return
+		assert self.parent is not None
+
+		if isinstance(self.parent.body, CBody) and self.parent.body.contentlist:
+			last = self.parent.body.contentlist[-1]
+			if isinstance(last, CDoStatement):
+				if self.body is not None:
+					stateStruct.error("'while' " + str(self) + " as part of 'do' " + str(last) + " has another body")
+				last.whilePart = self
+				addToContent = False
+
+		_CControlStructure.finalize(self, stateStruct, addToContent)			
 class CContinueStatement(_CControlStructure):
 	Keyword = "continue"
 class CBreakStatement(_CControlStructure):
 	Keyword = "break"
 class CIfStatement(_CControlStructure):
 	Keyword = "if"
+	StrOutAttribList = [
+		("args", bool, None, str),
+		("body", None, None, lambda x: "<...>"),
+		("elsePart", None, None, repr),
+		("defPos", None, "@", str),
+	]
+	elsePart = None
 class CElseStatement(_CControlStructure):
 	Keyword = "else"
+	def finalize(self, stateStruct, addToContent = False):
+		if self._finalized:
+			stateStruct.error("internal error: " + str(self) + " finalized twice")
+			return
+		assert self.parent is not None
+
+		base = self.parent
+		lastIf = None
+		last = None
+		while True:
+			if isinstance(base.body, CBody):
+				if not base.body.contentlist: break
+				last = base.body.contentlist[-1]
+			elif isinstance(base.body, CIfStatement):
+				last = base.body
+			else:
+				break
+			if not isinstance(last, CIfStatement): break
+			if last.elsePart is not None:
+				base = last.elsePart
+			else:
+				lastIf = last
+				base = lastIf
+	
+		if lastIf is not None:
+			lastIf.elsePart = self
+		else:
+			stateStruct.error("'else' " + str(self) + " without 'if', last was " + str(last))
+		_CControlStructure.finalize(self, stateStruct, addToContent)
 class CSwitchStatement(_CControlStructure):
 	Keyword = "switch"
 class CCaseStatement(_CControlStructure):
@@ -2387,6 +2469,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 					curCObj._bracketlevel = list(parentCObj._bracketlevel)
 					lasttoken = cpre3_parse_single_next_statement(stateStruct, curCObj, input_iter)
 					curCObj.finalize(stateStruct)
+					parentCObj.body = curCObj
 					return lasttoken
 				elif token.content == "[":
 					stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got unexpected '['")
@@ -2397,6 +2480,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 						stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got multiple bodies")
 					cpre3_parse_body(stateStruct, curCObj, input_iter)
 					curCObj.finalize(stateStruct)
+					parentCObj.body = curCObj
 					return
 				else:
 					stateStruct.error("cpre3 parse single after " + str(curCObj) + ": got unexpected/unknown opening bracket '" + token.content + "'")
@@ -2406,6 +2490,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 				stateStruct.error("cpre3 parse single: unexpected opening bracket '" + token.content + "' after " + str(curCObj))
 		elif isinstance(token, CClosingBracket):
 			if token.brackets == parentCObj._bracketlevel:
+				stateStruct.error("cpre3 parse single: closed brackets without expected statement")
 				return token
 			stateStruct.error("cpre3 parse single: unexpected closing bracket '" + token.content + "' after " + str(curCObj) + " at bracket level " + str(parentCObj._bracketlevel))
 		elif isinstance(token, CSemicolon):
@@ -2413,6 +2498,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 				CVarDecl.overtake(curCObj)
 			if curCObj is not None:
 				curCObj.finalize(stateStruct)
+				parentCObj.body = curCObj
 			return token
 		elif curCObj is None and isinstance(token, CIdentifier) and token.content in CControlStructures:
 			curCObj = CControlStructures[token.content](parent=parentCObj)
@@ -2423,6 +2509,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 				# We finalize in any way, also for 'do'. We don't do any semantic checks here
 				# if there is a correct 'while' following or neither if the 'else' has a previous 'if'.
 				curCObj.finalize(stateStruct)
+				parentCObj.body = curCObj
 				return lasttoken
 			elif isinstance(curCObj, CReturnStatement):
 				curCObj.body = CStatement(parent=curCObj)
@@ -2443,6 +2530,7 @@ def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 				curCObj._cpre3_handle_token(stateStruct, token)
 			else:
 				stateStruct.error("cpre3 parse single: got unexpected token " + str(token))
+	stateStruct.error("cpre3 parse single: runaway")
 	return
 
 def cpre3_parse_body(stateStruct, parentCObj, input_iter):
