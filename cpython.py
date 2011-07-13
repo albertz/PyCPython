@@ -59,6 +59,11 @@ def prepareState():
 state = prepareState()
 cparser.parse(CPythonDir + "/Modules/main.c", state)
 
+import cparser.interpreter
+
+interpreter = cparser.interpreter.Interpreter()
+interpreter.register(state)
+
 if __name__ == '__main__':
 	print "erros so far:"
 	for m in state._errors:
@@ -73,10 +78,10 @@ if __name__ == '__main__':
 		for c in f.body.contentlist:
 			print c
 	
-	import cparser.interpreter
+	print
+	print "PyAST of Py_Main:"
+	interpreter.dumpFunc("Py_Main")
 	
-	r = cparser.interpreter.Interpreter()
-	r.register(state)
-	
-	r.runFunc("Py_Main", len(sys.argv), sys.argv)
+	print
+	interpreter.runFunc("Py_Main", len(sys.argv), sys.argv)
 
