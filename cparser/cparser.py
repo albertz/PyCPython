@@ -1441,7 +1441,7 @@ class _CBaseWithOptBody:
 		if addToContent is None: addToContent = self.AutoAddToContent
 		
 		#print "finalize", self, "at", stateStruct.curPosAsStr()
-		if addToContent and self.parent.body and hasattr(self.parent.body, "contentlist"):
+		if addToContent and self.parent is not None and self.parent.body and hasattr(self.parent.body, "contentlist"):
 			self.parent.body.contentlist.append(self)
 	
 	def copy(self):
@@ -1609,7 +1609,9 @@ class CEnumConst(_CBaseWithOptBody):
 		if self.name:
 			# self.parent.parent is the parent of the enum
 			self.parent.parent.body.enumconsts[self.name] = self
-		
+	def getConstValue(self, stateStruct):
+		return self.value
+	
 class CFuncArgDecl(_CBaseWithOptBody):
 	AutoAddToContent = False	
 	def finalize(self, stateStruct, addToContent=False):
@@ -1683,7 +1685,13 @@ class _CStatementCall(_CBaseWithOptBody):
 	AutoAddToContent = False
 	base = None
 	def __nonzero__(self): return self.base is not None
-	def __str__(self): return self.__class__.__name__ + " " + str(self.base) + " " + str(self.args)
+	def __str__(self):
+		s = self.__class__.__name__ + " " + repr(self.base)
+		if self.name:
+			s += " name: " + self.name
+		else:
+			s += " args: " + str(self.args)
+		return s
 	
 class CFuncCall(_CStatementCall): pass # base(args) or (base)args; i.e. can also be a simple cast
 class CArrayIndexRef(_CStatementCall): pass # base[args]
@@ -1722,6 +1730,8 @@ def opsDoLeftToRight(stateStruct, op1, op2):
 
 def getConstValue(stateStruct, obj):
 	if hasattr(obj, "getConstValue"): return obj.getConstValue(stateStruct)
+	if isinstance(obj, (CNumber,CStr,CChar)):
+		return obj.content
 	stateStruct.error("don't know how to get const value from " + str(obj))
 	return None
 
@@ -1734,15 +1744,17 @@ class CStatement(_CBaseWithOptBody):
 	def __nonzero__(self): return bool(self._leftexpr) or bool(self._rightexpr)
 	def __repr__(self):
 		s = self.__class__.__name__
+		#s += " " + repr(self._tokens) # debug
 		if self._leftexpr is not None: s += " " + repr(self._leftexpr)
 		if self._op == COp("?:"):
 			s += " ? " + repr(self._middleexpr)
 			s += " : " + repr(self._rightexpr)
-		elif self._rightexpr is not None:
+		elif self._op is not None or self._rightexpr is not None:
 			s += " "
-			s += str(self._op) if self._op is not None else "<None>"
-			s += " "
-			s += repr(self._rightexpr)
+			s += str(self._op)
+			if self._rightexpr is not None:
+				s += " "
+				s += repr(self._rightexpr)
 		if self.defPos is not None: s += " @: " + self.defPos
 		return "<" + s + ">"
 	__str__ = __repr__
@@ -1907,7 +1919,10 @@ class CStatement(_CBaseWithOptBody):
 				funcCall = CStatement(parent=self.parent)
 			funcCall.base = ref
 			funcCall._bracketlevel = list(openingBracketToken.brackets)
-			self._leftexpr = funcCall
+			if self._state == 5:
+				self._leftexpr = funcCall
+			else:
+				self._rightexpr = funcCall
 			cpre3_parse_statements_in_brackets(stateStruct, funcCall, COp(","), funcCall.args, input_iter)
 			funcCall.finalize(stateStruct)
 			return
@@ -1957,17 +1972,42 @@ class CStatement(_CBaseWithOptBody):
 		if self._leftexpr is None: # prefixed only
 			func = OpPrefixFuncs[self._op.content]
 			v = getConstValue(stateStruct, self._rightexpr)
+			if v is None: return None
 			return func(v)
 		if self._op is None or self._rightexpr is None:
 			return getConstValue(stateStruct, self._leftexpr)
 		v1 = getConstValue(stateStruct, self._leftexpr)
+		if v1 is None: return None
 		v2 = getConstValue(stateStruct, self._rightexpr)
+		if v2 is None: return None
 		func = OpBinFuncs[self._op.content]
 		if self._op == COp("?:"):
 			v15 = getConstValue(stateStruct, self._middleexpr)
+			if v15 is None: return None
 			return func(v1, v15, v2)
 		return func(v1, v2)
-			
+	
+	def isCType(self):
+		if self._leftexpr is None: return False # all prefixed stuff is not a type
+		if self._rightexpr is not None: return False # same thing, prefixed stuff is not a type
+		t = self._leftexpr
+		try:
+			if issubclass(t, _ctypes._SimpleCData): return True
+		except: pass # e.g. typeerror or so
+		if isinstance(t, (CType,CStruct,CUnion,CEnum)): return True
+		return False
+		
+	def getCType(self, stateStruct):
+		assert self._leftexpr is not None
+		assert self._rightexpr is None
+		t = getCType(self._leftexpr, stateStruct)
+		if self._op is not None:
+			if self._op.content in ("*","&"):
+				t = POINTER(t)
+			else:
+				raise Exception, "postfix op " + str(self._op) + " unknown for pointer type " + str(self._leftexpr)
+		return t
+
 # only real difference is that this is inside of '[]'
 class CArrayStatement(CStatement): pass
 	
@@ -2043,7 +2083,7 @@ def cpre3_parse_enum(stateStruct, parentCObj, input_iter):
 		elif token == COp(","):
 			if state in (1,2):
 				if state == 2:
-					valueStmnt.finalize(stateStruct)
+					valueStmnt.finalize(stateStruct, addToContent=False)
 					curCObj.value = valueStmnt.getConstValue(stateStruct)
 				curCObj.finalize(stateStruct)
 				curCObj = CEnumConst(parent=parentCObj)
@@ -2055,7 +2095,7 @@ def cpre3_parse_enum(stateStruct, parentCObj, input_iter):
 			if token.brackets == parentCObj._bracketlevel:
 				if curCObj:
 					if state == 2:
-						valueStmnt.finalize(stateStruct)
+						valueStmnt.finalize(stateStruct, addToContent=False)
 						curCObj.value = valueStmnt.getConstValue(stateStruct)
 					curCObj.finalize(stateStruct)
 				parentCObj.finalize(stateStruct)
@@ -2429,6 +2469,7 @@ def cpre3_parse_statements_in_brackets(stateStruct, parentCObj, sepToken, addToL
 				break
 			stateStruct.error("cpre3 parse statements in brackets: unexpected closing bracket '" + token.content + "' after " + str(curCObj) + " at bracket level " + str(brackets))
 		elif token == sepToken:
+			curCObj.finalize(stateStruct, addToContent=False)
 			addToList.append(curCObj)
 			curCObj = _CBaseWithOptBody(parent=parentCObj)
 		elif isinstance(token, CSemicolon): # if the sepToken is not the semicolon, we don't expect it at all
@@ -2446,7 +2487,9 @@ def cpre3_parse_statements_in_brackets(stateStruct, parentCObj, sepToken, addToL
 				stateStruct.error("cpre3 parse statements in brackets: " + str(token) + " not expected after " + str(curCObj))
 			
 	# add also the last object
-	addToList.append(curCObj)
+	if curCObj:
+		curCObj.finalize(stateStruct, addToContent=False)
+		addToList.append(curCObj)
 
 def cpre3_parse_single_next_statement(stateStruct, parentCObj, input_iter):
 	curCObj = None
@@ -2693,6 +2736,8 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 		elif isinstance(token, CNumber):
 			if isinstance(curCObj, CVarDecl) and hasattr(curCObj, "bitsize"):
 				curCObj.bitsize = token.content
+			elif isinstance(curCObj, CStatement):
+				curCObj._cpre3_handle_token(stateStruct, token)
 			elif isinstance(curCObj.body, CStatement):
 				curCObj.body._cpre3_handle_token(stateStruct, token)
 			elif isinstance(curCObj, CCaseStatement):
