@@ -63,6 +63,7 @@ import cparser.interpreter
 
 interpreter = cparser.interpreter.Interpreter()
 interpreter.register(state)
+interpreter.registerFinalize()
 
 if __name__ == '__main__':
 	print "erros so far:"
