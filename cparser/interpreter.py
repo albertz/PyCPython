@@ -5,6 +5,7 @@
 from cparser import *
 from cwrapper import CStateWrapper
 
+import _ctypes
 import ast
 import sys
 import inspect
@@ -19,7 +20,13 @@ class CWrapValue:
 		s += repr(self.value)
 		s += ">"
 		return s
-
+	def getCType(self):
+		if self.decl is not None: return self.decl.type
+		elif self.value is not None and hasattr(self.value, "__class__"):
+			return self.value.__class__
+			#if isinstance(self.value, (_ctypes._SimpleCData,ctypes.Structure,ctypes.Union)):
+		return self	
+			
 def iterIdentifierNames():
 	S = "abcdefghijklmnopqrstuvwxyz0123456789"
 	n = 0
@@ -97,7 +104,7 @@ class GlobalScope:
 		decl = self.findIdentifier(name)
 		assert isinstance(decl, CVarDecl)
 		# TODO: We ignore any special initialization here. This is probably not what we want.
-		initValue = decl.getCType(self.stateStruct)()
+		initValue = decl.type.getCType(self.stateStruct)()
 		self.vars[name] = initValue
 		return initValue
 
@@ -138,7 +145,7 @@ class GlobalsWrapper:
 		return v
 	
 	def __repr__(self):
-		return "<" + self.__class__.__name__ + " " + repr(self._cache) + ">"
+		return "<" + self.__class__.__name__ + " " + repr(self.__dict__) + ">"
 
 class FuncEnv:
 	def __init__(self, globalScope):
@@ -237,6 +244,8 @@ def makeAstNodeCall(func, *args):
 
 def isPointerType(t):
 	if isinstance(t, CPointerType): return True
+	import inspect
+	if inspect.isclass(t) and issubclass(t, _ctypes._Pointer): return True
 	return False
 
 def getAstNode_valueFromObj(objAst, objType):
@@ -426,7 +435,7 @@ class Helpers:
 	
 	@staticmethod
 	def assignPtr(a, bValue):
-		aPtr = ctypes.cast(ctypes.pointer(a), ctypes.POINTER(c_void_p))
+		aPtr = ctypes.cast(ctypes.pointer(a), ctypes.POINTER(ctypes.c_void_p))
 		aPtr.contents.value = bValue
 		return a
 
@@ -437,7 +446,7 @@ class Helpers:
 
 	@staticmethod
 	def augAssignPtr(a, op, bValue):
-		aPtr = ctypes.cast(ctypes.pointer(a), ctypes.POINTER(c_void_p))
+		aPtr = ctypes.cast(ctypes.pointer(a), ctypes.POINTER(ctypes.c_void_p))
 		aPtr.contents.value = OpBinFuncs[op](aPtr.contents.value, bValue)
 		return a
 
@@ -449,6 +458,24 @@ def astForHelperFunc(helperFuncName, *astArgs):
 	a.args = list(astArgs)
 	return a
 
+def getAstNodeArrayIndex(base, index, ctx=ast.Load()):
+	a = ast.Subscript(ctx=ctx)
+	if isinstance(base, (str,unicode)):
+		base = ast.Name(id=base, ctx=ctx)
+	elif isinstance(base, ast.AST):
+		pass # ok
+	else:
+		assert False, "base " + str(base) + " has invalid type"
+	if isinstance(index, ast.AST):
+		pass # ok
+	elif isinstance(index, (int,long)):
+		index = ast.Num(index)
+	else:
+		assert False, "index " + str(index) + " has invalid type"
+	a.value = base
+	a.slice = ast.Index(value=index)
+	return a
+	
 def astAndTypeForStatement(funcEnv, stmnt):
 	if isinstance(stmnt, (CVarDecl,CFuncArgDecl)):
 		return funcEnv.getAstNodeForVarDecl(stmnt), stmnt.type
@@ -488,8 +515,9 @@ def astAndTypeForStatement(funcEnv, stmnt):
 		else:
 			assert False, "cannot handle " + str(stmnt.base) + " call"
 	elif isinstance(stmnt, CWrapValue):
-		# TODO
-		return ast.Num(0), ctypes.c_int
+		funcEnv.globalScope.interpreter.wrappedValuesDict[id(stmnt)] = stmnt
+		v = getAstNodeArrayIndex("values", id(stmnt))
+		return getAstNodeAttrib(v, "value"), stmnt.getCType()
 	else:
 		assert False, "cannot handle " + str(stmnt)
 
@@ -614,10 +642,18 @@ class Interpreter:
 	def __init__(self):
 		self.stateStructs = []
 		self._cStateWrapper = CStateWrapper(self)
+		self._cStateWrapper.IndirectSimpleCTypes = True
 		self.globalScope = GlobalScope(self, self._cStateWrapper)
 		self._func_cache = {}
 		self.globalsWrapper = GlobalsWrapper(self.globalScope)
-		self.globalsDict = {"ctypes": ctypes, "helpers": Helpers, "g": self.globalsWrapper, "intp": self}
+		self.wrappedValuesDict = {} # id(obj) -> obj
+		self.globalsDict = {
+			"ctypes": ctypes,
+			"helpers": Helpers,
+			"g": self.globalsWrapper,
+			"values": self.wrappedValuesDict,
+			"intp": self
+			}
 		
 	def register(self, stateStruct):
 		self.stateStructs += [stateStruct]
@@ -645,6 +681,13 @@ class Interpreter:
 			name = base.registerNewVar(arg.name, arg)
 			assert name is not None
 			base.astNode.args.args.append(ast.Name(id=name, ctx=ast.Param()))
+		if func.body is None:
+			# TODO: search in other C files
+			# Hack for now: ignore :)
+			print "XXX:", func.name, "is not loaded yet"
+			base.astNode.body.append(ast.Pass())
+			base.popScope()
+			return base
 		for c in func.body.contentlist:
 			if isinstance(c, CVarDecl):
 				base.registerNewVar(c.name, c)
@@ -665,23 +708,27 @@ class Interpreter:
 				base.astNode.body.append(astForCReturn(base, c))
 			else:
 				assert False, "cannot handle " + str(c)
+		if not base.astNode.body:
+			base.astNode.body.append(ast.Pass())
 		base.popScope()
 		return base
 
+	@staticmethod
+	def _unparse(pyAst):
+		from cStringIO import StringIO
+		output = StringIO()
+		from py_demo_unparse import Unparser
+		Unparser(pyAst, output)
+		return output.getvalue()
+
 	def _compile(self, pyAst):
 		# We unparse + parse again for now for better debugging (so we get some code in a backtrace).
-		def _unparse(pyAst):
-			from cStringIO import StringIO
-			output = StringIO()
-			from py_demo_unparse import Unparser
-			Unparser(pyAst, output)
-			return output.getvalue()
 		def _set_linecache(filename, source):
 			import linecache
 			linecache.cache[filename] = None, None, [line+'\n' for line in source.splitlines()], filename
 		SRC_FILENAME = "<PyCParser_" + pyAst.name + ">"
 		def _unparseAndParse(pyAst):
-			src = _unparse(pyAst)
+			src = self._unparse(pyAst)
 			_set_linecache(SRC_FILENAME, src)
 			return compile(src, SRC_FILENAME, "single")
 		def _justCompile(pyAst):
@@ -702,6 +749,7 @@ class Interpreter:
 		func.C_pyAst = pyAst
 		func.C_interpreter = self
 		func.C_argTypes = map(lambda a: a.type, cfunc.args)
+		func.C_unparse = lambda: self._unparse(pyAst)
 		return func
 
 	def getFunc(self, funcname):
