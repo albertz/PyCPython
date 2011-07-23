@@ -127,8 +127,6 @@ class GlobalsWrapper:
 		self.__dict__[name] = value
 	
 	def __getattr__(self, name):
-		# TODO handle '__builtins__' ?
-		print "dict wrapper getitem:", name
 		decl = self.globalScope.findIdentifier(name)
 		if decl is None: raise KeyError
 		if isinstance(decl, CVarDecl):
@@ -264,9 +262,12 @@ def getAstNode_newTypeInstance(objType, argAst=None, argType=None):
 	if argAst is not None:
 		if isinstance(argAst, (ast.Str, ast.Num)):
 			args += [argAst]
-		else:
-			assert argType is not None
+		elif argType is not None:
 			args += [getAstNode_valueFromObj(argAst, argType)]
+		else:
+			# expect that it is the AST for the value.
+			# there is no really way to 'assert' this.
+			args += [argAst]
 
 	typeAst = getAstNodeForVarType(objType)
 
@@ -446,6 +447,8 @@ class Helpers:
 
 	@staticmethod
 	def augAssignPtr(a, op, bValue):
+		assert op in ("+","-")
+		bValue *= ctypes.sizeof(a._type_)
 		aPtr = ctypes.cast(ctypes.pointer(a), ctypes.POINTER(ctypes.c_void_p))
 		aPtr.contents.value = OpBinFuncs[op](aPtr.contents.value, bValue)
 		return a
@@ -509,9 +512,20 @@ def astAndTypeForStatement(funcEnv, stmnt):
 			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
 			return a, stmnt.type
 		elif isinstance(stmnt.base, CStatement) and stmnt.base.isCType():
+			# C static cast
 			assert len(stmnt.args) == 1
-			v, _ = astAndTypeForStatement(funcEnv, stmnt.args[0])
-			return v, stmnt.base.asType()
+			bAst, bType = astAndTypeForStatement(funcEnv, stmnt.args[0])
+			bValueAst = getAstNode_valueFromObj(bAst, bType)
+			aType = stmnt.base.asType()
+			aTypeAst = getAstNodeForVarType(aType)
+
+			if isPointerType(aType):
+				astVoidPT = getAstNodeAttrib("ctypes", "c_void_p")
+				astCast = getAstNodeAttrib("ctypes", "cast")
+				astVoidP = makeAstNodeCall(astVoidPT, bValueAst)
+				return makeAstNodeCall(astCast, astVoidP, aTypeAst), aType
+			else:
+				return makeAstNodeCall(aTypeAst, bValueAst), aType
 		else:
 			assert False, "cannot handle " + str(stmnt.base) + " call"
 	elif isinstance(stmnt, CWrapValue):
@@ -553,6 +567,21 @@ def getAstNode_postfixDec(aAst, aType):
 	if isPointerType(aType):
 		return makeAstNodeCall(Helpers.postfixDecPtr, aAst)
 	return makeAstNodeCall(Helpers.postfixDec, aAst)
+
+def getAstNode_ptrBinOpExpr(stateStruct, aAst, aType, opStr, bAst, bType):
+	assert isPointerType(aType)
+	assert opStr in OpBin
+	op = OpBin[opStr]()
+	assert isinstance(op, (ast.Add,ast.Sub))
+	s = ctypes.sizeof(getCType(aType, stateStruct)._type_)
+	a = ast.BinOp()
+	a.op = op
+	a.left = getAstNode_valueFromObj(aAst, aType)
+	a.right = r = ast.BinOp()
+	r.op = ast.Mult()
+	r.left = ast.Num(s)
+	r.right = getAstNode_valueFromObj(bAst, bType)
+	return getAstNode_newTypeInstance(aType, a)
 	
 def astAndTypeForCStatement(funcEnv, stmnt):
 	assert isinstance(stmnt, CStatement)
@@ -565,8 +594,8 @@ def astAndTypeForCStatement(funcEnv, stmnt):
 		elif stmnt._op.content in OpUnary:
 			a = ast.UnaryOp()
 			a.op = OpUnary[stmnt._op.content]()
-			a.operand = rightAstNode
-			return a, rightType
+			a.operand = getAstNode_valueFromObj(rightAstNode, rightType)
+			return getAstNode_newTypeInstance(rightType, a), rightType
 		else:
 			assert False, "unary prefix op " + str(stmnt._op) + " is unknown"
 	if stmnt._op is None:
@@ -581,34 +610,42 @@ def astAndTypeForCStatement(funcEnv, stmnt):
 			assert False, "unary postfix op " + str(stmnt._op) + " is unknown"
 	leftAstNode, leftType = astAndTypeForStatement(funcEnv, stmnt._leftexpr)
 	rightAstNode, rightType = astAndTypeForStatement(funcEnv, stmnt._rightexpr)
-	if stmnt._op.content in OpBin:
-		a = ast.BinOp()
-		a.op = OpBin[stmnt._op.content]()
-		a.left = leftAstNode
-		a.right = rightAstNode
-		return a, leftType # TODO: not really correct. e.g. int + float -> float
-	elif stmnt._op.content in OpBinBool:
-		a = ast.BoolOp()
-		a.op = OpBinBool[stmnt._op.content]()
-		a.values = [leftAstNode, rightAstNode]
-		return a, ctypes.c_int
-	elif stmnt._op.content in OpBinCmp:
-		a = ast.Compare()
-		a.ops = [OpBinCmp[stmnt._op.content]()]
-		a.left = leftAstNode
-		a.comparators = [rightAstNode]
-		return a, ctypes.c_int
-	elif stmnt._op.content == "=":
+	if stmnt._op.content == "=":
 		return getAstNode_assign(leftAstNode, leftType, rightAstNode, rightType), leftType
 	elif stmnt._op.content in OpAugAssign:
 		return getAstNode_augAssign(leftAstNode, leftType, stmnt._op.content, rightAstNode, rightType), leftType
+	elif stmnt._op.content in OpBinBool:
+		a = ast.BoolOp()
+		a.op = OpBinBool[stmnt._op.content]()
+		a.values = [
+			getAstNode_valueFromObj(leftAstNode, leftType),
+			getAstNode_valueFromObj(rightAstNode, rightType)]
+		return getAstNode_newTypeInstance(ctypes.c_int, a), ctypes.c_int
+	elif stmnt._op.content in OpBinCmp:
+		a = ast.Compare()
+		a.ops = [OpBinCmp[stmnt._op.content]()]
+		a.left = getAstNode_valueFromObj(leftAstNode, leftType)
+		a.comparators = [getAstNode_valueFromObj(rightAstNode, rightType)]
+		return getAstNode_newTypeInstance(ctypes.c_int, a), ctypes.c_int
 	elif stmnt._op.content == "?:":
 		middleAstNode, middleType = astAndTypeForStatement(funcEnv, stmnt._middleexpr)
 		a = ast.IfExp()
-		a.test = leftAstNode
-		a.body = middleAstNode
-		a.orelse = rightAstNode
-		return a, middleType # TODO: not really correct...
+		a.test = getAstNode_valueFromObj(leftAstNode, leftType)
+		a.body = getAstNode_valueFromObj(middleAstNode, middleType)
+		a.orelse = getAstNode_valueFromObj(rightAstNode, rightType)
+		return getAstNode_newTypeInstance(middleType, a), middleType # TODO: not really correct...
+	elif isPointerType(leftType):
+		return getAstNode_ptrBinOpExpr(
+			funcEnv.globalScope.stateStruct,
+			leftAstNode, leftType,
+			stmnt._op.content,
+			rightAstNode, rightType), leftType
+	elif stmnt._op.content in OpBin:
+		a = ast.BinOp()
+		a.op = OpBin[stmnt._op.content]()
+		a.left = getAstNode_valueFromObj(leftAstNode, leftType)
+		a.right = getAstNode_valueFromObj(rightAstNode, rightType)		
+		return getAstNode_newTypeInstance(leftType, a), leftType # TODO: not really correct. e.g. int + float -> float
 	else:
 		assert False, "binary op " + str(stmnt._op) + " is unknown"
 
@@ -685,10 +722,10 @@ class Interpreter:
 			# TODO: search in other C files
 			# Hack for now: ignore :)
 			print "XXX:", func.name, "is not loaded yet"
-			base.astNode.body.append(ast.Pass())
-			base.popScope()
-			return base
-		for c in func.body.contentlist:
+			funccontent = []
+		else:
+			funccontent = func.body.contentlist
+		for c in funccontent:
 			if isinstance(c, CVarDecl):
 				base.registerNewVar(c.name, c)
 			elif isinstance(c, CStatement):
@@ -708,9 +745,13 @@ class Interpreter:
 				base.astNode.body.append(astForCReturn(base, c))
 			else:
 				assert False, "cannot handle " + str(c)
-		if not base.astNode.body:
-			base.astNode.body.append(ast.Pass())
 		base.popScope()
+		if isSameType(self._cStateWrapper, func.type, CVoidType()):
+			returnValueAst = NoneAstNode
+		else:
+			returnTypeAst = getAstNodeForVarType(func.type)
+			returnValueAst = makeAstNodeCall(returnTypeAst)
+		base.astNode.body.append(ast.Return(value=returnValueAst))
 		return base
 
 	@staticmethod
