@@ -84,5 +84,5 @@ if __name__ == '__main__':
 	interpreter.dumpFunc("Py_Main")
 	
 	print
-	interpreter.runFunc("Py_Main", len(sys.argv), sys.argv)
+	interpreter.runFunc("Py_Main", len(sys.argv), sys.argv + [None])
 
