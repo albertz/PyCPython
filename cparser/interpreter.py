@@ -478,7 +478,12 @@ def getAstNodeArrayIndex(base, index, ctx=ast.Load()):
 	a.value = base
 	a.slice = ast.Index(value=index)
 	return a
-	
+
+def getAstForWrapValue(funcEnv, wrapValue):
+	funcEnv.globalScope.interpreter.wrappedValuesDict[id(wrapValue)] = wrapValue
+	v = getAstNodeArrayIndex("values", id(wrapValue))
+	return v
+
 def astAndTypeForStatement(funcEnv, stmnt):
 	if isinstance(stmnt, (CVarDecl,CFuncArgDecl)):
 		return funcEnv.getAstNodeForVarDecl(stmnt), stmnt.type
@@ -496,7 +501,7 @@ def astAndTypeForStatement(funcEnv, stmnt):
 		assert attrDecl is not None
 		return a, attrDecl.type
 	elif isinstance(stmnt, CNumber):
-		t = minCIntTypeForNums(stmnt.content)
+		t = minCIntTypeForNums(stmnt.content, useUnsignedTypes=False)
 		if t is None: t = "int64_t" # it's an overflow; just take a big type
 		t = CStdIntType(t)
 		return getAstNode_newTypeInstance(t, ast.Num(n=stmnt.content)), t
@@ -526,11 +531,16 @@ def astAndTypeForStatement(funcEnv, stmnt):
 				return makeAstNodeCall(astCast, astVoidP, aTypeAst), aType
 			else:
 				return makeAstNodeCall(aTypeAst, bValueAst), aType
+		elif isinstance(stmnt.base, CWrapValue):
+			# expect that we just wrapped a callable function/object
+			a = ast.Call(keywords=[], starargs=None, kwargs=None)
+			a.func = getAstNodeAttrib(getAstForWrapValue(funcEnv, stmnt.base), "value")
+			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
+			return a, stmnt.type
 		else:
 			assert False, "cannot handle " + str(stmnt.base) + " call"
 	elif isinstance(stmnt, CWrapValue):
-		funcEnv.globalScope.interpreter.wrappedValuesDict[id(stmnt)] = stmnt
-		v = getAstNodeArrayIndex("values", id(stmnt))
+		v = getAstForWrapValue(funcEnv, stmnt)
 		return getAstNodeAttrib(v, "value"), stmnt.getCType()
 	else:
 		assert False, "cannot handle " + str(stmnt)
@@ -653,9 +663,15 @@ PyAstNoOp = ast.Assert(test=ast.Name(id="True", ctx=ast.Load()), msg=None)
 
 def astForCWhile(funcEnv, stmnt):
 	assert isinstance(stmnt, CWhileStatement)
+	assert stmnt.body is not None
 	assert len(stmnt.args) == 1
-	# TODO ...
-	return PyAstNoOp
+	assert isinstance(stmnt.args[0], CStatement)
+	whileAst = ast.While(body=[], orelse=[])
+	whileAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[0]))
+	funcEnv.pushScope()
+	codeContentToBody(funcEnv,  stmnt.body.contentlist, whileAst.body)
+	funcEnv.popScope()
+	return whileAst
 
 def astForCFor(funcEnv, stmnt):
 	# TODO
@@ -669,11 +685,44 @@ def astForCIf(funcEnv, stmnt):
 	# TODO
 	return PyAstNoOp
 
-def astForCReturn(funcEnv, stmnt):
+def astForCSwitch(funcEnv, stmnt):
 	# TODO
 	return PyAstNoOp
 
+def astForCReturn(funcEnv, stmnt):
+	assert isinstance(stmnt, CReturnStatement)
+	if not stmnt.body:
+		assert isSameType(funcEnv.globalScope.stateStruct, funcEnv.func.type, CVoidType())
+		return ast.Return(value=None)
+	assert isinstance(stmnt.body, CStatement)
+	valueAst = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.body))
+	returnTypeAst = getAstNodeForVarType(funcEnv.func.type)
+	returnValueAst = makeAstNodeCall(returnTypeAst, valueAst)
+	return ast.Return(value=returnValueAst)
 
+def codeContentToBody(funcEnv, content, body):
+	for c in content:
+		if isinstance(c, CVarDecl):
+			funcEnv.registerNewVar(c.name, c)
+		elif isinstance(c, CStatement):
+			a, t = astAndTypeForCStatement(funcEnv, c)
+			if isinstance(a, ast.expr):
+				a = ast.Expr(value=a)
+			body.append(a)
+		elif isinstance(c, CWhileStatement):
+			body.append(astForCWhile(funcEnv, c))
+		elif isinstance(c, CForStatement):
+			body.append(astForCFor(funcEnv, c))
+		elif isinstance(c, CDoStatement):
+			body.append(astForCDoWhile(funcEnv, c))
+		elif isinstance(c, CIfStatement):
+			body.append(astForCIf(funcEnv, c))
+		elif isinstance(c, CSwitchStatement):
+			body.append(astForCSwitch(funcEnv, c))
+		elif isinstance(c, CReturnStatement):
+			body.append(astForCReturn(funcEnv, c))
+		else:
+			assert False, "cannot handle " + str(c)
 
 class Interpreter:
 	def __init__(self):
@@ -712,6 +761,7 @@ class Interpreter:
 		assert isinstance(func, CFunc)
 		base = FuncEnv(globalScope=self.globalScope)
 		assert func.name is not None
+		base.func = func
 		base.astNode.name = func.name
 		base.pushScope()
 		for arg in func.args:
@@ -722,29 +772,8 @@ class Interpreter:
 			# TODO: search in other C files
 			# Hack for now: ignore :)
 			print "XXX:", func.name, "is not loaded yet"
-			funccontent = []
 		else:
-			funccontent = func.body.contentlist
-		for c in funccontent:
-			if isinstance(c, CVarDecl):
-				base.registerNewVar(c.name, c)
-			elif isinstance(c, CStatement):
-				a, t = astAndTypeForCStatement(base, c)
-				if isinstance(a, ast.expr):
-					a = ast.Expr(value=a)
-				base.astNode.body.append(a)
-			elif isinstance(c, CWhileStatement):
-				base.astNode.body.append(astForCWhile(base, c))
-			elif isinstance(c, CForStatement):
-				base.astNode.body.append(astForCFor(base, c))
-			elif isinstance(c, CDoStatement):
-				base.astNode.body.append(astForCDoWhile(base, c))
-			elif isinstance(c, CIfStatement):
-				base.astNode.body.append(astForCIf(base, c))
-			elif isinstance(c, CReturnStatement):
-				base.astNode.body.append(astForCReturn(base, c))
-			else:
-				assert False, "cannot handle " + str(c)
+			codeContentToBody(base, func.body.contentlist, base.astNode.body)
 		base.popScope()
 		if isSameType(self._cStateWrapper, func.type, CVoidType()):
 			returnValueAst = NoneAstNode
