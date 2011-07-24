@@ -56,11 +56,14 @@ int _PyOS_GetOpt(int argc, char **argv, char *optstring)
 #endif
 
         else if (argv[_PyOS_optind][0] != '-' ||
-                 argv[_PyOS_optind][1] == '\0' /* lone dash */ )
+                 argv[_PyOS_optind][1] == '\0' /* lone dash */ ) {
+			printf("opt out 1 for %s\n", argv[_PyOS_optind]);
             return -1;
+		}
 
         else if (strcmp(argv[_PyOS_optind], "--") == 0) {
             ++_PyOS_optind;
+			printf("opt out 2 for %s\n", argv[_PyOS_optind]);
             return -1;
         }
 
@@ -78,9 +81,11 @@ int _PyOS_GetOpt(int argc, char **argv, char *optstring)
         opt_ptr = &argv[_PyOS_optind++][1];
     }
 
-    if ( (option = *opt_ptr++) == '\0')
+    if ( (option = *opt_ptr++) == '\0') {
+		printf("opt out 3\n");
         return -1;
-
+	}
+	
     if (option == 'J') {
         fprintf(stderr, "-J is reserved for Jython\n");
         return '_';
