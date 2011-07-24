@@ -59,6 +59,7 @@ def prepareState():
 state = prepareState()
 cparser.parse(CPythonDir + "/Modules/main.c", state)
 cparser.parse(CPythonDir + "/Python/getopt.c", state)
+cparser.parse(CPythonDir + "/Python/pythonrun.c", state)
 
 import cparser.interpreter
 
