@@ -254,7 +254,11 @@ Py_Main(int argc, char **argv)
 
     PySys_ResetWarnOptions();
 
+	printf("hello there!\n");
+	printf("argc: %i, argv[0]: %s, argv[1]: %s\n", argc, argv[0], argv[1]);
     while ((c = _PyOS_GetOpt(argc, argv, PROGRAM_OPTS)) != EOF) {
+		printf("Opt char: %c\n", c);
+
         if (c == 'c') {
             /* -c is the last option; following arguments
                that look like options are left for the
