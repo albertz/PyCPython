@@ -58,6 +58,7 @@ def prepareState():
 
 state = prepareState()
 cparser.parse(CPythonDir + "/Modules/main.c", state)
+cparser.parse(CPythonDir + "/Python/getopt.c", state)
 
 import cparser.interpreter
 
@@ -82,6 +83,10 @@ if __name__ == '__main__':
 	print
 	print "PyAST of Py_Main:"
 	interpreter.dumpFunc("Py_Main")
+
+	# Test run
+	print
+	interpreter.runFunc("Py_Main", 2, ["Python", "-V", None])
 	
 	print
 	interpreter.runFunc("Py_Main", len(sys.argv), sys.argv + [None])
