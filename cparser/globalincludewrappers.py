@@ -55,6 +55,7 @@ class Wrapper:
 		state.vars["stderr"] = CWrapValue(callCFunc("fdopen", 2, "a"))
 		wrapCFunc(state, "fprintf", restype=ctypes.c_int, argtypes=(FileP, ctypes.c_char_p))
 		wrapCFunc(state, "fputs", restype=ctypes.c_int, argtypes=(ctypes.c_char_p, FileP))
+		wrapCFunc(state, "fflush", restype=ctypes.c_int, argtypes=(FileP,))
 		state.vars["errno"] = CWrapValue(0) # TODO
 		state.macros["EOF"] = Macro(rightside="-1") # TODO?
 		wrapCFunc(state, "setbuf", restype=CVoidType, argtypes=(FileP, ctypes.c_char_p))
@@ -69,6 +70,7 @@ class Wrapper:
 		state.macros["S_IFMT"] = Macro(rightside="0") # TODO
 		state.macros["S_IFDIR"] = Macro(rightside="0") # TODO
 	def handle_stdlib_h(self, state):
+		wrapCFunc(state, "abort", restype=CVoidType, argtypes=())
 		wrapCFunc(state, "malloc")
 		wrapCFunc(state, "free")
 		state.funcs["getenv"] = CWrapValue(
@@ -83,6 +85,7 @@ class Wrapper:
 		wrapCFunc(state, "strcmp", restype=ctypes.c_int, argtypes=(ctypes.c_char_p,ctypes.c_char_p))
 		wrapCFunc(state, "strtok", restype=ctypes.c_char_p, argtypes=(ctypes.c_char_p,ctypes.c_char_p))
 		wrapCFunc(state, "strchr", restype=ctypes.c_char_p, argtypes=(ctypes.c_char_p,ctypes.c_int))
+		wrapCFunc(state, "strdup", restype=ctypes.c_char_p, argtypes=(ctypes.c_char_p,))
 		wrapCFunc(state, "strerror", restype=ctypes.c_char_p, argtypes=(ctypes.c_int,))
 	def handle_time_h(self, state): pass
 	def handle_ctype_h(self, state): pass
