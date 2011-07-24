@@ -113,17 +113,6 @@ class GlobalScope:
 		self.vars[name] = initValue
 		return initValue
 
-class CTypeWrapper:
-	def __init__(self, decl, globalScope):
-		self.decl = decl
-		self.globalScope = globalScope
-		self._ctype_cache = None
-	def __call__(self, *args):
-		if self._ctype_cache is None:
-			self._ctype_cache = getCType(self.decl, self.globalScope.stateStruct)
-		# TODO: we are ignoring args here
-		return self._ctype_cache()
-
 class GlobalsWrapper:
 	def __init__(self, globalScope):
 		self.globalScope = globalScope
@@ -141,7 +130,7 @@ class GlobalsWrapper:
 		elif isinstance(decl, CFunc):
 			v = self.globalScope.interpreter.getFunc(name)
 		elif isinstance(decl, (CTypedef,CStruct,CUnion,CEnum)):
-			v = CTypeWrapper(decl, self.globalScope)
+			v = getCType(decl, self.globalScope.stateStruct)
 		else:
 			assert False, "didn't expected " + str(decl)
 		self.__dict__[name] = v
@@ -158,9 +147,9 @@ class GlobalsStructWrapper:
 		self.__dict__[name] = value
 	
 	def __getattr__(self, name):
-		decl = self.globalScope.stateStruct.get(name)
-		if decl is None: raise KeyError
-		v = CTypeWrapper(decl, self.globalScope)		
+		decl = self.globalScope.stateStruct.structs.get(name)
+		if decl is None: raise AttributeError
+		v = getCType(decl, self.globalScope.stateStruct)
 		self.__dict__[name] = v
 		return v
 	
@@ -525,6 +514,15 @@ def astAndTypeForStatement(funcEnv, stmnt):
 		attrDecl = t.findAttrib(a.attr)
 		assert attrDecl is not None, "attrib " + str(a.attr) + " not found"
 		return a, attrDecl.type
+	elif isinstance(stmnt, CPtrAccessRef):
+		# build equivalent AttribAccess statement
+		derefStmnt = CStatement()
+		derefStmnt._op = COp("*")
+		derefStmnt._rightexpr = stmnt.base
+		attrStmnt = CAttribAccessRef()
+		attrStmnt.base = derefStmnt
+		attrStmnt.name = stmnt.name
+		return astAndTypeForStatement(funcEnv, attrStmnt)		
 	elif isinstance(stmnt, CNumber):
 		t = minCIntTypeForNums(stmnt.content, useUnsignedTypes=False)
 		if t is None: t = "int64_t" # it's an overflow; just take a big type
@@ -808,6 +806,7 @@ class Interpreter:
 		self.stateStructs = []
 		self._cStateWrapper = CStateWrapper(self)
 		self._cStateWrapper.IndirectSimpleCTypes = True
+		self._cStateWrapper.error = self._cStateWrapperError
 		self.globalScope = GlobalScope(self, self._cStateWrapper)
 		self._func_cache = {}
 		self.globalsWrapper = GlobalsWrapper(self.globalScope)
@@ -821,6 +820,9 @@ class Interpreter:
 			"values": self.wrappedValuesDict,
 			"intp": self
 			}
+	
+	def _cStateWrapperError(self, s):
+		print "Error:", s
 		
 	def register(self, stateStruct):
 		self.stateStructs += [stateStruct]

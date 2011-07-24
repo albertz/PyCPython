@@ -1509,7 +1509,8 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None, addToCont
 	if addToContent is None:
 		addToContent = obj.name is not None
 
-	obj.type = make_type_from_typetokens(stateStruct, obj._type_tokens)
+	if obj.type is None:
+		obj.type = make_type_from_typetokens(stateStruct, obj._type_tokens)
 	_CBaseWithOptBody.finalize(obj, stateStruct, addToContent=addToContent)
 	
 	if addToContent and hasattr(obj.parent, "body"):
@@ -1538,7 +1539,11 @@ class CFunc(_CBaseWithOptBody):
 		
 class CVarDecl(_CBaseWithOptBody):
 	finalize = lambda *args: _finalizeBasicType(*args, dictName="vars")	
-
+	def clearDeclForNextVar(self):
+		if hasattr(self, "bitsize"): delattr(self, "bitsize")
+		while self._type_tokens and self._type_tokens[-1] in ("*",):
+			self._type_tokens.pop()
+	
 def wrapCTypeClassIfNeeded(t):
 	if t.__base__ is _ctypes._SimpleCData: return wrapCTypeClass(t)
 	else: return t
@@ -2799,7 +2804,7 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					oldObj = curCObj
 					curCObj = curCObj.copy()
 					oldObj.finalize(stateStruct)
-					if hasattr(curCObj, "bitsize"): delattr(curCObj, "bitsize")
+					curCObj.clearDeclForNextVar()
 					curCObj.name = None
 					curCObj.body = None
 				elif token.content == ":" and curCObj and curCObj._type_tokens and curCObj.name:
