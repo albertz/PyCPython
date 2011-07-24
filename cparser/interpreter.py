@@ -11,9 +11,11 @@ import sys
 import inspect
 
 class CWrapValue:
-	def __init__(self, value, decl=None):
+	def __init__(self, value, decl=None, **kwattr):
 		self.value = value
 		self.decl = decl
+		for k,v in kwattr.iteritems():
+			setattr(self, k, v)
 	def __repr__(self):
 		s = "<" + self.__class__.__name__ + " "
 		if self.decl is not None: s += repr(self.decl) + " "
@@ -84,8 +86,11 @@ class GlobalScope:
 		name = self.names.get(id(decl), None)
 		if name is not None: return name
 		o = self.findIdentifier(decl.name)
-		if o is decl: return decl.name
-		return None
+		if o is None: return None
+		# Note: `o` might be a different object than `decl`.
+		# This can happen if `o` is the extern declaration and `decl`
+		# is the actual variable. Anyway, this is fine.
+		return o.name
 	
 	def registerExternVar(self, name_prefix, value=None):
 		if not isinstance(value, CWrapValue):
@@ -145,6 +150,23 @@ class GlobalsWrapper:
 	def __repr__(self):
 		return "<" + self.__class__.__name__ + " " + repr(self.__dict__) + ">"
 
+class GlobalsStructWrapper:
+	def __init__(self, globalScope):
+		self.globalScope = globalScope
+	
+	def __setattr__(self, name, value):
+		self.__dict__[name] = value
+	
+	def __getattr__(self, name):
+		decl = self.globalScope.stateStruct.get(name)
+		if decl is None: raise KeyError
+		v = CTypeWrapper(decl, self.globalScope)		
+		self.__dict__[name] = v
+		return v
+	
+	def __repr__(self):
+		return "<" + self.__class__.__name__ + " " + repr(self.__dict__) + ">"
+	
 class FuncEnv:
 	def __init__(self, globalScope):
 		self.globalScope = globalScope
@@ -209,7 +231,7 @@ def getAstNodeForCTypesBasicType(t):
 	if t is CVoidType: return NoneAstNode
 	if not inspect.isclass(t) and isinstance(t, CVoidType): return NoneAstNode
 	if issubclass(t, CVoidType): return None
-	assert getattr(ctypes, t.__name__) is t
+	assert issubclass(t, getattr(ctypes, t.__name__))
 	return getAstNodeAttrib("ctypes", t.__name__)
 
 def getAstNodeForVarType(t):
@@ -222,6 +244,9 @@ def getAstNodeForVarType(t):
 		return makeAstNodeCall(a, getAstNodeForVarType(t.pointerOf))
 	elif isinstance(t, CTypedefType):
 		return getAstNodeAttrib("g", t.name)
+	elif isinstance(t, CStruct):
+		# TODO: this assumes the was previously declared globally.
+		return getAstNodeAttrib("structs", t.name)
 	else:
 		try: return getAstNodeForCTypesBasicType(t)
 		except: pass
@@ -252,7 +277,7 @@ def getAstNode_valueFromObj(objAst, objType):
 		astCast = getAstNodeAttrib("ctypes", "cast")
 		astVoidP = makeAstNodeCall(astCast, objAst, astVoidPT)
 		astValue = getAstNodeAttrib(astVoidP, "value")
-		return astValue
+		return ast.BoolOp(op=ast.Or(), values=[astValue, ast.Num(0)])
 	else:
 		astValue = getAstNodeAttrib(objAst, "value")
 		return astValue		
@@ -498,7 +523,7 @@ def astAndTypeForStatement(funcEnv, stmnt):
 			t = funcEnv.globalScope.stateStruct.typedefs[t.name]
 		assert isinstance(t, (CStruct,CUnion))
 		attrDecl = t.findAttrib(a.attr)
-		assert attrDecl is not None
+		assert attrDecl is not None, "attrib " + str(a.attr) + " not found"
 		return a, attrDecl.type
 	elif isinstance(stmnt, CNumber):
 		t = minCIntTypeForNums(stmnt.content, useUnsignedTypes=False)
@@ -506,16 +531,18 @@ def astAndTypeForStatement(funcEnv, stmnt):
 		t = CStdIntType(t)
 		return getAstNode_newTypeInstance(t, ast.Num(n=stmnt.content)), t
 	elif isinstance(stmnt, CStr):
-		return makeAstNodeCall(getAstNodeAttrib("ctypes", "c_char_p"), ast.Str(s=stmnt.content)), ctypes.c_char_p
+		t = CPointerType(ctypes.c_char)
+		v = makeAstNodeCall(getAstNodeAttrib("ctypes", "c_char_p"), ast.Str(s=str(stmnt.content)))
+		return getAstNode_newTypeInstance(t, v, t), t
 	elif isinstance(stmnt, CChar):
-		return makeAstNodeCall(getAstNodeAttrib("ctypes", "c_char"), ast.Str(s=stmnt.content)), ctypes.c_char
+		return makeAstNodeCall(getAstNodeAttrib("ctypes", "c_char"), ast.Str(s=str(stmnt.content))), ctypes.c_char
 	elif isinstance(stmnt, CFuncCall):
 		if isinstance(stmnt.base, CFunc):
 			assert stmnt.base.name is not None
 			a = ast.Call(keywords=[], starargs=None, kwargs=None)
 			a.func = getAstNodeAttrib("g", stmnt.base.name)
 			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
-			return a, stmnt.type
+			return a, stmnt.base.type
 		elif isinstance(stmnt.base, CStatement) and stmnt.base.isCType():
 			# C static cast
 			assert len(stmnt.args) == 1
@@ -536,9 +563,27 @@ def astAndTypeForStatement(funcEnv, stmnt):
 			a = ast.Call(keywords=[], starargs=None, kwargs=None)
 			a.func = getAstNodeAttrib(getAstForWrapValue(funcEnv, stmnt.base), "value")
 			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
-			return a, stmnt.type
+			return a, stmnt.base.returnType
 		else:
 			assert False, "cannot handle " + str(stmnt.base) + " call"
+	elif isinstance(stmnt, CArrayIndexRef):
+		aAst, aType = astAndTypeForStatement(funcEnv, stmnt.base)
+		assert isinstance(aType, CPointerType)
+		assert len(stmnt.args) == 1
+		# kind of a hack: create equivalent ptr arithmetic expression
+		ptrStmnt = CStatement()
+		ptrStmnt._leftexpr = stmnt.base
+		ptrStmnt._op = COp("+")
+		ptrStmnt._rightexpr = stmnt.args[0]
+		derefStmnt = CStatement()
+		derefStmnt._op = COp("*")
+		derefStmnt._rightexpr = ptrStmnt
+		return astAndTypeForCStatement(funcEnv, derefStmnt)
+		# TODO: support for real arrays.
+		# the following code may be useful
+		#bAst, bType = astAndTypeForStatement(funcEnv, stmnt.args[0])
+		#bValueAst = getAstNode_valueFromObj(bAst, bType)
+		#return getAstNodeArrayIndex(aAst, bValueAst), aType.pointerOf
 	elif isinstance(stmnt, CWrapValue):
 		v = getAstForWrapValue(funcEnv, stmnt)
 		return getAstNodeAttrib(v, "value"), stmnt.getCType()
@@ -601,6 +646,11 @@ def astAndTypeForCStatement(funcEnv, stmnt):
 			return getAstNode_prefixInc(rightAstNode, rightType), rightType
 		elif stmnt._op.content == "--":
 			return getAstNode_prefixDec(rightAstNode, rightType), rightType
+		elif stmnt._op.content == "*":
+			assert isinstance(rightType, CPointerType)
+			return getAstNodeAttrib(rightAstNode, "contents"), rightType.pointerOf
+		elif stmnt._op.content == "&":
+			return makeAstNodeCall(getAstNodeAttrib("ctypes", "pointer"), rightAstNode), CPointerType(rightType)
 		elif stmnt._op.content in OpUnary:
 			a = ast.UnaryOp()
 			a.op = OpUnary[stmnt._op.content]()
@@ -669,7 +719,8 @@ def astForCWhile(funcEnv, stmnt):
 	whileAst = ast.While(body=[], orelse=[])
 	whileAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[0]))
 	funcEnv.pushScope()
-	codeContentToBody(funcEnv,  stmnt.body.contentlist, whileAst.body)
+	cCodeToPyAstList(funcEnv, stmnt.body, whileAst.body)
+	if not whileAst.body: whileAst.body.append(ast.Pass())
 	funcEnv.popScope()
 	return whileAst
 
@@ -682,8 +733,26 @@ def astForCDoWhile(funcEnv, stmnt):
 	return PyAstNoOp
 
 def astForCIf(funcEnv, stmnt):
-	# TODO
-	return PyAstNoOp
+	assert isinstance(stmnt, CIfStatement)
+	assert stmnt.body is not None
+	assert len(stmnt.args) == 1
+	assert isinstance(stmnt.args[0], CStatement)
+
+	ifAst = ast.If(body=[], orelse=[])
+	ifAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[0]))
+	funcEnv.pushScope()
+	cCodeToPyAstList(funcEnv, stmnt.body, ifAst.body)
+	if not ifAst.body: ifAst.body.append(ast.Pass())
+	funcEnv.popScope()
+	
+	if stmnt.elsePart is not None:
+		assert stmnt.elsePart.body is not None
+		funcEnv.pushScope()
+		cCodeToPyAstList(funcEnv, stmnt.elsePart.body, ifAst.orelse)
+		if not ifAst.orelse: ifAst.orelse.append(ast.Pass())
+		funcEnv.popScope()
+
+	return ifAst
 
 def astForCSwitch(funcEnv, stmnt):
 	# TODO
@@ -700,30 +769,40 @@ def astForCReturn(funcEnv, stmnt):
 	returnValueAst = makeAstNodeCall(returnTypeAst, valueAst)
 	return ast.Return(value=returnValueAst)
 
-def codeContentToBody(funcEnv, content, body):
-	for c in content:
-		if isinstance(c, CVarDecl):
-			funcEnv.registerNewVar(c.name, c)
-		elif isinstance(c, CStatement):
-			a, t = astAndTypeForCStatement(funcEnv, c)
-			if isinstance(a, ast.expr):
-				a = ast.Expr(value=a)
-			body.append(a)
-		elif isinstance(c, CWhileStatement):
-			body.append(astForCWhile(funcEnv, c))
-		elif isinstance(c, CForStatement):
-			body.append(astForCFor(funcEnv, c))
-		elif isinstance(c, CDoStatement):
-			body.append(astForCDoWhile(funcEnv, c))
-		elif isinstance(c, CIfStatement):
-			body.append(astForCIf(funcEnv, c))
-		elif isinstance(c, CSwitchStatement):
-			body.append(astForCSwitch(funcEnv, c))
-		elif isinstance(c, CReturnStatement):
-			body.append(astForCReturn(funcEnv, c))
-		else:
-			assert False, "cannot handle " + str(c)
+def cStatementToPyAst(funcEnv, c, body):
+	if isinstance(c, CVarDecl):
+		funcEnv.registerNewVar(c.name, c)
+	elif isinstance(c, CStatement):
+		a, t = astAndTypeForCStatement(funcEnv, c)
+		if isinstance(a, ast.expr):
+			a = ast.Expr(value=a)
+		body.append(a)
+	elif isinstance(c, CWhileStatement):
+		body.append(astForCWhile(funcEnv, c))
+	elif isinstance(c, CForStatement):
+		body.append(astForCFor(funcEnv, c))
+	elif isinstance(c, CDoStatement):
+		body.append(astForCDoWhile(funcEnv, c))
+	elif isinstance(c, CIfStatement):
+		body.append(astForCIf(funcEnv, c))
+	elif isinstance(c, CSwitchStatement):
+		body.append(astForCSwitch(funcEnv, c))
+	elif isinstance(c, CReturnStatement):
+		body.append(astForCReturn(funcEnv, c))
+	elif isinstance(c, CCodeBlock):
+		funcEnv.pushScope()
+		cCodeToPyAstList(funcEnv, c.body, body)
+		funcEnv.popScope()
+	else:
+		assert False, "cannot handle " + str(c)
 
+def cCodeToPyAstList(funcEnv, cBody, astBody):
+	if isinstance(cBody, CBody):
+		for c in cBody.contentlist:
+			cStatementToPyAst(funcEnv, c, astBody)
+	else:
+		cStatementToPyAst(funcEnv, cBody, astBody)
+		
 class Interpreter:
 	def __init__(self):
 		self.stateStructs = []
@@ -732,11 +811,13 @@ class Interpreter:
 		self.globalScope = GlobalScope(self, self._cStateWrapper)
 		self._func_cache = {}
 		self.globalsWrapper = GlobalsWrapper(self.globalScope)
+		self.globalsStructWrapper = GlobalsStructWrapper(self.globalScope)
 		self.wrappedValuesDict = {} # id(obj) -> obj
 		self.globalsDict = {
 			"ctypes": ctypes,
 			"helpers": Helpers,
 			"g": self.globalsWrapper,
+			"structs": self.globalsStructWrapper,
 			"values": self.wrappedValuesDict,
 			"intp": self
 			}
@@ -773,7 +854,7 @@ class Interpreter:
 			# Hack for now: ignore :)
 			print "XXX:", func.name, "is not loaded yet"
 		else:
-			codeContentToBody(base, func.body.contentlist, base.astNode.body)
+			cCodeToPyAstList(base, func.body, base.astNode.body)
 		base.popScope()
 		if isSameType(self._cStateWrapper, func.type, CVoidType()):
 			returnValueAst = NoneAstNode
@@ -789,6 +870,7 @@ class Interpreter:
 		output = StringIO()
 		from py_demo_unparse import Unparser
 		Unparser(pyAst, output)
+		output.write("\n")
 		return output.getvalue()
 
 	def _compile(self, pyAst):
@@ -832,8 +914,7 @@ class Interpreter:
 	
 	def dumpFunc(self, funcname, output=sys.stdout):
 		f = self.getFunc(funcname)
-		from py_demo_unparse import Unparser
-		Unparser(f.C_pyAst, output)
+		print >>output, f.C_unparse()
 	
 	def _castArgToCType(self, arg, typ):
 		if isinstance(typ, CPointerType):

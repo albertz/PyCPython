@@ -1539,6 +1539,15 @@ class CFunc(_CBaseWithOptBody):
 class CVarDecl(_CBaseWithOptBody):
 	finalize = lambda *args: _finalizeBasicType(*args, dictName="vars")	
 
+def wrapCTypeClassIfNeeded(t):
+	if t.__base__ is _ctypes._SimpleCData: return wrapCTypeClass(t)
+	else: return t
+	
+def wrapCTypeClass(t):
+	class WrappedType(t): pass
+	WrappedType.__name__ = t.__name__
+	return WrappedType
+
 def _getCTypeStruct(baseClass, obj, stateStruct):
 	if hasattr(obj, "_ctype"): return obj._ctype
 	assert hasattr(obj, "body"), str(obj) + " must have the body attrib"
@@ -1551,11 +1560,9 @@ def _getCTypeStruct(baseClass, obj, stateStruct):
 			if len(c.arrayargs) != 1: raise Exception, str(c) + " has too many array args"
 			n = c.arrayargs[0].value
 			t = t * n
-		elif t.__base__ is _ctypes._SimpleCData and stateStruct.IndirectSimpleCTypes:
+		elif stateStruct.IndirectSimpleCTypes:
 			# See http://stackoverflow.com/questions/6800827/python-ctypes-structure-how-to-access-attributes-as-if-they-were-ctypes-and-not/6801253#6801253
-			class WrappedType(t): pass
-			WrappedType.__name__ = t.__name__
-			t = WrappedType
+			t = wrapCTypeClassIfNeeded(t)
 		if hasattr(c, "bitsize"):
 			fields += [(c.name, t, c.bitsize)]
 		else:
@@ -1731,7 +1738,6 @@ def _create_cast_call(stateStruct, parent, base, token):
 	arg = CStatement(parent=funcCall)
 	funcCall.args = [arg]
 	arg._cpre3_handle_token(stateStruct, token)
-	arg.finalize(stateStruct)
 	funcCall.finalize(stateStruct)
 	return funcCall
 
@@ -1853,6 +1859,7 @@ class CStatement(_CBaseWithOptBody):
 				self._leftexpr = CStr(self._leftexpr.content + token.content)
 			else:
 				self._leftexpr = _create_cast_call(stateStruct, self, self._leftexpr, token)
+				self._state = 40
 		elif self._state == 6: # after expr + op
 			if isinstance(token, CIdentifier):
 				obj = findObjInNamespace(stateStruct, self.parent, token.content)
@@ -1889,13 +1896,14 @@ class CStatement(_CBaseWithOptBody):
 					self._op = token
 					self._state = 6
 				else:
-					self._rightexpr = CStatement(parent=self, _leftexpr=self._rightexpr)
+					self._rightexpr = CStatement(parent=self, _leftexpr=self._rightexpr, _state=6)
 					self._rightexpr._op = token
 					self._state = 8
 			elif isinstance(self._rightexpr, CStr) and isinstance(token, CStr):
 				self._rightexpr = CStr(self._rightexpr.content + token.content)
 			else:
 				self._rightexpr = _create_cast_call(stateStruct, self, self._rightexpr, token)
+				self._state = 45
 		elif self._state == 8: # right-to-left chain, pull down
 			assert isinstance(self._rightexpr, CStatement)
 			self._rightexpr._cpre3_handle_token(stateStruct, token)
@@ -1926,6 +1934,20 @@ class CStatement(_CBaseWithOptBody):
 				self._state = 5
 			else:
 				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + str(self._leftexpr))
+		elif self._state == 40: # after cast_call((expr) x)
+			if token in (COp("."),COp("->")):
+				self._leftexpr.args[0]._cpre3_handle_token(stateStruct, token)
+			else:
+				self._leftexpr.args[0].finalize(stateStruct)
+				self._state = 5
+				self._cpre3_handle_token(stateStruct, token) # redo handling
+		elif self._state == 45: # after expr + op + cast_call((expr) x)
+			if token in (COp("."),COp("->")):
+				self._rightexpr.args[0]._cpre3_handle_token(stateStruct, token)
+			else:
+				self._rightexpr.args[0].finalize(stateStruct)
+				self._state = 7
+				self._cpre3_handle_token(stateStruct, token) # redo handling
 		else:
 			stateStruct.error("internal error: statement parsing: token " + str(token) + " in invalid state " + str(self._state))
 	def _cpre3_parse_brackets(self, stateStruct, openingBracketToken, input_iter):
@@ -1956,6 +1978,15 @@ class CStatement(_CBaseWithOptBody):
 			self._rightexpr._cpre3_parse_brackets(stateStruct, openingBracketToken, input_iter)
 			if self._rightexpr._state == 5:
 				self._state = 9
+			return
+
+		if self._state in (40,45): # after .. cast_call + expr
+			if self._state == 40:
+				ref = self._leftexpr
+			else:
+				ref = self._rightexpr
+			assert isinstance(ref, CFuncCall)
+			ref.args[0]._cpre3_parse_brackets(stateStruct, openingBracketToken, input_iter)
 			return
 
 		if openingBracketToken.content == "(":
@@ -2330,6 +2361,28 @@ class CCodeBlock(_CBaseWithOptBody):
 	NameIsRelevant = False
 class CGotoLabel(_CBaseWithOptBody): pass
 
+def _getLastCBody(base):
+	last = None
+	while True:
+		if isinstance(base.body, CBody):
+			if not base.body.contentlist: break
+			last = base.body.contentlist[-1]
+		elif isinstance(base.body, _CControlStructure):
+			last = base.body
+		else:
+			break
+		if not isinstance(last, _CControlStructure): break
+		if isinstance(last, CIfStatement):
+			if last.elsePart is not None:
+				base = last.elsePart
+			else:
+				base = last
+		elif isinstance(last, (CForStatement,CWhileStatement)):
+			base = last
+		else:
+			break
+	return last
+
 class _CControlStructure(_CBaseWithOptBody):
 	NameIsRelevant = False
 	StrOutAttribList = [
@@ -2356,7 +2409,7 @@ class CWhileStatement(_CControlStructure):
 		assert self.parent is not None
 
 		if isinstance(self.parent.body, CBody) and self.parent.body.contentlist:
-			last = self.parent.body.contentlist[-1]
+			last = _getLastCBody(self.parent)
 			if isinstance(last, CDoStatement):
 				if self.body is not None:
 					stateStruct.error("'while' " + str(self) + " as part of 'do' " + str(last) + " has another body")
