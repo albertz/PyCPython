@@ -84,10 +84,10 @@ if __name__ == '__main__':
 	print "PyAST of Py_Main:"
 	interpreter.dumpFunc("Py_Main")
 
-	# Test run
+	print "Test run, printing version:"
+	interpreter.runFunc("Py_Main", 2, ["Python", "-V", None])	
 	print
-	interpreter.runFunc("Py_Main", 2, ["Python", "-V", None])
 	
-	print
+	print "Real run:"
 	interpreter.runFunc("Py_Main", len(sys.argv), sys.argv + [None])
 
