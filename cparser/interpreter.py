@@ -148,6 +148,8 @@ class GlobalsWrapper:
 			v = self.globalScope.interpreter.getFunc(name)
 		elif isinstance(decl, (CTypedef,CStruct,CUnion,CEnum)):
 			v = getCType(decl, self.globalScope.stateStruct)
+		elif isinstance(decl, CFuncPointerDecl):
+			v = getCType(decl, self.globalScope.stateStruct)
 		else:
 			assert False, "didn't expected " + str(decl)
 		self.__dict__[name] = v
@@ -296,6 +298,9 @@ def getAstNode_valueFromObj(objAst, objType):
 		astVoidP = makeAstNodeCall(astCast, objAst, astVoidPT)
 		astValue = getAstNodeAttrib(astVoidP, "value")
 		return ast.BoolOp(op=ast.Or(), values=[astValue, ast.Num(0)])
+	elif isinstance(objType, CFuncPointerDecl):
+		# TODO...?
+		return objAst
 	else:
 		astValue = getAstNodeAttrib(objAst, "value")
 		return astValue		
@@ -556,6 +561,9 @@ def getAstForWrapValue(interpreter, wrapValue):
 def astAndTypeForStatement(funcEnv, stmnt):
 	if isinstance(stmnt, (CVarDecl,CFuncArgDecl)):
 		return funcEnv.getAstNodeForVarDecl(stmnt), stmnt.type
+	elif isinstance(stmnt, CFunc):
+		# TODO: specify type correctly
+		return funcEnv.getAstNodeForVarDecl(stmnt), CFuncPointerDecl()
 	elif isinstance(stmnt, CStatement):
 		return astAndTypeForCStatement(funcEnv, stmnt)
 	elif isinstance(stmnt, CAttribAccessRef):
