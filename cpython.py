@@ -57,9 +57,11 @@ def prepareState():
 	return state
 
 state = prepareState()
-cparser.parse(CPythonDir + "/Modules/main.c", state)
-cparser.parse(CPythonDir + "/Python/getopt.c", state)
-cparser.parse(CPythonDir + "/Python/pythonrun.c", state)
+cparser.parse(CPythonDir + "/Modules/main.c", state) # Py_Main
+cparser.parse(CPythonDir + "/Python/getopt.c", state) # _PyOS_GetOpt
+cparser.parse(CPythonDir + "/Python/pythonrun.c", state) # Py_Initialize
+cparser.parse(CPythonDir + "/Python/pystate.c", state) # PyInterpreterState_New
+cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOptions
 
 import cparser.interpreter
 
@@ -84,12 +86,12 @@ if __name__ == '__main__':
 	print
 	print "PyAST of Py_Main:"
 	interpreter.dumpFunc("Py_Main")
-
+	
 	args = ("Py_Main", 2, ["Python", "-V", None])
 	print "Test run", args, ":"
 	interpreter.runFunc(*args)
 	print
-	
+
 	args = ("Py_Main", len(sys.argv), sys.argv + [None])
 	print "Real run", args, ":"
 	interpreter.runFunc(*args)
