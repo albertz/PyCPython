@@ -74,15 +74,6 @@ if __name__ == '__main__':
 	for m in state._errors:
 		print m
 	
-	for f in state.contentlist:
-		if not isinstance(f, cparser.CFunc): continue
-		if not f.body: continue
-		
-		print
-		print "parsed content of " + str(f) + ":"
-		for c in f.body.contentlist:
-			print c
-	
 	print
 	print "PyAST of Py_Main:"
 	interpreter.dumpFunc("Py_Main")
