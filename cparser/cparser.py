@@ -534,8 +534,10 @@ def cpreprocess_evaluate_ifdef(state, arg):
 	return arg in state.macros
 
 def cpreprocess_evaluate_single(state, arg):
-	if arg == "": return None	
+	if arg == "": return None
 	try: return int(arg) # is integer?
+	except: pass
+	try: return int(arg, 16) # is hex?
 	except: pass
 	if len(arg) >= 2 and arg[0] == '"' and arg[-1] == '"': return arg[1:-1] # is string?
 	
@@ -1128,9 +1130,11 @@ class _CBase:
 			setattr(self, k, v)
 	def __repr__(self):
 		if self.content is None: return "<" + self.__class__.__name__ + ">"
-		return "<" + self.__class__.__name__ + " " + str(self.content) + ">"
+		return "<" + self.__class__.__name__ + " " + repr(self.content) + ">"
 	def __eq__(self, other):
 		return self.__class__ is other.__class__ and self.content == other.content
+	def __ne__(self, other):
+		return not self == other
 	def __hash__(self): return hash(self.__class__) + 31 * hash(self.content)
 	def asCCode(self): return self.content
 
@@ -1296,9 +1300,25 @@ def cpre2_parse(stateStruct, input, brackets = None):
 					if macrobrackets:
 						if len(macroargs) == 0: macroargs = [""]
 						macroargs[-1] += c
+						if c == "'": state = 311
+						elif c == '"': state = 313
 					else:
 						state = 32
 						breakLoop = False
+			elif state == 311: # in 'str in macro
+				macroargs[-1] += c
+				if c == "'": state = 31
+				elif c == "\\": state = 312
+			elif state == 312: # in escape in 'str in macro
+				macroargs[-1] += c
+				state = 311
+			elif state == 313: # in "str in macro
+				macroargs[-1] += c
+				if c == '"': state = 31
+				elif c == "\\": state = 314
+			elif state == 314: # in escape in "str in macro
+				macroargs[-1] += c
+				state = 313
 			elif state == 32: # finalize macro
 				try:
 					resolved = stateStruct.macros[macroname].eval(stateStruct, macroargs)
@@ -1790,11 +1810,11 @@ def opsDoLeftToRight(stateStruct, op1, op2):
 	
 	try: opprec1 = OpPrecedences[op1]
 	except:
-		stateStruct.error("internal error: statement parsing: op " + op1 + " unknown")
+		stateStruct.error("internal error: statement parsing: op1 " + repr(op1) + " unknown")
 		opprec1 = 100
 	try: opprec2 = OpPrecedences[op2]
 	except:
-		stateStruct.error("internal error: statement parsing: op " + op2 + " unknown")
+		stateStruct.error("internal error: statement parsing: op2 " + repr(op2) + " unknown")
 		opprec2 = 100
 	
 	if opprec1 < opprec2:
@@ -1813,6 +1833,10 @@ def getConstValue(stateStruct, obj):
 	return None
 
 class CSizeofSymbol: pass
+
+class CArrayArgs(_CBaseWithOptBody):
+	# args is a list of CStatement
+	NameIsRelevant = False
 
 class CStatement(_CBaseWithOptBody):
 	NameIsRelevant = False
@@ -1931,7 +1955,10 @@ class CStatement(_CBaseWithOptBody):
 				self._state = 22
 				self._rightexpr = CPtrAccessRef(parent=self, base=self._rightexpr)
 			elif isinstance(token, COp):
-				if self._op == COp("?") and token == COp(":"):
+				if token == COp(":"):
+					if self._op != COp("?"):
+						stateStruct.error("internal error: got ':' after " + repr(self) + " with " + repr(self._op))
+						# TODO: any better way to fix/recover? right now, we just assume '?' anyway
 					self._middleexpr = self._rightexpr
 					self._rightexpr = None
 					self._op = COp("?:")
@@ -1965,7 +1992,16 @@ class CStatement(_CBaseWithOptBody):
 			elif not isinstance(token, COp):
 				self._rightexpr._cpre3_handle_token(stateStruct, token)
 			else: # is COp
-				if opsDoLeftToRight(stateStruct, self._op.content, token.content):
+				if token.content == ":":
+					if self._op == COp("?"):
+						self._middleexpr = self._rightexpr
+						self._rightexpr = None
+						self._op = COp("?:")
+						self._state = 6
+					else:
+						self._rightexpr._cpre3_handle_token(stateStruct, token)
+						self._state = 8
+				elif opsDoLeftToRight(stateStruct, self._op.content, token.content):
 					import copy
 					subStatement = copy.copy(self)
 					self._leftexpr = subStatement
@@ -1981,7 +2017,7 @@ class CStatement(_CBaseWithOptBody):
 				self._leftexpr.name = token.content
 				self._state = 5
 			else:
-				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + str(self._leftexpr))
+				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + str(self._leftexpr) + " in state " + str(self._state))
 		elif self._state == 40: # after cast_call((expr) x)
 			if token in (COp("."),COp("->")):
 				self._leftexpr.args[0]._cpre3_handle_token(stateStruct, token)
@@ -1996,9 +2032,24 @@ class CStatement(_CBaseWithOptBody):
 				self._rightexpr.args[0].finalize(stateStruct)
 				self._state = 7
 				self._cpre3_handle_token(stateStruct, token) # redo handling
+		elif self._state == 22: # after expr + op + expr with attrib/ptr access
+			if isinstance(token, CIdentifier):
+				assert isinstance(self._rightexpr, (CAttribAccessRef,CPtrAccessRef))
+				self._rightexpr.name = token.content
+				self._state = 7
+			else:
+				stateStruct.error("statement parsing: didn't expected token " + str(token) + " after " + str(self._leftexpr) + " in state " + str(self._state))
 		else:
 			stateStruct.error("internal error: statement parsing: token " + str(token) + " in invalid state " + str(self._state))
 	def _cpre3_parse_brackets(self, stateStruct, openingBracketToken, input_iter):
+		if self._state == 0 and openingBracketToken.content == "{": # array args
+			arrayArgs = CArrayArgs(parent=self)
+			arrayArgs._bracketlevel = list(openingBracketToken.brackets)
+			cpre3_parse_statements_in_brackets(stateStruct, arrayArgs, COp(","), arrayArgs.args, input_iter)
+			arrayArgs.finalize(stateStruct)
+			self._state = 5
+			return
+		
 		if self._state in (5,7): # after expr or expr + op + expr
 			if self._state == 5:
 				ref = self._leftexpr
@@ -2596,9 +2647,6 @@ def cpre3_parse_statements_in_brackets(stateStruct, parentCObj, sepToken, addToL
 				curCObj._cpre3_parse_brackets(stateStruct, token, input_iter)
 			elif isinstance(curCObj.body, CStatement):
 				curCObj.body._cpre3_parse_brackets(stateStruct, token, input_iter)
-			elif token.content == "{":
-				CCodeBlock.overtake(curCObj)
-				cpre3_parse_body(stateStruct, curCObj, input_iter)
 			elif not curCObj.isDerived():
 				CStatement.overtake(curCObj)
 				curCObj._cpre3_parse_brackets(stateStruct, token, input_iter)
@@ -2805,7 +2853,7 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 					elif isinstance(curCObj, CEnum): DictName = "enums"
 					if DictName is not None:
 						typeObj = findCObjTypeInNamespace(stateStruct, parentCObj, DictName, curCObj.name)
-						if typeObj is not None:
+						if typeObj is not None and typeObj.body is not None: # if body is None, we still wait for another decl
 							curCObj = CVarDecl(parent=parentCObj)
 							curCObj._type_tokens += [typeObj]
 				else:
@@ -2828,7 +2876,7 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 				CStatement.overtake(curCObj)
 			if isinstance(curCObj, CStatement):
 				curCObj._cpre3_handle_token(stateStruct, token)
-			elif isinstance(curCObj.body, CStatement) and token.content != ",":
+			elif isinstance(curCObj.body, CStatement) and token.content != ",": # op(,) gets some extra handling. eg for CVarDecl
 				curCObj.body._cpre3_handle_token(stateStruct, token)
 			elif isinstance(curCObj, CCaseStatement):
 				if token.content == ":":
@@ -2842,7 +2890,10 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
 				curCObj.finalize(stateStruct)
 				curCObj = _CBaseWithOptBody(parent=parentCObj)
 			elif isinstance(curCObj, _CControlStructure):
-				stateStruct.error("cpre3 parse after " + str(curCObj) + ": didn't expected op '" + token.content + "'")
+				if isinstance(curCObj.body, CStatement): # for example, because of op(,), we might have missed that above
+					curCObj.body._cpre3_handle_token(stateStruct, token)
+				else:	
+					stateStruct.error("cpre3 parse after " + str(curCObj) + ": didn't expected op '" + token.content + "'")
 			else:
 				if token.content == "*":
 					if isinstance(curCObj, (CStruct,CUnion,CEnum)):
