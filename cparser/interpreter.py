@@ -625,12 +625,20 @@ def astAndTypeForStatement(funcEnv, stmnt):
 				return makeAstNodeCall(astCast, astVoidP, aTypeAst), aType
 			else:
 				return makeAstNodeCall(aTypeAst, bValueAst), aType
+		elif isinstance(stmnt.base, CStatement):
+			# func ptr call
+			a = ast.Call(keywords=[], starargs=None, kwargs=None)
+			pAst, pType = astAndTypeForStatement(funcEnv, stmnt.base)
+			assert isinstance(pType, CFuncPointerDecl)
+			a.func = getAstNode_valueFromObj(pAst, pType)
+			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
+			return a, pType.type
 		elif isinstance(stmnt.base, CWrapValue):
 			# expect that we just wrapped a callable function/object
 			a = ast.Call(keywords=[], starargs=None, kwargs=None)
 			a.func = getAstNodeAttrib(getAstForWrapValue(funcEnv.globalScope.interpreter, stmnt.base), "value")
 			a.args = map(lambda arg: astAndTypeForStatement(funcEnv, arg)[0], stmnt.args)
-			return a, stmnt.base.returnType
+			return a, stmnt.base.returnType			
 		else:
 			assert False, "cannot handle " + str(stmnt.base) + " call"
 	elif isinstance(stmnt, CArrayIndexRef):
@@ -705,8 +713,14 @@ def astAndTypeForCStatement(funcEnv, stmnt):
 		elif stmnt._op.content == "--":
 			return getAstNode_prefixDec(rightAstNode, rightType), rightType
 		elif stmnt._op.content == "*":
-			assert isinstance(rightType, CPointerType)
-			return getAstNodeAttrib(rightAstNode, "contents"), rightType.pointerOf
+			while isinstance(rightType, CTypedefType):
+				rightType = funcEnv.globalScope.stateStruct.typedefs[rightType.name]
+			if isinstance(rightType, CPointerType):
+				return getAstNodeAttrib(rightAstNode, "contents"), rightType.pointerOf
+			elif isinstance(rightType, CFuncPointerDecl):
+				return rightAstNode, rightType # we cannot really dereference a funcptr with ctypes ...
+			else:
+				assert False, str(stmnt) + " has bad type " + str(rightType)
 		elif stmnt._op.content == "&":
 			return makeAstNodeCall(getAstNodeAttrib("ctypes", "pointer"), rightAstNode), CPointerType(rightType)
 		elif stmnt._op.content in OpUnary:
@@ -781,35 +795,77 @@ PyAstNoOp = ast.Assert(test=ast.Name(id="True", ctx=ast.Load()), msg=None)
 
 def astForCWhile(funcEnv, stmnt):
 	assert isinstance(stmnt, CWhileStatement)
-	assert stmnt.body is not None
 	assert len(stmnt.args) == 1
 	assert isinstance(stmnt.args[0], CStatement)
+
 	whileAst = ast.While(body=[], orelse=[])
 	whileAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[0]))
+
 	funcEnv.pushScope(whileAst.body)
-	cCodeToPyAstList(funcEnv, stmnt.body)
+	if stmnt.body is not None:
+		cCodeToPyAstList(funcEnv, stmnt.body)
 	if not whileAst.body: whileAst.body.append(ast.Pass())
 	funcEnv.popScope()
+
 	return whileAst
 
 def astForCFor(funcEnv, stmnt):
-	# TODO
-	return PyAstNoOp
+	assert isinstance(stmnt, CForStatement)
+	assert len(stmnt.args) == 3
+	assert isinstance(stmnt.args[1], CStatement) # second arg is the check; we must be able to evaluate that
+
+	# introduce dummy 'if' AST so that we have a scope for the for-loop (esp. the first statement)
+	ifAst = ast.If(body=[], orelse=[], test=ast.Name(id="True", ctx=ast.Load()))
+	funcEnv.pushScope(ifAst.body)
+	cStatementToPyAst(funcEnv, stmnt.args[0])
+	
+	whileAst = ast.While(body=[], orelse=[], test=ast.Name(id="True", ctx=ast.Load()))
+	ifAst.body.append(whileAst)
+
+	ifTestAst = ast.If(body=[ast.Pass()], orelse=[ast.Break()])
+	ifTestAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[1]))
+	whileAst.body.append(ifTestAst)
+	
+	funcEnv.pushScope(whileAst.body)
+	if stmnt.body is not None:
+		cCodeToPyAstList(funcEnv, stmnt.body)
+	cStatementToPyAst(funcEnv, stmnt.args[2])	
+	funcEnv.popScope() # whileAst / main for-body
+	
+	funcEnv.popScope() # ifAst
+	return ifAst
 
 def astForCDoWhile(funcEnv, stmnt):
-	# TODO
-	return PyAstNoOp
+	assert isinstance(stmnt, CDoStatement)
+	assert isinstance(stmnt.whilePart, CWhileStatement)
+	assert stmnt.whilePart.body is None
+	assert len(stmnt.args) == 0
+	assert len(stmnt.whilePart.args) == 1
+	assert isinstance(stmnt.whilePart.args[0], CStatement)
+	whileAst = ast.While(body=[], orelse=[], test=ast.Name(id="True", ctx=ast.Load()))
+	
+	funcEnv.pushScope(whileAst.body)
+	if stmnt.body is not None:
+		cCodeToPyAstList(funcEnv, stmnt.body)
+	funcEnv.popScope()
+
+	ifAst = ast.If(body=[ast.Continue()], orelse=[ast.Break()])
+	ifAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.whilePart.args[0]))
+	whileAst.body.append(ifAst)
+	
+	return whileAst
 
 def astForCIf(funcEnv, stmnt):
 	assert isinstance(stmnt, CIfStatement)
-	assert stmnt.body is not None
 	assert len(stmnt.args) == 1
 	assert isinstance(stmnt.args[0], CStatement)
 
 	ifAst = ast.If(body=[], orelse=[])
 	ifAst.test = getAstNode_valueFromObj(*astAndTypeForCStatement(funcEnv, stmnt.args[0]))
+
 	funcEnv.pushScope(ifAst.body)
-	cCodeToPyAstList(funcEnv, stmnt.body)
+	if stmnt.body is not None:
+		cCodeToPyAstList(funcEnv, stmnt.body)
 	if not ifAst.body: ifAst.body.append(ast.Pass())
 	funcEnv.popScope()
 	
