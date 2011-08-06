@@ -45,6 +45,7 @@ def prepareState():
 				state.macros["SIZEOF_PID_T"] = state.macros["SIZEOF_INT"]
 				state.macros["SIZEOF_TIME_T"] = state.macros["SIZEOF_LONG"]
 				state.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
+				state.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
 				return
 				yield None # make it a generator
 			return reader(), None
