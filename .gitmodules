@@ -1,0 +1,4 @@
+[submodule "cparser"]
+	path = cparser
+	url = https://github.com/albertz/PyCParser.git
+	branch = master
