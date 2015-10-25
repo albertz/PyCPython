@@ -2,3 +2,7 @@
 	path = cparser
 	url = https://github.com/albertz/PyCParser.git
 	branch = master
+[submodule "CPython"]
+	path = CPython
+	url = https://github.com/albertz/CPython.git
+	branch = master
