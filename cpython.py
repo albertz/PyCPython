@@ -12,7 +12,7 @@ if __name__ == '__main__':
 else:
 	MyDir = "."
 
-CPythonDir = MyDir + "/Python-2.7.1"
+CPythonDir = MyDir + "/CPython"
 
 import cparser
 
