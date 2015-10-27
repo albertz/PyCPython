@@ -30,6 +30,7 @@ def prepareState():
 	def readLocalInclude(state, filename):
 		if filename == "pyconfig.h":
 			def reader():
+				# see CPython/pyconfig.h.in for reference
 				import ctypes
 				sizeofMacro = lambda t: cparser.Macro(rightside=str(ctypes.sizeof(t)))
 				state.macros["SIZEOF_SHORT"] = sizeofMacro(ctypes.c_short)
@@ -46,6 +47,7 @@ def prepareState():
 				state.macros["SIZEOF_TIME_T"] = state.macros["SIZEOF_LONG"]
 				state.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
 				state.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
+				# _GNU_SOURCE, _POSIX_C_SOURCE or so?
 				return
 				yield None # make it a generator
 			return reader(), None
