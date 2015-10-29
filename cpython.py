@@ -65,6 +65,7 @@ cparser.parse(CPythonDir + "/Python/getopt.c", state) # _PyOS_GetOpt
 cparser.parse(CPythonDir + "/Python/pythonrun.c", state) # Py_Initialize
 cparser.parse(CPythonDir + "/Python/pystate.c", state) # PyInterpreterState_New
 cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOptions
+cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
 cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 import cparser.interpreter
