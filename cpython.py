@@ -68,6 +68,7 @@ cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOption
 cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
 cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
 cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
+cparser.parse(CPythonDir + "/Python/ceval.c", state) # PyEval_EvalFrameEx etc
 cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 import cparser.interpreter
