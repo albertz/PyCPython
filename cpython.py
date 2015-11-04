@@ -15,6 +15,7 @@ else:
 CPythonDir = MyDir + "/CPython"
 
 import cparser
+import cparser.interpreter
 
 def prepareState():
 	state = cparser.State()
@@ -28,6 +29,7 @@ def prepareState():
 	state.findIncludeFullFilename = findIncludeFullFilename
 	
 	def readLocalInclude(state, filename):
+		#print " ", filename, "..."
 		if filename == "pyconfig.h":
 			def reader():
 				# see CPython/pyconfig.h.in for reference
@@ -59,34 +61,47 @@ def prepareState():
 	
 	return state
 
-state = prepareState()
-cparser.parse(CPythonDir + "/Modules/main.c", state) # Py_Main
-cparser.parse(CPythonDir + "/Python/getopt.c", state) # _PyOS_GetOpt
-cparser.parse(CPythonDir + "/Python/pythonrun.c", state) # Py_Initialize
-cparser.parse(CPythonDir + "/Python/pystate.c", state) # PyInterpreterState_New
-cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOptions
-cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
-cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
-cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
-cparser.parse(CPythonDir + "/Python/ceval.c", state) # PyEval_EvalFrameEx etc
-cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
-import cparser.interpreter
+def main(argv):
+	state = prepareState()
 
-interpreter = cparser.interpreter.Interpreter()
-interpreter.register(state)
-interpreter.registerFinalize()
+	print "parsing..."
+	# We keep all in the same state, i.e. the same static space.
+	# This also means that we don't reset macro definitions. This speeds up header includes.
+	# Usually this is not a problem.
+	cparser.parse(CPythonDir + "/Modules/main.c", state) # Py_Main
+	state.macros["FAST_LOOPS"] = cparser.Macro(rightside="0")  # not sure where this would come from
+	cparser.parse(CPythonDir + "/Python/ceval.c", state) # PyEval_EvalFrameEx etc
+	del state.macros["EMPTY"]  # will be redefined later
+	cparser.parse(CPythonDir + "/Python/getopt.c", state) # _PyOS_GetOpt
+	cparser.parse(CPythonDir + "/Python/pythonrun.c", state) # Py_Initialize
+	cparser.parse(CPythonDir + "/Python/pystate.c", state) # PyInterpreterState_New
+	cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOptions
+	cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
+	cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
+	cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
+	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
-if __name__ == '__main__':
-	print "erros so far:"
-	for m in state._errors:
-		print m
-	
+	if state._errors:
+		print "parse errors:"
+		for m in state._errors:
+			print m
+	else:
+		print "no parse errors"
+
+	interpreter = cparser.interpreter.Interpreter()
+	interpreter.register(state)
+	interpreter.registerFinalize()
+
+
 	print
 	print "PyAST of Py_Main:"
 	interpreter.dumpFunc("Py_Main")
-	
-	args = ("Py_Main", len(sys.argv), sys.argv + [None])
+
+	args = ("Py_Main", len(argv), argv + [None])
 	print "Run", args, ":"
 	interpreter.runFunc(*args)
 
+
+if __name__ == '__main__':
+	main(sys.argv)
