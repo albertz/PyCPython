@@ -91,7 +91,6 @@ def main(argv):
 
 	interpreter = cparser.interpreter.Interpreter()
 	interpreter.register(state)
-	interpreter.registerFinalize()
 
 
 	print
