@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # PyCPython - interpret CPython in Python
 # by Albert Zeyer, 2011
 # code under GPL
