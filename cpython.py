@@ -80,6 +80,8 @@ def main(argv):
 	cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
 	cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
 	cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
+	cparser.parse(CPythonDir + "/Objects/tupleobject.c", state) # PyTuple_New
+	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
 	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 	if state._errors:
