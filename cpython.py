@@ -16,6 +16,7 @@ CPythonDir = MyDir + "/CPython"
 
 import cparser
 import cparser.interpreter
+import argparse
 
 def prepareState():
 	state = cparser.State()
@@ -63,9 +64,25 @@ def prepareState():
 
 
 def main(argv):
+	argparser = argparse.ArgumentParser(
+		usage="%s [PyCPython options, see below] [CPython options, see via --help]" % argv[0],
+		description="Emulate CPython by interpreting its C code via PyCParser.",
+		epilog="All other options are passed on to CPython. Use --help to see them.",
+		add_help=False  # we will add our own
+	)
+	argparser.add_argument(
+		'--pycpython-help', action='help', help='show this help message and exit')
+	argparser.add_argument(
+		'--dump-python', action='store', nargs=1,
+		help="Dumps the converted Python code of the specified function, e.g. Py_Main.")
+	args_ns, argv_rest = argparser.parse_known_args(argv[1:])
+	argv = argv[:1] + argv_rest
+	print "PyCPython -", argparser.description,
+	print "(use --pycpython-help for help)"
+
 	state = prepareState()
 
-	print "parsing..."
+	print "Parsing CPython...",
 	# We keep all in the same state, i.e. the same static space.
 	# This also means that we don't reset macro definitions. This speeds up header includes.
 	# Usually this is not a problem.
@@ -85,19 +102,21 @@ def main(argv):
 	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 	if state._errors:
-		print "parse errors:"
+		print "finished, parse errors:"
 		for m in state._errors:
 			print m
 	else:
-		print "no parse errors"
+		print "finished, no parse errors."
 
 	interpreter = cparser.interpreter.Interpreter()
 	interpreter.register(state)
 
-
-	print
-	print "PyAST of Py_Main:"
-	interpreter.dumpFunc("Py_Main")
+	if args_ns.dump_python:
+		for fn in args_ns.dump_python:
+			print
+			print "PyAST of %s:" % fn
+			interpreter.dumpFunc(fn)
+		sys.exit()
 
 	args = ("Py_Main", len(argv), argv + [None])
 	print "Run", args, ":"
