@@ -99,6 +99,7 @@ def main(argv):
 	cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
 	cparser.parse(CPythonDir + "/Objects/tupleobject.c", state) # PyTuple_New
 	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
+	cparser.parse(CPythonDir + "/Modules/gcmodule.c", state) # _PyObject_GC_NewVar
 	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 	if state._errors:
