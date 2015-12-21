@@ -98,6 +98,10 @@ def main(argv):
 	cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
 	cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
 	cparser.parse(CPythonDir + "/Objects/tupleobject.c", state) # PyTuple_New
+	del state.macros["Return"]  # will be used differently
+	# We need these macro hacks because dictobject.c will use the same vars.
+	state.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
+	state.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
 	cparser.parse(CPythonDir + "/Objects/dictobject.c", state)  # PyDict_New
 	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
 	cparser.parse(CPythonDir + "/Modules/gcmodule.c", state) # _PyObject_GC_NewVar
