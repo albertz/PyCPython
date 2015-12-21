@@ -25,7 +25,7 @@ def prepareState():
 	def findIncludeFullFilename(filename, local):
 		fullfn = CPythonDir + "/Include/" + filename
 		if os.path.exists(fullfn): return fullfn
-		return filename
+		return cparser.State.findIncludeFullFilename(state, filename, local)
 	
 	state.findIncludeFullFilename = findIncludeFullFilename
 	
