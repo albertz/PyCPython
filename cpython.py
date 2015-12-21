@@ -18,49 +18,44 @@ import cparser
 import cparser.interpreter
 import argparse
 
-def prepareState():
-	state = cparser.State()
-	state.autoSetupSystemMacros()
-	
-	def findIncludeFullFilename(filename, local):
+class CPythonState(cparser.State):
+
+	def __init__(self):
+		super(CPythonState, self).__init__()
+		self.autoSetupSystemMacros()
+		self.autoSetupGlobalIncludeWrappers()
+
+	def findIncludeFullFilename(self, filename, local):
 		fullfn = CPythonDir + "/Include/" + filename
 		if os.path.exists(fullfn): return fullfn
-		return cparser.State.findIncludeFullFilename(state, filename, local)
-	
-	state.findIncludeFullFilename = findIncludeFullFilename
-	
-	def readLocalInclude(state, filename):
+		return super(CPythonState, self).findIncludeFullFilename(filename, local)
+
+	def readLocalInclude(self, filename):
 		#print " ", filename, "..."
 		if filename == "pyconfig.h":
 			def reader():
 				# see CPython/pyconfig.h.in for reference
 				import ctypes
 				sizeofMacro = lambda t: cparser.Macro(rightside=str(ctypes.sizeof(t)))
-				state.macros["SIZEOF_SHORT"] = sizeofMacro(ctypes.c_short)
-				state.macros["SIZEOF_INT"] = sizeofMacro(ctypes.c_int)
-				state.macros["SIZEOF_LONG"] = sizeofMacro(ctypes.c_long)
-				state.macros["SIZEOF_LONG_LONG"] = sizeofMacro(ctypes.c_longlong)
-				state.macros["SIZEOF_DOUBLE"] = sizeofMacro(ctypes.c_double)
-				state.macros["SIZEOF_FLOAT"] = sizeofMacro(ctypes.c_float)
-				state.macros["SIZEOF_VOID_P"] = sizeofMacro(ctypes.c_void_p)
-				state.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
-				state.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
-				state.macros["SIZEOF_PTHREAD_T"] = state.macros["SIZEOF_LONG"]
-				state.macros["SIZEOF_PID_T"] = state.macros["SIZEOF_INT"]
-				state.macros["SIZEOF_TIME_T"] = state.macros["SIZEOF_LONG"]
-				state.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
-				state.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
+				self.macros["SIZEOF_SHORT"] = sizeofMacro(ctypes.c_short)
+				self.macros["SIZEOF_INT"] = sizeofMacro(ctypes.c_int)
+				self.macros["SIZEOF_LONG"] = sizeofMacro(ctypes.c_long)
+				self.macros["SIZEOF_LONG_LONG"] = sizeofMacro(ctypes.c_longlong)
+				self.macros["SIZEOF_DOUBLE"] = sizeofMacro(ctypes.c_double)
+				self.macros["SIZEOF_FLOAT"] = sizeofMacro(ctypes.c_float)
+				self.macros["SIZEOF_VOID_P"] = sizeofMacro(ctypes.c_void_p)
+				self.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
+				self.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
+				self.macros["SIZEOF_PTHREAD_T"] = self.macros["SIZEOF_LONG"]
+				self.macros["SIZEOF_PID_T"] = self.macros["SIZEOF_INT"]
+				self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
+				self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
+				self.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
 				# _GNU_SOURCE, _POSIX_C_SOURCE or so?
 				return
 				yield None # make it a generator
 			return reader(), None
-		return cparser.State.readLocalInclude(state, filename)
-	
-	state.readLocalInclude = lambda fn: readLocalInclude(state, fn)
-	
-	state.autoSetupGlobalIncludeWrappers()
-	
-	return state
+		return super(CPythonState, self).readLocalInclude(filename)
 
 
 def main(argv):
@@ -80,7 +75,7 @@ def main(argv):
 	print "PyCPython -", argparser.description,
 	print "(use --pycpython-help for help)"
 
-	state = prepareState()
+	state = CPythonState()
 
 	print "Parsing CPython...",
 	# We keep all in the same state, i.e. the same static space.
