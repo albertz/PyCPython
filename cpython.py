@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # PyCPython - interpret CPython in Python
 # by Albert Zeyer, 2011
-# code under GPL
+# code under BSD 2-Clause License
 
 import better_exchook
 better_exchook.install()
