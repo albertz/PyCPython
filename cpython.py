@@ -99,6 +99,8 @@ def main(argv):
 	state.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
 	state.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
 	cparser.parse(CPythonDir + "/Objects/dictobject.c", state)  # PyDict_New
+	# We need this macro hack because stringobject.c will use the same var.
+	state.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
 	cparser.parse(CPythonDir + "/Objects/stringobject.c", state)  # PyString_FromString
 	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
 	cparser.parse(CPythonDir + "/Modules/gcmodule.c", state) # _PyObject_GC_NewVar
