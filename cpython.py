@@ -71,6 +71,9 @@ def main(argv):
 	argparser.add_argument(
 		'--dump-python', action='store', nargs=1,
 		help="Dumps the converted Python code of the specified function, e.g. Py_Main.")
+	argparser.add_argument(
+		'--verbose-jit', action='store_true',
+		help="Prints what functions and global vars we are going to translate.")
 	args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 	argv = argv[:1] + argv_rest
 	print "PyCPython -", argparser.description,
@@ -122,6 +125,10 @@ def main(argv):
 			print "PyAST of %s:" % fn
 			interpreter.dumpFunc(fn)
 		sys.exit()
+
+	if args_ns.verbose_jit:
+		interpreter.debug_print_getFunc = True
+		interpreter.debug_print_getVar = True
 
 	args = ("Py_Main", len(argv), argv + [None])
 	print "Run", args, ":"
