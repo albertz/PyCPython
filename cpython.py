@@ -59,6 +59,23 @@ class CPythonState(cparser.State):
 		return super(CPythonState, self).readLocalInclude(filename)
 
 
+def init_faulthandler(sigusr1_chain=False):
+  """
+  :param bool sigusr1_chain: whether the default SIGUSR1 handler should also be called.
+  """
+  try:
+    import faulthandler
+  except ImportError, e:
+    print "faulthandler import error. %s" % e
+    return
+  # Only enable if not yet enabled -- otherwise, leave it in its current state.
+  if not faulthandler.is_enabled():
+    faulthandler.enable()
+    if os.name != 'nt':
+      import signal
+      faulthandler.register(signal.SIGUSR1, all_threads=True, chain=sigusr1_chain)
+
+
 def main(argv):
 	argparser = argparse.ArgumentParser(
 		usage="%s [PyCPython options, see below] [CPython options, see via --help]" % argv[0],
@@ -136,4 +153,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+	init_faulthandler()
 	main(sys.argv)
