@@ -81,8 +81,11 @@ def init_faulthandler(sigusr1_chain=False):
 
 def register_sigusr1_print_backtrace():
 	if os.name == "nt": return
+	def sigusr1_handler(sig, frame):
+		print "--- SIGUSR1 handler"
+		better_exchook.print_tb(tb=frame)
 	import signal
-	signal.signal(signal.SIGUSR1, better_exchook.print_tb)
+	signal.signal(signal.SIGUSR1, sigusr1_handler)
 
 
 def main(argv):
