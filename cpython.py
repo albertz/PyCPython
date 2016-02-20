@@ -60,20 +60,29 @@ class CPythonState(cparser.State):
 
 
 def init_faulthandler(sigusr1_chain=False):
-  """
-  :param bool sigusr1_chain: whether the default SIGUSR1 handler should also be called.
-  """
-  try:
-    import faulthandler
-  except ImportError, e:
-    print "faulthandler import error. %s" % e
-    return
-  # Only enable if not yet enabled -- otherwise, leave it in its current state.
-  if not faulthandler.is_enabled():
-    faulthandler.enable()
-    if os.name != 'nt':
-      import signal
-      faulthandler.register(signal.SIGUSR1, all_threads=True, chain=sigusr1_chain)
+	"""
+	:param bool sigusr1_chain: whether the default SIGUSR1 handler should also be called.
+	"""
+	try:
+		import faulthandler
+	except ImportError, e:
+		print "faulthandler import error. %s" % e
+		return
+	# Only enable if not yet enabled -- otherwise, leave it in its current state.
+	if not faulthandler.is_enabled():
+		faulthandler.enable()
+		if os.name != 'nt':
+			import signal
+			# This will print a backtrace on SIGUSR1.
+			# Note that this also works when Python is hanging,
+			# i.e. in cases where register_sigusr1_print_backtrace() will not work.
+			faulthandler.register(signal.SIGUSR1, all_threads=True, chain=sigusr1_chain)
+
+
+def register_sigusr1_print_backtrace():
+	if os.name == "nt": return
+	import signal
+	signal.signal(signal.SIGUSR1, better_exchook.print_tb)
 
 
 def main(argv):
@@ -153,5 +162,6 @@ def main(argv):
 
 
 if __name__ == '__main__':
-	init_faulthandler()
+	register_sigusr1_print_backtrace()
+	init_faulthandler(sigusr1_chain=True)
 	main(sys.argv)
