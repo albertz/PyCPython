@@ -136,6 +136,7 @@ def main(argv):
 	cparser.parse(CPythonDir + "/Objects/stringobject.c", state)  # PyString_FromString
 	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
 	cparser.parse(CPythonDir + "/Modules/gcmodule.c", state) # _PyObject_GC_NewVar
+	cparser.parse(CPythonDir + "/Objects/descrobject.c", state) # PyDescr_NewWrapper
 	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
 
 	if state._errors:
