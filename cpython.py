@@ -78,6 +78,7 @@ class CPythonState(cparser.State):
 		# We need these macro hacks because dictobject.c will use the same vars.
 		self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
 		self.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
+		self.macros["free_list"] = cparser.Macro(rightside="free_list__dict")
 		cparser.parse(CPythonDir + "/Objects/dictobject.c", self)  # PyDict_New
 		# We need this macro hack because stringobject.c will use the same var.
 		self.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
@@ -87,6 +88,7 @@ class CPythonState(cparser.State):
 		cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
 		# We need these macro hacks because methodobject.c will use the same vars.
 		self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
+		self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
 		cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
 
 
