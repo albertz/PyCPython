@@ -90,6 +90,14 @@ class CPythonState(cparser.State):
 		self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
 		self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
 		cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
+		# We need these macro hacks because methodobject.c will use the same vars.
+		self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
+		self.macros["free_list"] = cparser.Macro(rightside="free_list__list")
+		self.macros["sizeof_doc"] = cparser.Macro(rightside="sizeof_doc__list")
+		self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__list")
+		self.macros["index_doc"] = cparser.Macro(rightside="index_doc__list")
+		self.macros["count_doc"] = cparser.Macro(rightside="count__list")
+		cparser.parse(CPythonDir + "/Objects/listobject.c", self) # PyList_New
 
 
 def init_faulthandler(sigusr1_chain=False):
