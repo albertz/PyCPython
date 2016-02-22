@@ -58,6 +58,35 @@ class CPythonState(cparser.State):
 			return reader(), None
 		return super(CPythonState, self).readLocalInclude(filename)
 
+	def parse_cpython(self):
+		# We keep all in the same state, i.e. the same static space.
+		# This also means that we don't reset macro definitions. This speeds up header includes.
+		# Usually this is not a problem.
+		cparser.parse(CPythonDir + "/Modules/main.c", self) # Py_Main
+		self.macros["FAST_LOOPS"] = cparser.Macro(rightside="0")  # not sure where this would come from
+		cparser.parse(CPythonDir + "/Python/ceval.c", self) # PyEval_EvalFrameEx etc
+		del self.macros["EMPTY"]  # will be redefined later
+		cparser.parse(CPythonDir + "/Python/getopt.c", self) # _PyOS_GetOpt
+		cparser.parse(CPythonDir + "/Python/pythonrun.c", self) # Py_Initialize
+		cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
+		cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
+		cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
+		cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
+		cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
+		cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
+		del self.macros["Return"]  # will be used differently
+		# We need these macro hacks because dictobject.c will use the same vars.
+		self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
+		self.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
+		cparser.parse(CPythonDir + "/Objects/dictobject.c", self)  # PyDict_New
+		# We need this macro hack because stringobject.c will use the same var.
+		self.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
+		cparser.parse(CPythonDir + "/Objects/stringobject.c", self)  # PyString_FromString
+		cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
+		cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
+		cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
+		cparser.parse(CPythonDir + "/Include/structmember.h", self) # struct PyMemberDef. just for now to avoid errors :)
+
 
 def init_faulthandler(sigusr1_chain=False):
 	"""
@@ -111,33 +140,7 @@ def main(argv):
 	state = CPythonState()
 
 	print "Parsing CPython...",
-	# We keep all in the same state, i.e. the same static space.
-	# This also means that we don't reset macro definitions. This speeds up header includes.
-	# Usually this is not a problem.
-	cparser.parse(CPythonDir + "/Modules/main.c", state) # Py_Main
-	state.macros["FAST_LOOPS"] = cparser.Macro(rightside="0")  # not sure where this would come from
-	cparser.parse(CPythonDir + "/Python/ceval.c", state) # PyEval_EvalFrameEx etc
-	del state.macros["EMPTY"]  # will be redefined later
-	cparser.parse(CPythonDir + "/Python/getopt.c", state) # _PyOS_GetOpt
-	cparser.parse(CPythonDir + "/Python/pythonrun.c", state) # Py_Initialize
-	cparser.parse(CPythonDir + "/Python/pystate.c", state) # PyInterpreterState_New
-	cparser.parse(CPythonDir + "/Python/sysmodule.c", state) # PySys_ResetWarnOptions
-	cparser.parse(CPythonDir + "/Python/random.c", state) # _PyRandom_Init
-	cparser.parse(CPythonDir + "/Objects/object.c", state) # _Py_ReadyTypes etc
-	cparser.parse(CPythonDir + "/Objects/typeobject.c", state) # PyType_Ready
-	cparser.parse(CPythonDir + "/Objects/tupleobject.c", state) # PyTuple_New
-	del state.macros["Return"]  # will be used differently
-	# We need these macro hacks because dictobject.c will use the same vars.
-	state.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
-	state.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
-	cparser.parse(CPythonDir + "/Objects/dictobject.c", state)  # PyDict_New
-	# We need this macro hack because stringobject.c will use the same var.
-	state.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
-	cparser.parse(CPythonDir + "/Objects/stringobject.c", state)  # PyString_FromString
-	cparser.parse(CPythonDir + "/Objects/obmalloc.c", state) # PyObject_Free
-	cparser.parse(CPythonDir + "/Modules/gcmodule.c", state) # _PyObject_GC_NewVar
-	cparser.parse(CPythonDir + "/Objects/descrobject.c", state) # PyDescr_NewWrapper
-	cparser.parse(CPythonDir + "/Include/structmember.h", state) # struct PyMemberDef. just for now to avoid errors :)
+	state.parse_cpython()
 
 	if state._errors:
 		print "finished, parse errors:"
