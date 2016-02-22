@@ -85,7 +85,9 @@ class CPythonState(cparser.State):
 		cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
 		cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
 		cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
-		cparser.parse(CPythonDir + "/Include/structmember.h", self) # struct PyMemberDef. just for now to avoid errors :)
+		# We need these macro hacks because methodobject.c will use the same vars.
+		self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
+		cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
 
 
 def init_faulthandler(sigusr1_chain=False):
