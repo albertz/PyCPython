@@ -41,7 +41,7 @@ def main(argv):
 	f.write("\nintp = cparser.interpreter.Interpreter()\n")
 	f.write("\nclass g:\n")
 	last_log_time = time.time()
-	func_count = 0
+	func_count = func_count_incomplete = 0
 	for i, content in enumerate(state.contentlist):
 		if time.time() - last_log_time > 2.0:
 			last_log_time = time.time()
