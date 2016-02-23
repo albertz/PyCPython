@@ -41,18 +41,27 @@ def main(argv):
 	f.write("\nintp = cparser.interpreter.Interpreter()\n")
 	f.write("\nclass g:\n")
 	last_log_time = time.time()
+	func_count = 0
 	for i, content in enumerate(state.contentlist):
 		if time.time() - last_log_time > 2.0:
 			last_log_time = time.time()
 			print "Compile... (%.0f%%)" % (100.0 * i / len(state.contentlist))
-		if isinstance(content, cparser.CFunc):
-			if content.body is None:
-				if state.funcs[content.name].body is not None:
-					continue  # we will write it later
-			funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
-			pyAst = funcEnv.astNode
-			Unparser(pyAst, indent=1, file=f)
-		# TODO...
+		try:
+			if isinstance(content, cparser.CFunc):
+				if content.body is None:
+					if state.funcs[content.name].body is not None:
+						continue  # we will write it later
+					else:
+						# We will write some dummy placeholder.
+						func_count_incomplete += 1
+				func_count += 1
+				funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
+				pyAst = funcEnv.astNode
+				Unparser(pyAst, indent=1, file=f)
+			# TODO...
+		except Exception:
+			print "!!! Exception while compiling %r" % content
+			raise
 	f.write("\nif __name__ == '__main__':\n")
 	f.write("    g.Py_Main(len(sys.argv), sys.argv + [None])\n\n")
 	f.close()
