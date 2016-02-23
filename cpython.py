@@ -98,6 +98,7 @@ class CPythonState(cparser.State):
 		self.macros["index_doc"] = cparser.Macro(rightside="index_doc__list")
 		self.macros["count_doc"] = cparser.Macro(rightside="count__list")
 		cparser.parse(CPythonDir + "/Objects/listobject.c", self) # PyList_New
+		cparser.parse(CPythonDir + "/Objects/abstract.c", self) # PySequence_List
 
 
 def init_faulthandler(sigusr1_chain=False):
