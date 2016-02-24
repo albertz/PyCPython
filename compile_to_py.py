@@ -41,23 +41,26 @@ def main(argv):
 	f.write("\nintp = cparser.interpreter.Interpreter()\n")
 	f.write("\nclass g:\n")
 	last_log_time = time.time()
-	func_count = func_count_incomplete = 0
+	count = count_incomplete = 0
 	for i, content in enumerate(state.contentlist):
 		if time.time() - last_log_time > 2.0:
 			last_log_time = time.time()
 			print "Compile... (%.0f%%)" % (100.0 * i / len(state.contentlist))
 		try:
+			if cparser.isExternDecl(content):
+				content = state.getResolvedDecl(content)
+				if cparser.isExternDecl(content):
+					# We will write some dummy placeholder.
+					count_incomplete += 1
+				else:
+					# We have a full declaration available.
+					continue  # we will write it later
+			count += 1
 			if isinstance(content, cparser.CFunc):
-				if content.body is None:
-					if state.funcs[content.name].body is not None:
-						continue  # we will write it later
-					else:
-						# We will write some dummy placeholder.
-						func_count_incomplete += 1
-				func_count += 1
 				funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
 				pyAst = funcEnv.astNode
 				Unparser(pyAst, indent=1, file=f)
+			#elif isinstance(content, cparser.CStruct):
 			# TODO...
 		except Exception:
 			print "!!! Exception while compiling %r" % content
