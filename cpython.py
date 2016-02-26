@@ -99,6 +99,7 @@ class CPythonState(cparser.State):
 		self.macros["count_doc"] = cparser.Macro(rightside="count__list")
 		cparser.parse(CPythonDir + "/Objects/listobject.c", self) # PyList_New
 		cparser.parse(CPythonDir + "/Objects/abstract.c", self) # PySequence_List
+		cparser.parse(CPythonDir + "/Python/modsupport.c", self) # Py_BuildValue
 
 
 def init_faulthandler(sigusr1_chain=False):
