@@ -45,7 +45,11 @@ def main(argv):
 	for i, content in enumerate(state.contentlist):
 		if time.time() - last_log_time > 2.0:
 			last_log_time = time.time()
-			print "Compile... (%.0f%%)" % (100.0 * i / len(state.contentlist))
+			perc_compl = 100.0 * i / len(state.contentlist)
+			cur_content_s = "%s %s" % (content.__class__.__name__,
+									   (getattr(content, "name", None) or "<noname>"))
+			cur_file_s = getattr(content, "defPos", "<unknown source>")
+			print "Compile... (%.0f%%) (%s) (%s)" % (perc_compl, cur_content_s, cur_file_s)
 		try:
 			if cparser.isExternDecl(content):
 				content = state.getResolvedDecl(content)
