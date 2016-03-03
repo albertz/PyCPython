@@ -42,6 +42,7 @@ def main(argv):
 	f.write("# PyCPython - interpret CPython in Python\n")
 	f.write("# Statically compiled CPython.\n\n")
 	f.write("import sys\n")
+	f.write("import better_exchook\n")
 	f.write("import cparser\n")
 	f.write("import cparser.interpreter\n")
 	f.write("import ctypes\n")
@@ -84,7 +85,10 @@ def main(argv):
 			sys.excepthook(*sys.exc_info())
 			# We continue...
 	f.write("\n\nif __name__ == '__main__':\n")
-	f.write("    g.Py_Main(len(sys.argv), sys.argv + [None])\n\n")
+	f.write("    better_exchook.install()\n")
+	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
+			"              intp._castArgToCType(sys.argv + [None],\n"
+			"                                   cparser.CPointerType(cparser.CPointerType(cparser.CBuiltinType(('char',))))))\n\n")
 	f.close()
 
 	print "Done."
