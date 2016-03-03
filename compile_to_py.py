@@ -43,7 +43,11 @@ def main(argv):
 	f.write("import sys\n")
 	f.write("import cparser\n")
 	f.write("import cparser.interpreter\n")
+	f.write("import ctypes\n")
 	f.write("\nintp = cparser.interpreter.Interpreter()\n")
+	f.write("\nhelpers = intp.helpers\n")
+	f.write("\nctypes_wrapped = intp.ctypes_wrapped\n")
+	# TODO: structs, unions, values
 	f.write("\nclass g:\n")
 	last_log_time = time.time()
 	count = count_incomplete = 0
@@ -68,6 +72,7 @@ def main(argv):
 			if isinstance(content, cparser.CFunc):
 				funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
 				pyAst = funcEnv.astNode
+				f.write("@staticmethod\n")
 				Unparser(pyAst, indent=1, file=f)
 			#elif isinstance(content, cparser.CStruct):
 			# TODO...
@@ -75,7 +80,7 @@ def main(argv):
 			print "!!! Exception while compiling %r" % content
 			sys.excepthook(*sys.exc_info())
 			# We continue...
-	f.write("\nif __name__ == '__main__':\n")
+	f.write("\n\nif __name__ == '__main__':\n")
 	f.write("    g.Py_Main(len(sys.argv), sys.argv + [None])\n\n")
 	f.close()
 
