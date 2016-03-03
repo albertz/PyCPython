@@ -10,6 +10,7 @@ import cparser
 import cparser.interpreter
 from cparser.py_demo_unparse import Unparser
 import time
+import ast
 
 
 def main(argv):
@@ -44,9 +45,10 @@ def main(argv):
 	f.write("import cparser\n")
 	f.write("import cparser.interpreter\n")
 	f.write("import ctypes\n")
-	f.write("\nintp = cparser.interpreter.Interpreter()\n")
-	f.write("\nhelpers = intp.helpers\n")
-	f.write("\nctypes_wrapped = intp.ctypes_wrapped\n")
+	f.write("\n")
+	f.write("intp = cparser.interpreter.Interpreter()\n")
+	f.write("helpers = intp.helpers\n")
+	f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
 	# TODO: structs, unions, values
 	f.write("\nclass g:\n")
 	last_log_time = time.time()
@@ -72,7 +74,8 @@ def main(argv):
 			if isinstance(content, cparser.CFunc):
 				funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
 				pyAst = funcEnv.astNode
-				f.write("@staticmethod\n")
+				assert isinstance(pyAst, ast.FunctionDef)
+				pyAst.decorator_list.append(ast.Name(id="staticmethod", ctx=ast.Load()))
 				Unparser(pyAst, indent=1, file=f)
 			#elif isinstance(content, cparser.CStruct):
 			# TODO...
