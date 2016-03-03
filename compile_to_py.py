@@ -19,7 +19,12 @@ def main(argv):
 	print "Compile CPython to %s." % os.path.basename(out_fn)
 
 	print "Parsing CPython...",
-	state.parse_cpython()
+	try:
+		state.parse_cpython()
+	except Exception:
+		print "!!! Exception while parsing. Should not happen. Cannot recover. Please report this bug."
+		print "The parser currently is here:", state.curPosAsStr()
+		raise
 	if state._errors:
 		print "finished, parse errors:"
 		for m in state._errors:
@@ -68,7 +73,8 @@ def main(argv):
 			# TODO...
 		except Exception:
 			print "!!! Exception while compiling %r" % content
-			raise
+			sys.excepthook(*sys.exc_info())
+			# We continue...
 	f.write("\nif __name__ == '__main__':\n")
 	f.write("    g.Py_Main(len(sys.argv), sys.argv + [None])\n\n")
 	f.close()
