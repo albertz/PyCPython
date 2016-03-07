@@ -50,8 +50,9 @@ def main(argv):
 	f.write("intp = cparser.interpreter.Interpreter()\n")
 	f.write("helpers = intp.helpers\n")
 	f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
+	f.write("values = intp.wrappedValues\n")
 	# TODO: structs, unions, values
-	f.write("\nclass g:\n")
+	f.write("\n\nclass g:\n")
 	last_log_time = time.time()
 	count = count_incomplete = 0
 	for i, content in enumerate(state.contentlist):
