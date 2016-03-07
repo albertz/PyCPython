@@ -87,8 +87,9 @@ def main(argv):
 	f.write("\n\nif __name__ == '__main__':\n")
 	f.write("    better_exchook.install()\n")
 	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
-			"              intp._castArgToCType(sys.argv + [None],\n"
-			"                                   cparser.CPointerType(cparser.CPointerType(cparser.CBuiltinType(('char',))))))\n\n")
+			"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
+            "               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
+            "                 for arg in sys.argv]))\n\n")
 	f.close()
 
 	print "Done."
