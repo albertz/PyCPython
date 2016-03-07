@@ -48,6 +48,7 @@ def main(argv):
 	f.write("import ctypes\n")
 	f.write("\n")
 	f.write("intp = cparser.interpreter.Interpreter()\n")
+	f.write("intp.setupStatic()\n")
 	f.write("helpers = intp.helpers\n")
 	f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
 	f.write("values = intp.wrappedValues\n")
@@ -85,7 +86,7 @@ def main(argv):
 			print "!!! Exception while compiling %r" % content
 			sys.excepthook(*sys.exc_info())
 			# We continue...
-	f.write("\n\nif __name__ == '__main__':\n")
+	f.write("\n\n\nif __name__ == '__main__':\n")
 	f.write("    better_exchook.install()\n")
 	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
 			"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
