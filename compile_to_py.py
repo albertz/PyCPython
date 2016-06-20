@@ -51,7 +51,6 @@ def main(argv):
 	f.write("intp.setupStatic()\n")
 	f.write("helpers = intp.helpers\n")
 	f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
-	f.write("values = intp.wrappedValues\n")
 	# TODO: structs, unions, values
 	f.write("\n\nclass g:\n")
 	last_log_time = time.time()
@@ -86,12 +85,32 @@ def main(argv):
 			print "!!! Exception while compiling %r" % content
 			sys.excepthook(*sys.exc_info())
 			# We continue...
-	f.write("\n\n\nif __name__ == '__main__':\n")
+
+	f.write("\n\n\n")
+	f.write("class values:\n")
+	def maybe_add_wrap_value(container_name, var_name, var):
+		if not isinstance(var, cparser.CWrapValue): return
+		v = cparser.interpreter.getAstForWrapValue(interpreter, var)
+		assert isinstance(v, ast.Attribute)
+		assert isinstance(v.value, ast.Name)
+		assert v.value.id == "values"
+		wrap_name = v.attr
+		var2 = getattr(interpreter.wrappedValues, wrap_name, None)
+		assert var2 is var
+		f.write("    %s = intp.stateStructs[0].%s[%r]\n" % (wrap_name, container_name, var_name))
+	# These are added by globalincludewrappers.
+	for varname, var in sorted(state.vars.items()):
+		maybe_add_wrap_value("vars", varname, var)
+	for varname, var in sorted(state.funcs.items()):
+		maybe_add_wrap_value("funcs", varname, var)
+
+	f.write("\n\n\n")
+	f.write("if __name__ == '__main__':\n")
 	f.write("    better_exchook.install()\n")
 	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
 			"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
-            "               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
-            "                 for arg in sys.argv]))\n\n")
+			"               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
+			"                 for arg in sys.argv]))\n\n")
 	f.close()
 
 	print "Done."
