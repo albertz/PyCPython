@@ -79,8 +79,11 @@ def main(argv):
 				assert isinstance(pyAst, ast.FunctionDef)
 				pyAst.decorator_list.append(ast.Name(id="staticmethod", ctx=ast.Load()))
 				Unparser(pyAst, indent=1, file=f)
-			#elif isinstance(content, cparser.CStruct):
-			# TODO...
+			elif isinstance(content, (cparser.CStruct, cparser.CUnion)):
+				# see _getCTypeStruct for reference
+				pass  # TODO. not simple.
+			else:
+				raise Exception("unexpected content type: %s" % type(content))
 		except Exception:
 			print "!!! Exception while compiling %r" % content
 			sys.excepthook(*sys.exc_info())
