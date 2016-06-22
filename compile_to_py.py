@@ -71,14 +71,14 @@ def main(argv):
 			content = state.getResolvedDecl(content)
 			if cparser.isExternDecl(content):
 				# Dummy placeholder.
-				f.write("    cls %s: 'Dummy extern struct declaration'\n" % content.name)
+				f.write("    class %s: 'Dummy extern struct declaration'\n" % content.name)
 				continue
 			else:
 				# We have a full declaration available.
 				continue  # we will write it later
 		# see _getCTypeStruct for reference
 		# TODO. not simple.
-		f.write("    cls %s: 'Dummy'\n" % content.name)  # Dummy for now
+		f.write("    class %s: 'Dummy'\n" % content.name)  # Dummy for now
 	f.write("\n\n")
 
 	f.write("class unions:\n")
@@ -98,14 +98,14 @@ def main(argv):
 			content = state.getResolvedDecl(content)
 			if cparser.isExternDecl(content):
 				# Dummy placeholder.
-				f.write("    cls %s: 'Dummy extern union declaration'\n" % content.name)
+				f.write("    class %s: 'Dummy extern union declaration'\n" % content.name)
 				continue
 			else:
 				# We have a full declaration available.
 				continue  # we will write it later
 		# see _getCTypeStruct for reference
 		# TODO. not simple. see above for structs
-		f.write("    cls %s: 'Dummy'\n" % content.name)  # Dummy for now
+		f.write("    class %s: 'Dummy'\n" % content.name)  # Dummy for now
 	f.write("\n\n")
 
 	f.write("class g:\n")
@@ -143,6 +143,7 @@ def main(argv):
 				assert isinstance(pyAst, ast.FunctionDef)
 				pyAst.decorator_list.append(ast.Name(id="staticmethod", ctx=ast.Load()))
 				Unparser(pyAst, indent=1, file=f)
+				f.write("\n")
 			elif isinstance(content, (cparser.CStruct, cparser.CUnion)):
 				pass  # Handled in the other loops.
 			elif isinstance(content, cparser.CTypedef):
