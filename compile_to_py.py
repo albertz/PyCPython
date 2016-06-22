@@ -133,7 +133,9 @@ def main(argv):
 					continue  # we will write it later
 			count += 1
 			if content.name:
-				assert content.name not in g_names, "%r defined twice" % content.name
+				if content.name in g_names:
+					print "Error (ignored): %r defined twice" % content.name
+					continue
 				g_names.add(content.name)
 			else:
 				continue
@@ -158,7 +160,7 @@ def main(argv):
 		except Exception as exc:
 			print "!!! Exception while compiling %r" % content
 			if content.name:
-				f.write("   %s = 'Compile exception ' %r\n" % (content.name, str(exc)))
+				f.write("    %s = 'Compile exception ' %r\n" % (content.name, str(exc)))
 			sys.excepthook(*sys.exc_info())
 			# We continue...
 	f.write("\n\n")
