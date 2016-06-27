@@ -154,7 +154,7 @@ def main(argv):
 				f.write("    %s = 'Dummy vardecl'\n" % content.name)  # TODO
 			elif isinstance(content, cparser.CEnum):
 				int_type_name = content.getMinCIntType()
-				f.write("    %s = ctypes.%s\n" % (content.name, int_type_name))
+				f.write("    %s = ctypes.c_%s\n" % (content.name, int_type_name.replace("_t", "")))
 			else:
 				raise Exception("unexpected content type: %s" % type(content))
 		except Exception as exc:
