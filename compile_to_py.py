@@ -43,7 +43,7 @@ def builtin_ctypes_name(s):
 
 def stdint_ctypes_name(s):
 	# See State.StdIntTypes.
-	assert isinstance(s, str)
+	assert isinstance(s, (str, unicode))
 	if s in ["ptrdiff_t", "intptr_t"]:
 		s = "c_long"
 	elif s == "FILE":
@@ -60,7 +60,7 @@ def set_name_for_typedeffed_struct(obj, state):
 	if not isinstance(obj.type, (cparser.CStruct, cparser.CUnion)):
 		return False
 	if not obj.type.name:
-		obj.type.name = "__anonymous_%s" % obj.name
+		obj.type.name = "_anonymous_%s" % obj.name
 		return True
 	if isinstance(obj.type, cparser.CStruct):
 		if obj.type.name in state.structs:
@@ -73,6 +73,47 @@ def set_name_for_typedeffed_struct(obj, state):
 		# See above.
 		state.unions[obj.type.name] = obj.type
 	return True
+
+def fix_name(obj):
+	assert obj.name
+	if obj.name.startswith("__"):
+		obj.name = "_M_%s" % obj.name[2:]
+
+def get_py_type(t, state):
+	if isinstance(t, cparser.CTypedef):
+		assert t.name, "typedef target typedef must have name"
+		return t.name
+	elif isinstance(t, cparser.CStruct):
+		assert t.name, "struct must have name, should have been assigned earlier also to anonymous structs"
+		return "structs.%s" % t.name
+	elif isinstance(t, cparser.CUnion):
+		assert t.name, "union must have name, should have been assigned earlier also to anonymous unions"
+		return "unions.%s" % t.name
+	elif isinstance(t, cparser.CBuiltinType):
+		return "ctypes.%s" % builtin_ctypes_name(t.builtinType)
+	elif isinstance(t, cparser.CStdIntType):
+		return "ctypes.%s" % stdint_ctypes_name(t.name)
+	elif isinstance(t, cparser.CEnum):
+		int_type_name = t.getMinCIntType()
+		return "ctypes.%s" % stdint_ctypes_name(int_type_name)
+	elif isinstance(t, cparser.CPointerType):
+		if cparser.isVoidPtrType(t):
+			return "ctypes.c_void_p"
+		else:
+			return "ctypes.POINTER(%s)" % get_py_type(t.pointerOf, state)
+	elif isinstance(t, cparser.CFuncPointerDecl):
+		if isinstance(t.type, cparser.CPointerType):
+			# https://bugs.python.org/issue5710
+			restype = "ctypes.c_void_p"
+		elif t.type == cparser.CBuiltinType(("void",)):
+			restype = "None"
+		else:
+			restype = get_py_type(t.type, state)
+		return "ctypes.CFUNCTYPE(%s)" % ", ".join([restype] + [get_py_type(a, state) for a in t.args])
+	elif isinstance(t, cparser.CFuncArgDecl):
+		return get_py_type(t.type, state)
+	else:
+		raise Exception("unexpected type: %s" % type(t))
 
 
 def main(argv):
@@ -109,6 +150,7 @@ def main(argv):
 	f.write("import cparser.interpreter\n")
 	f.write("import ctypes\n")
 	f.write("\n")
+	f.write("better_exchook.install()\n")
 	f.write("intp = cparser.interpreter.Interpreter()\n")
 	f.write("intp.setupStatic()\n")
 	f.write("helpers = intp.helpers\n")
@@ -132,19 +174,20 @@ def main(argv):
 		if not isinstance(content, cparser.CStruct):
 			continue
 		if not content.name:
-			content.name = "__anonymous_struct_%i" % i
+			content.name = "_anonymous_struct_%i" % i
 		elif cparser.isExternDecl(content):
 			content = state.getResolvedDecl(content)
 			if cparser.isExternDecl(content):
 				# Dummy placeholder.
-				f.write("    class %s: 'Dummy extern struct declaration'\n" % content.name)
+				f.write("    %s = ctypes.c_int  # Dummy extern struct declaration\n" % content.name)
 				continue
 			else:
 				# We have a full declaration available.
 				continue  # we will write it later
+		fix_name(content)
 		# see _getCTypeStruct for reference
 		# TODO. not simple.
-		f.write("    class %s: 'Dummy'\n" % content.name)  # Dummy for now
+		f.write("    class %s(ctypes.Structure): 'Dummy'\n" % content.name)  # Dummy for now
 	f.write("\n\n")
 
 	f.write("class unions:\n")
@@ -163,19 +206,20 @@ def main(argv):
 		if not isinstance(content, cparser.CUnion):
 			continue
 		if not content.name:
-			content.name = "__anonymous_union_%i" % i
+			content.name = "_anonymous_union_%i" % i
 		elif cparser.isExternDecl(content):
 			content = state.getResolvedDecl(content)
 			if cparser.isExternDecl(content):
 				# Dummy placeholder.
-				f.write("    class %s: 'Dummy extern union declaration'\n" % content.name)
+				f.write("    %s = ctypes.c_int  # Dummy extern union declaration\n" % content.name)
 				continue
 			else:
 				# We have a full declaration available.
 				continue  # we will write it later
+		fix_name(content)
 		# see _getCTypeStruct for reference
 		# TODO. not simple. see above for structs
-		f.write("    class %s: 'Dummy'\n" % content.name)  # Dummy for now
+		f.write("    class %s(ctypes.Union): 'Dummy'\n" % content.name)  # Dummy for now
 	f.write("\n\n")
 
 	f.write("class g:\n")
@@ -203,6 +247,7 @@ def main(argv):
 					continue  # we will write it later
 			count += 1
 			if content.name:
+				fix_name(content)
 				if content.name in g_names:
 					print "Error (ignored): %r defined twice" % content.name
 					continue
@@ -219,26 +264,7 @@ def main(argv):
 			elif isinstance(content, (cparser.CStruct, cparser.CUnion)):
 				pass  # Handled in the other loops.
 			elif isinstance(content, cparser.CTypedef):
-				if isinstance(content.type, cparser.CTypedef):
-					assert content.type.name, "typedef target typedef must have name"
-					f.write("    %s = %s\n" % (content.name, content.type.name))
-				elif isinstance(content.type, cparser.CStruct):
-					assert content.type.name, "typedef target struct must have name, should have been assigned earlier also to anonymous structs"
-					f.write("    %s = structs.%s\n" % (content.name, content.type.name))
-				elif isinstance(content.type, cparser.CUnion):
-					assert content.type.name, "typedef target union must have name, should have been assigned earlier also to anonymous unions"
-					f.write("    %s = unions.%s\n" % (content.name, content.type.name))
-				elif isinstance(content.type, cparser.CBuiltinType):
-					f.write("    %s = ctypes.%s\n" % (content.name, builtin_ctypes_name(content.type.builtinType)))
-				elif isinstance(content.type, cparser.CStdIntType):
-					f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(content.type.name)))
-				elif isinstance(content.type, cparser.CEnum):
-					int_type_name = content.type.getMinCIntType()
-					f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
-				elif isinstance(content.type, cparser.CFuncPointerDecl):
-					f.write("    %s = 'Dummy funcptr type'\n" % (content.name,))  # TODO
-				else:
-					raise Exception("unexpected typedef target type: %s" % type(content.type))
+				f.write("    %s = %s\n" % (content.name, get_py_type(content.type, state)))
 			elif isinstance(content, cparser.CVarDecl):
 				f.write("    %s = 'Dummy vardecl'\n" % content.name)  # TODO
 			elif isinstance(content, cparser.CEnum):
@@ -273,7 +299,6 @@ def main(argv):
 	f.write("\n\n")
 
 	f.write("if __name__ == '__main__':\n")
-	f.write("    better_exchook.install()\n")
 	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
 			"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
 			"               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
