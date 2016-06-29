@@ -66,12 +66,12 @@ def set_name_for_typedeffed_struct(obj, state):
 		if obj.type.name in state.structs:
 			return False
 		# So that we will find it next time. Not sure why this can even happen.
-		state.structs[obj.type.name] = obj.type
+		#state.structs[obj.type.name] = obj.type
 	elif isinstance(obj.type, cparser.CUnion):
 		if obj.type.name in state.unions:
 			return False
 		# See above.
-		state.unions[obj.type.name] = obj.type
+		#state.unions[obj.type.name] = obj.type
 	return True
 
 def fix_name(obj):
@@ -79,41 +79,387 @@ def fix_name(obj):
 	if obj.name.startswith("__"):
 		obj.name = "_M_%s" % obj.name[2:]
 
-def get_py_type(t, state):
-	if isinstance(t, cparser.CTypedef):
-		assert t.name, "typedef target typedef must have name"
-		return t.name
-	elif isinstance(t, cparser.CStruct):
-		assert t.name, "struct must have name, should have been assigned earlier also to anonymous structs"
-		return "structs.%s" % t.name
-	elif isinstance(t, cparser.CUnion):
-		assert t.name, "union must have name, should have been assigned earlier also to anonymous unions"
-		return "unions.%s" % t.name
-	elif isinstance(t, cparser.CBuiltinType):
-		return "ctypes.%s" % builtin_ctypes_name(t.builtinType)
-	elif isinstance(t, cparser.CStdIntType):
-		return "ctypes.%s" % stdint_ctypes_name(t.name)
-	elif isinstance(t, cparser.CEnum):
-		int_type_name = t.getMinCIntType()
-		return "ctypes.%s" % stdint_ctypes_name(int_type_name)
-	elif isinstance(t, cparser.CPointerType):
-		if cparser.isVoidPtrType(t):
-			return "ctypes.c_void_p"
-		else:
-			return "ctypes.POINTER(%s)" % get_py_type(t.pointerOf, state)
-	elif isinstance(t, cparser.CFuncPointerDecl):
-		if isinstance(t.type, cparser.CPointerType):
-			# https://bugs.python.org/issue5710
-			restype = "ctypes.c_void_p"
-		elif t.type == cparser.CBuiltinType(("void",)):
-			restype = "None"
-		else:
-			restype = get_py_type(t.type, state)
-		return "ctypes.CFUNCTYPE(%s)" % ", ".join([restype] + [get_py_type(a, state) for a in t.args])
-	elif isinstance(t, cparser.CFuncArgDecl):
-		return get_py_type(t.type, state)
-	else:
+
+class CodeGen:
+
+	def __init__(self, f, state, interpreter):
+		self.f = f
+		self.state = state
+		self.interpreter = interpreter
+		self.structs = {}
+		self.unions = {}
+		self.delayed_structs = []
+		self._py_in_structs = False
+		self._py_in_unions = False
+		self._py_in_globals = False
+		self._anonymous_name_counter = 0
+
+	def write_header(self):
+		f = self.f
+		f.write("#!/usr/bin/env python\n")
+		f.write("# PyCPython - interpret CPython in Python\n")
+		f.write("# Statically compiled CPython.\n\n")
+		f.write("import sys\n")
+		f.write("import better_exchook\n")
+		f.write("import cparser\n")
+		f.write("import cparser.interpreter\n")
+		f.write("import ctypes\n")
+		f.write("\n")
+		f.write("better_exchook.install()\n")
+		f.write("intp = cparser.interpreter.Interpreter()\n")
+		f.write("intp.setupStatic()\n")
+		f.write("helpers = intp.helpers\n")
+		f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
+		f.write("\n\n")
+
+	def write_structs(self):
+		self._py_in_structs = True
+		self._write_structs("struct")
+		self._py_in_structs = False
+
+	def write_unions(self):
+		self._py_in_unions = True
+		self._write_structs("union")
+		self._py_in_unions = False
+
+	def fix_names(self):
+		for content in self.state.contentlist:
+			if isinstance(content, cparser.CTypedef):
+				set_name_for_typedeffed_struct(content, self.state)
+			if isinstance(content, (cparser.CStruct, cparser.CUnion, cparser.CFunc, cparser.CTypedef, cparser.CVarDecl)):
+				if not content.name:
+					content.name = self._get_anonymous_name()
+				fix_name(content)
+
+	def _get_anonymous_name_counter(self):
+		self._anonymous_name_counter += 1
+		return self._anonymous_name_counter
+
+	def _get_anonymous_name(self):
+		return "_anonymous_%i" % self._get_anonymous_name_counter()
+
+	def _write_structs(self, base_type):
+		f = self.f
+		f.write("class %ss:\n" % base_type)
+		cparse_base_type = {"struct": cparser.CStruct, "union": cparser.CUnion}[base_type]
+		last_log_time = time.time()
+		for i, content in enumerate(self.state.contentlist):
+			if time.time() - last_log_time > 2.0:
+				last_log_time = time.time()
+				perc_compl = 100.0 * i / len(self.state.contentlist)
+				cur_content_s = "%s %s" % (content.__class__.__name__,
+										   (getattr(content, "name", None) or "<noname>"))
+				cur_file_s = getattr(content, "defPos", "<unknown source>")
+				print "Compile %ss... (%.0f%%) (%s) (%s)" % (base_type, perc_compl, cur_content_s, cur_file_s)
+			if isinstance(content, cparser.CTypedef):
+				content = content.type
+			if not isinstance(content, cparse_base_type):
+				continue
+			if cparser.isExternDecl(content):
+				content = self.state.getResolvedDecl(content)
+				if cparser.isExternDecl(content):
+					# Dummy placeholder.
+					f.write("    %s = ctypes_wrapped.c_int  # Dummy extern declaration\n" % content.name)
+					continue
+				else:
+					# We have a full declaration available.
+					continue  # we will write it later
+			self._try_write_struct(content)
+		f.write("\n\n")
+
+	class WriteStructException(Exception): pass
+	class NoBody(WriteStructException): pass
+	class RecursiveConstruction(WriteStructException): pass
+	class IncompleteStructCannotCompleteHere(WriteStructException): pass
+
+	def _write_struct(self, content):
+		assert content.name
+		print "write struct", content
+		if content.body is None:
+			raise self.NoBody()
+		if getattr(content, "_comppy_constructing", None):
+			raise self.RecursiveConstruction()
+		content._comppy_constructing = True
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(content)]
+		ctype_base = {"struct": "ctypes.Structure", "union": "ctypes.Union"}[base_type]
+		struct_dict = {"struct": self.structs, "union": self.unions}[base_type]
+		# see _getCTypeStruct for reference
+		fields = []
+		try:
+			for c in content.body.contentlist:
+				if not isinstance(c, cparser.CVarDecl): continue
+				t = self.get_py_type(c.type)
+				if c.arrayargs:
+					if len(c.arrayargs) != 1: raise Exception(str(c) + " has too many array args")
+					n = c.arrayargs[0].value
+					t = "%s * %i" % (t, n)
+				if hasattr(c, "bitsize"):
+					fields.append("(%r, %s, %s)" % (str(c.name), t, c.bitsize))
+				else:
+					fields.append("(%r, %s)" % (str(c.name), t))
+		finally:
+			content._comppy_constructing = False
+		self._fix_local_struct_name(content)
+		f = self.f
+		f.write("    class %s(%s):\n" % (content.name, ctype_base))
+		f.write("        _fields_ = [\n")
+		f.write("            %s]\n" % (",\n" + " " * 12).join(fields))
+		f.write("\n")
+		content._comppy_written = True
+		assert content.name not in struct_dict
+		struct_dict[content.name] = content
+
+	def _try_write_struct(self, content):
+		assert content.name
+		assert content.body is not None
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(content)]
+		struct_dict = {"struct": self.structs, "union": self.unions}[base_type]
+		if getattr(content, "_comppy_written", None):
+			assert struct_dict[content.name] is content
+			return
+		try:
+			self._write_struct(content)
+		except self.WriteStructException:
+			if content not in self.delayed_structs:
+				assert content.name not in struct_dict
+				self.delayed_structs.append(content)
+				self.f.write("    %s = None  # will we initialized later\n" % content.name)
+
+	def _fix_local_struct_name(self, t):
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
+		state_dict = getattr(self.state, "%ss" % base_type)
+		# Check if this is a local declaration (inside another struct or a function).
+		if t.name in state_dict and state_dict[t.name] is not t:
+			t.name = "_local_%i_%s" % (self._get_anonymous_name_counter(), t.name)
+			assert t.name not in state_dict
+
+	def _check_local_struct_type(self, t):
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
+		if not t.name:
+			t.name = self._get_anonymous_name()
+		self._fix_local_struct_name(t)
+		struct_dict = {"struct": self.structs, "union": self.unions}[base_type]
+		if t.name not in struct_dict:
+			if {"struct": self._py_in_structs, "union": self._py_in_unions}[base_type]:
+				if t.body is None:
+					t2 = self.state.getResolvedDecl(t)
+					if t2 is not None:
+						t = t2
+				self._write_struct(t)
+			else:
+				raise self.IncompleteStructCannotCompleteHere()
+
+	def write_delayed_structs(self):
+		f = self.f
+		for t in self.delayed_structs:
+			self._fix_local_struct_name(t)
+			f.write("# delayed TODO: %s\n" % t)
+			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
+			struct_dict = getattr(self, "%ss" % base_type)
+			assert t.name not in struct_dict
+			struct_dict[t.name] = t
+		del self.delayed_structs[:]
+		f.write("\n\n")
+
+	def get_py_type(self, t):
+		if isinstance(t, cparser.CTypedef):
+			if self._py_in_globals:
+				assert t.name, "typedef target typedef must have name"
+				return t.name
+			return self.get_py_type(t.type)
+		elif isinstance(t, cparser.CStruct):
+			self._check_local_struct_type(t)
+			if self._py_in_structs:
+				return t.name
+			assert t.name, "struct must have name, should have been assigned earlier also to anonymous structs"
+			return "structs.%s" % t.name
+		elif isinstance(t, cparser.CUnion):
+			self._check_local_struct_type(t)
+			if self._py_in_unions:
+				return t.name
+			assert t.name, "union must have name, should have been assigned earlier also to anonymous unions"
+			return "unions.%s" % t.name
+		elif isinstance(t, cparser.CBuiltinType):
+			return "ctypes_wrapped.%s" % builtin_ctypes_name(t.builtinType)
+		elif isinstance(t, cparser.CStdIntType):
+			return "ctypes_wrapped.%s" % stdint_ctypes_name(t.name)
+		elif isinstance(t, cparser.CEnum):
+			int_type_name = t.getMinCIntType()
+			return "ctypes_wrapped.%s" % stdint_ctypes_name(int_type_name)
+		elif isinstance(t, cparser.CPointerType):
+			if cparser.isVoidPtrType(t):
+				return "ctypes_wrapped.c_void_p"
+			else:
+				return "ctypes.POINTER(%s)" % self.get_py_type(t.pointerOf)
+		elif isinstance(t, cparser.CArrayType):
+			if not t.arrayLen:
+				return "ctypes.POINTER(%s)" % self.get_py_type(t.arrayOf)
+			l = cparser.getConstValue(self.state, t.arrayLen)
+			if l is None:
+				l = 1
+			return "%s * %i" % (self.get_py_type(t.arrayOf), l)
+		elif isinstance(t, cparser.CFuncPointerDecl):
+			if isinstance(t.type, cparser.CPointerType):
+				# https://bugs.python.org/issue5710
+				restype = "ctypes_wrapped.c_void_p"
+			elif t.type == cparser.CBuiltinType(("void",)):
+				restype = "None"
+			else:
+				restype = self.get_py_type(t.type)
+			return "ctypes.CFUNCTYPE(%s)" % ", ".join([restype] + [self.get_py_type(a) for a in t.args])
+		elif isinstance(t, cparser.CFuncArgDecl):
+			return self.get_py_type(t.type)
 		raise Exception("unexpected type: %s" % type(t))
+
+	def write_globals(self):
+		self._py_in_globals = True
+		f = self.f
+		f.write("class g:\n")
+		g_names = set()
+		last_log_time = time.time()
+		count = count_incomplete = 0
+		for i, content in enumerate(self.state.contentlist):
+			if time.time() - last_log_time > 2.0:
+				last_log_time = time.time()
+				perc_compl = 100.0 * i / len(self.state.contentlist)
+				cur_content_s = "%s %s" % (content.__class__.__name__,
+										   (getattr(content, "name", None) or "<noname>"))
+				cur_file_s = getattr(content, "defPos", "<unknown source>")
+				print "Compile... (%.0f%%) (%s) (%s)" % (perc_compl, cur_content_s, cur_file_s)
+			if isinstance(content, (cparser.CStruct, cparser.CUnion)):
+				continue  # Handled in the other loops.
+			try:
+				if cparser.isExternDecl(content):
+					content = self.state.getResolvedDecl(content)
+					if cparser.isExternDecl(content):
+						# We will write some dummy placeholder.
+						count_incomplete += 1
+					else:
+						# We have a full declaration available.
+						continue  # we will write it later
+				count += 1
+				if content.name:
+					fix_name(content)
+					if content.name in g_names:
+						print "Error (ignored): %r defined twice" % content.name
+						continue
+					g_names.add(content.name)
+				else:
+					continue
+				if isinstance(content, cparser.CFunc):
+					funcEnv = self.interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
+					pyAst = funcEnv.astNode
+					assert isinstance(pyAst, ast.FunctionDef)
+					pyAst.decorator_list.append(ast.Name(id="staticmethod", ctx=ast.Load()))
+					Unparser(pyAst, indent=1, file=f)
+					f.write("\n")
+				elif isinstance(content, (cparser.CStruct, cparser.CUnion)):
+					pass  # Handled in the other loops.
+				elif isinstance(content, cparser.CTypedef):
+					f.write("    %s = %s\n" % (content.name, self.get_py_type(content.type)))
+				elif isinstance(content, cparser.CVarDecl):
+					f.write("    %s = 'Dummy vardecl'\n" % content.name)  # TODO
+				elif isinstance(content, cparser.CEnum):
+					int_type_name = content.getMinCIntType()
+					f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
+				else:
+					raise Exception("unexpected content type: %s" % type(content))
+			except Exception as exc:
+				print "!!! Exception while compiling %r" % content
+				if content.name:
+					f.write("    %s = 'Compile exception ' %r\n" % (content.name, str(exc)))
+				sys.excepthook(*sys.exc_info())
+			# We continue...
+		f.write("\n\n")
+		self._py_in_globals = False
+
+	def write_values(self):
+		f = self.f
+		f.write("class values:\n")
+
+		def maybe_add_wrap_value(container_name, var_name, var):
+			if not isinstance(var, cparser.CWrapValue): return
+			v = cparser.interpreter.getAstForWrapValue(self.interpreter, var)
+			assert isinstance(v, ast.Attribute)
+			assert isinstance(v.value, ast.Name)
+			assert v.value.id == "values"
+			wrap_name = v.attr
+			var2 = getattr(self.interpreter.wrappedValues, wrap_name, None)
+			assert var2 is var
+			f.write("    %s = intp.stateStructs[0].%s[%r]\n" % (wrap_name, container_name, var_name))
+
+		# These are added by globalincludewrappers.
+		for varname, var in sorted(self.state.vars.items()):
+			maybe_add_wrap_value("vars", varname, var)
+		for varname, var in sorted(self.state.funcs.items()):
+			maybe_add_wrap_value("funcs", varname, var)
+		f.write("\n\n")
+
+	def write_footer(self):
+		f = self.f
+		f.write("if __name__ == '__main__':\n")
+		f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
+				"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
+				"               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
+				"                 for arg in sys.argv]))\n")
+		f.write("\n")
+
+
+def make_struct(baseClass, obj, stateStruct):
+
+	def _construct(obj):
+		fields = []
+		for c in obj.body.contentlist:
+			if not isinstance(c, cparser.CVarDecl): continue
+			try:
+				obj._construct_struct_attrib = c.type
+				t = get_py_type(c.type, stateStruct)
+			finally:
+				obj._construct_struct_attrib = None
+			if c.arrayargs:
+				if len(c.arrayargs) != 1: raise Exception(str(c) + " has too many array args")
+				n = c.arrayargs[0].value
+				t = "%s * %i" % (t, n)
+			if hasattr(c, "bitsize"):
+				fields += [(str(c.name), t, c.bitsize)]
+			else:
+				fields += [(str(c.name), t)]
+		if obj._ctype_is_constructing:
+			obj._ctype._fields_ = fields
+			obj._ctype_is_constructing = False
+
+	def construct(obj):
+		try:
+			stateStruct._construct_struct_type_stack += [obj]
+			_construct(obj)
+		finally:
+			stateStruct._construct_struct_type_stack.pop()
+
+	if getattr(obj, "_ctype_is_constructing", None):
+		# If the parent referred to us as a pointer, it's fine,
+		# we can return our incomplete type.
+		if isPointerType(
+				stateStruct._construct_struct_type_stack[-1]._construct_struct_attrib,
+				alsoFuncPtr=True, alsoArray=False):
+			return obj._ctype
+		# Otherwise, try to construct it now.
+		if obj._ctype_construct_need_now:
+			raise RecursiveStructConstruction("Recursive construction of type %s" % obj)
+		obj._ctype_construct_need_now = True
+		construct(obj)
+		return obj._ctype
+
+	if hasattr(obj, "_ctype"): return obj._ctype
+	if not hasattr(obj, "body"): raise CTypeConstructionException("%s must have the body attrib" % obj)
+	if obj.body is None: raise CTypeConstructionException("%s.body must not be None. maybe it was only forward-declarated?" % obj)
+
+	class ctype(baseClass): pass
+	ctype.__name__ = str(obj.name or "<anonymous-struct>")
+	obj._ctype = ctype
+	obj._ctype_is_constructing = True
+	obj._ctype_construct_need_now = False
+	construct(obj)
+	return ctype
 
 
 def main(argv):
@@ -141,169 +487,14 @@ def main(argv):
 
 	print "Compile..."
 	f = open(out_fn, "w")
-	f.write("#!/usr/bin/env python\n")
-	f.write("# PyCPython - interpret CPython in Python\n")
-	f.write("# Statically compiled CPython.\n\n")
-	f.write("import sys\n")
-	f.write("import better_exchook\n")
-	f.write("import cparser\n")
-	f.write("import cparser.interpreter\n")
-	f.write("import ctypes\n")
-	f.write("\n")
-	f.write("better_exchook.install()\n")
-	f.write("intp = cparser.interpreter.Interpreter()\n")
-	f.write("intp.setupStatic()\n")
-	f.write("helpers = intp.helpers\n")
-	f.write("ctypes_wrapped = intp.ctypes_wrapped\n")
-	f.write("\n\n")
-
-	f.write("class structs:\n")
-	last_log_time = time.time()
-	for i, content in enumerate(state.contentlist):
-		if time.time() - last_log_time > 2.0:
-			last_log_time = time.time()
-			perc_compl = 100.0 * i / len(state.contentlist)
-			cur_content_s = "%s %s" % (content.__class__.__name__,
-									   (getattr(content, "name", None) or "<noname>"))
-			cur_file_s = getattr(content, "defPos", "<unknown source>")
-			print "Compile structs... (%.0f%%) (%s) (%s)" % (perc_compl, cur_content_s, cur_file_s)
-		if isinstance(content, cparser.CTypedef):
-			if not set_name_for_typedeffed_struct(content, state):
-				continue
-			content = content.type
-		if not isinstance(content, cparser.CStruct):
-			continue
-		if not content.name:
-			content.name = "_anonymous_struct_%i" % i
-		elif cparser.isExternDecl(content):
-			content = state.getResolvedDecl(content)
-			if cparser.isExternDecl(content):
-				# Dummy placeholder.
-				f.write("    %s = ctypes.c_int  # Dummy extern struct declaration\n" % content.name)
-				continue
-			else:
-				# We have a full declaration available.
-				continue  # we will write it later
-		fix_name(content)
-		# see _getCTypeStruct for reference
-		# TODO. not simple.
-		f.write("    class %s(ctypes.Structure): 'Dummy'\n" % content.name)  # Dummy for now
-	f.write("\n\n")
-
-	f.write("class unions:\n")
-	for i, content in enumerate(state.contentlist):
-		if time.time() - last_log_time > 2.0:
-			last_log_time = time.time()
-			perc_compl = 100.0 * i / len(state.contentlist)
-			cur_content_s = "%s %s" % (content.__class__.__name__,
-									   (getattr(content, "name", None) or "<noname>"))
-			cur_file_s = getattr(content, "defPos", "<unknown source>")
-			print "Compile unions... (%.0f%%) (%s) (%s)" % (perc_compl, cur_content_s, cur_file_s)
-		if isinstance(content, cparser.CTypedef):
-			if not set_name_for_typedeffed_struct(content, state):
-				continue
-			content = content.type
-		if not isinstance(content, cparser.CUnion):
-			continue
-		if not content.name:
-			content.name = "_anonymous_union_%i" % i
-		elif cparser.isExternDecl(content):
-			content = state.getResolvedDecl(content)
-			if cparser.isExternDecl(content):
-				# Dummy placeholder.
-				f.write("    %s = ctypes.c_int  # Dummy extern union declaration\n" % content.name)
-				continue
-			else:
-				# We have a full declaration available.
-				continue  # we will write it later
-		fix_name(content)
-		# see _getCTypeStruct for reference
-		# TODO. not simple. see above for structs
-		f.write("    class %s(ctypes.Union): 'Dummy'\n" % content.name)  # Dummy for now
-	f.write("\n\n")
-
-	f.write("class g:\n")
-	g_names = set()
-	last_log_time = time.time()
-	count = count_incomplete = 0
-	for i, content in enumerate(state.contentlist):
-		if time.time() - last_log_time > 2.0:
-			last_log_time = time.time()
-			perc_compl = 100.0 * i / len(state.contentlist)
-			cur_content_s = "%s %s" % (content.__class__.__name__,
-									   (getattr(content, "name", None) or "<noname>"))
-			cur_file_s = getattr(content, "defPos", "<unknown source>")
-			print "Compile... (%.0f%%) (%s) (%s)" % (perc_compl, cur_content_s, cur_file_s)
-		if isinstance(content, (cparser.CStruct, cparser.CUnion)):
-			continue  # Handled in the other loops.
-		try:
-			if cparser.isExternDecl(content):
-				content = state.getResolvedDecl(content)
-				if cparser.isExternDecl(content):
-					# We will write some dummy placeholder.
-					count_incomplete += 1
-				else:
-					# We have a full declaration available.
-					continue  # we will write it later
-			count += 1
-			if content.name:
-				fix_name(content)
-				if content.name in g_names:
-					print "Error (ignored): %r defined twice" % content.name
-					continue
-				g_names.add(content.name)
-			else:
-				continue
-			if isinstance(content, cparser.CFunc):
-				funcEnv = interpreter._translateFuncToPyAst(content, noBodyMode="code-with-exception")
-				pyAst = funcEnv.astNode
-				assert isinstance(pyAst, ast.FunctionDef)
-				pyAst.decorator_list.append(ast.Name(id="staticmethod", ctx=ast.Load()))
-				Unparser(pyAst, indent=1, file=f)
-				f.write("\n")
-			elif isinstance(content, (cparser.CStruct, cparser.CUnion)):
-				pass  # Handled in the other loops.
-			elif isinstance(content, cparser.CTypedef):
-				f.write("    %s = %s\n" % (content.name, get_py_type(content.type, state)))
-			elif isinstance(content, cparser.CVarDecl):
-				f.write("    %s = 'Dummy vardecl'\n" % content.name)  # TODO
-			elif isinstance(content, cparser.CEnum):
-				int_type_name = content.getMinCIntType()
-				f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
-			else:
-				raise Exception("unexpected content type: %s" % type(content))
-		except Exception as exc:
-			print "!!! Exception while compiling %r" % content
-			if content.name:
-				f.write("    %s = 'Compile exception ' %r\n" % (content.name, str(exc)))
-			sys.excepthook(*sys.exc_info())
-			# We continue...
-	f.write("\n\n")
-
-	f.write("class values:\n")
-	def maybe_add_wrap_value(container_name, var_name, var):
-		if not isinstance(var, cparser.CWrapValue): return
-		v = cparser.interpreter.getAstForWrapValue(interpreter, var)
-		assert isinstance(v, ast.Attribute)
-		assert isinstance(v.value, ast.Name)
-		assert v.value.id == "values"
-		wrap_name = v.attr
-		var2 = getattr(interpreter.wrappedValues, wrap_name, None)
-		assert var2 is var
-		f.write("    %s = intp.stateStructs[0].%s[%r]\n" % (wrap_name, container_name, var_name))
-	# These are added by globalincludewrappers.
-	for varname, var in sorted(state.vars.items()):
-		maybe_add_wrap_value("vars", varname, var)
-	for varname, var in sorted(state.funcs.items()):
-		maybe_add_wrap_value("funcs", varname, var)
-	f.write("\n\n")
-
-	f.write("if __name__ == '__main__':\n")
-	f.write("    g.Py_Main(ctypes_wrapped.c_int(len(sys.argv)),\n"
-			"              (ctypes.POINTER(ctypes_wrapped.c_char) * (len(sys.argv) + 1))(\n"
-			"               *[ctypes.cast(intp._make_string(arg), ctypes.POINTER(ctypes_wrapped.c_char))\n"
-			"                 for arg in sys.argv]))\n")
-	f.write("\n")
+	code_gen = CodeGen(f, state, interpreter)
+	code_gen.write_header()
+	code_gen.fix_names()
+	code_gen.write_structs()
+	code_gen.write_unions()
+	code_gen.write_delayed_structs()
+	code_gen.write_globals()
+	code_gen.write_footer()
 	f.close()
 
 	print "Done."
