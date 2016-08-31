@@ -127,8 +127,7 @@ class CodeGen:
 			if isinstance(content, cparser.CTypedef):
 				set_name_for_typedeffed_struct(content, self.state)
 			if isinstance(content, (cparser.CStruct, cparser.CUnion, cparser.CFunc, cparser.CTypedef, cparser.CVarDecl)):
-				if not content.name:
-					content.name = self._get_anonymous_name()
+				assert content.name
 				fix_name(content)
 
 	def _get_anonymous_name_counter(self):
@@ -141,6 +140,8 @@ class CodeGen:
 	def _write_structs(self, base_type):
 		f = self.f
 		f.write("class %ss:\n" % base_type)
+		f.write("    pass\n")
+		f.write("\n")
 		cparse_base_type = {"struct": cparser.CStruct, "union": cparser.CUnion}[base_type]
 		last_log_time = time.time()
 		for i, content in enumerate(self.state.contentlist):
@@ -159,10 +160,11 @@ class CodeGen:
 				content = self.state.getResolvedDecl(content)
 				if cparser.isExternDecl(content):
 					# Dummy placeholder.
-					f.write("    %s = ctypes_wrapped.c_int  # Dummy extern declaration\n" % content.name)
+					self._write_struct_dummy_extern(content)
 					continue
 				else:
 					# We have a full declaration available.
+					# It will be written later when we come to it in this loop.
 					continue  # we will write it later
 			self._try_write_struct(content)
 		f.write("\n\n")
@@ -174,7 +176,6 @@ class CodeGen:
 
 	def _write_struct(self, content):
 		assert content.name
-		print "write struct", content
 		if content.body is None:
 			raise self.NoBody()
 		if getattr(content, "_comppy_constructing", None):
@@ -199,13 +200,22 @@ class CodeGen:
 					fields.append("(%r, %s)" % (str(c.name), t))
 		finally:
 			content._comppy_constructing = False
-		self._fix_local_struct_name(content)
 		f = self.f
-		f.write("    class %s(%s):\n" % (content.name, ctype_base))
-		f.write("        _fields_ = [\n")
-		f.write("            %s]\n" % (",\n" + " " * 12).join(fields))
+		f.write("class _%s_%s(%s):\n" % (base_type, content.name, ctype_base))
+		f.write("    _fields_ = [\n")
+		f.write("        %s]\n" % (",\n" + " " * 8).join(fields))
+		f.write("%ss.%s = _%s_%s\n" % (base_type, content.name, base_type, content.name))
+		f.write("del _%s_%s\n" % (base_type, content.name))
 		f.write("\n")
 		content._comppy_written = True
+		assert content.name not in struct_dict
+		struct_dict[content.name] = content
+
+	def _write_struct_dummy_extern(self, content):
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(content)]
+		self.f.write("%ss.%s = ctypes_wrapped.c_int  # Dummy extern declaration\n" % (base_type, content.name))
+		struct_dict = {"struct": self.structs, "union": self.unions}[base_type]
+		assert content.name
 		assert content.name not in struct_dict
 		struct_dict[content.name] = content
 
@@ -223,42 +233,48 @@ class CodeGen:
 			if content not in self.delayed_structs:
 				assert content.name not in struct_dict
 				self.delayed_structs.append(content)
-				self.f.write("    %s = None  # will we initialized later\n" % content.name)
-
-	def _fix_local_struct_name(self, t):
-		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
-		state_dict = getattr(self.state, "%ss" % base_type)
-		# Check if this is a local declaration (inside another struct or a function).
-		if t.name in state_dict and state_dict[t.name] is not t:
-			t.name = "_local_%i_%s" % (self._get_anonymous_name_counter(), t.name)
-			assert t.name not in state_dict
+				self.f.write("%ss.%s = None  # will we initialized later\n" % (base_type, content.name))
 
 	def _check_local_struct_type(self, t):
-		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
 		if not t.name:
-			t.name = self._get_anonymous_name()
-		self._fix_local_struct_name(t)
+			t.name = "_local_" + self._get_anonymous_name()
+		if t.body is None:
+			t2 = self.state.getResolvedDecl(t)
+			if t2 is not None:
+				assert t2.name == t.name
+				t = t2
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
 		struct_dict = {"struct": self.structs, "union": self.unions}[base_type]
 		if t.name not in struct_dict:
 			if {"struct": self._py_in_structs, "union": self._py_in_unions}[base_type]:
-				if t.body is None:
-					t2 = self.state.getResolvedDecl(t)
-					if t2 is not None:
-						t = t2
 				self._write_struct(t)
 			else:
 				raise self.IncompleteStructCannotCompleteHere()
 
+	def _write_delayed_struct(self, content):
+		# See cparser._getCTypeStruct for reference.
+		f = self.f
+		f.write("# delayed TODO: %s\n" % content)
+		assert content.name
+		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(content)]
+		struct_dict = getattr(self, "%ss" % base_type)
+		assert content.name not in struct_dict
+		struct_dict[content.name] = content
+		ctype_base = {"struct": "ctypes.Structure", "union": "ctypes.Union"}[base_type]
+		f.write("class _class_%s_%s(%s): pass" % (base_type, content.name, ctype_base))
+		f.write("_fields_%s_%s = []\n" % (base_type, content.name))
+		# TODO wip...
+		# finalize the type
+		f.write("_class_%s_%s.fields = _fields_%s_%s\n" % (base_type, content.name, base_type, content.name))
+		f.write("%ss.%s = _class_%s_%s\n" % (base_type, content.name, base_type, content.name))
+		f.write("del _class_%s_%s\n" % (base_type, content.name))
+		f.write("\n")
+		self.delayed_structs.remove(content)
+
 	def write_delayed_structs(self):
 		f = self.f
-		for t in self.delayed_structs:
-			self._fix_local_struct_name(t)
-			f.write("# delayed TODO: %s\n" % t)
-			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
-			struct_dict = getattr(self, "%ss" % base_type)
-			assert t.name not in struct_dict
-			struct_dict[t.name] = t
-		del self.delayed_structs[:]
+		while self.delayed_structs:
+			self._write_delayed_struct(self.delayed_structs[0])
 		f.write("\n\n")
 
 	def get_py_type(self, t):
@@ -267,18 +283,11 @@ class CodeGen:
 				assert t.name, "typedef target typedef must have name"
 				return t.name
 			return self.get_py_type(t.type)
-		elif isinstance(t, cparser.CStruct):
+		elif isinstance(t, (cparser.CStruct, cparser.CUnion)):
+			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
 			self._check_local_struct_type(t)
-			if self._py_in_structs:
-				return t.name
 			assert t.name, "struct must have name, should have been assigned earlier also to anonymous structs"
-			return "structs.%s" % t.name
-		elif isinstance(t, cparser.CUnion):
-			self._check_local_struct_type(t)
-			if self._py_in_unions:
-				return t.name
-			assert t.name, "union must have name, should have been assigned earlier also to anonymous unions"
-			return "unions.%s" % t.name
+			return "%ss.%s" % (base_type, t.name)
 		elif isinstance(t, cparser.CBuiltinType):
 			return "ctypes_wrapped.%s" % builtin_ctypes_name(t.builtinType)
 		elif isinstance(t, cparser.CStdIntType):
