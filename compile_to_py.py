@@ -91,7 +91,9 @@ class CodeGen:
 		self.delayed_structs = []
 		self._py_in_structs = False
 		self._py_in_unions = False
+		self._py_in_delayed = False
 		self._py_in_globals = False
+		self._get_py_type_stack = []
 		self._anonymous_name_counter = 0
 
 	def write_header(self):
@@ -201,11 +203,11 @@ class CodeGen:
 		finally:
 			content._comppy_constructing = False
 		f = self.f
-		f.write("class _%s_%s(%s):\n" % (base_type, content.name, ctype_base))
+		f.write("class _class_%s_%s(%s):\n" % (base_type, content.name, ctype_base))
 		f.write("    _fields_ = [\n")
 		f.write("        %s]\n" % (",\n" + " " * 8).join(fields))
-		f.write("%ss.%s = _%s_%s\n" % (base_type, content.name, base_type, content.name))
-		f.write("del _%s_%s\n" % (base_type, content.name))
+		f.write("%ss.%s = _class_%s_%s\n" % (base_type, content.name, base_type, content.name))
+		f.write("del _class_%s_%s\n" % (base_type, content.name))
 		f.write("\n")
 		content._comppy_written = True
 		assert content.name not in struct_dict
@@ -233,7 +235,7 @@ class CodeGen:
 			if content not in self.delayed_structs:
 				assert content.name not in struct_dict
 				self.delayed_structs.append(content)
-				self.f.write("%ss.%s = None  # will we initialized later\n" % (base_type, content.name))
+				content._delayed_write = True
 
 	def _check_local_struct_type(self, t):
 		if not t.name:
@@ -248,36 +250,94 @@ class CodeGen:
 		if t.name not in struct_dict:
 			if {"struct": self._py_in_structs, "union": self._py_in_unions}[base_type]:
 				self._write_struct(t)
+			elif self._py_in_delayed:
+				self._write_delayed_struct(t)
 			else:
 				raise self.IncompleteStructCannotCompleteHere()
 
 	def _write_delayed_struct(self, content):
 		# See cparser._getCTypeStruct for reference.
 		f = self.f
-		f.write("# delayed TODO: %s\n" % content)
 		assert content.name
 		base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(content)]
 		struct_dict = getattr(self, "%ss" % base_type)
 		assert content.name not in struct_dict
-		struct_dict[content.name] = content
 		ctype_base = {"struct": "ctypes.Structure", "union": "ctypes.Union"}[base_type]
-		f.write("class _class_%s_%s(%s): pass" % (base_type, content.name, ctype_base))
-		f.write("_fields_%s_%s = []\n" % (base_type, content.name))
-		# TODO wip...
+		if not getattr(content, "_wrote_header", False):
+			f.write("class _class_%s_%s(%s): pass\n" % (base_type, content.name, ctype_base))
+			f.write("%ss.%s = _class_%s_%s\n" % (base_type, content.name, base_type, content.name))
+			content._wrote_header = True
+		if content.body is None:
+			return
+
+		parent_type = None
+		type_stack = list(self._get_py_type_stack)
+		if type_stack:
+			# type_stack[-1], or getResolvedDecl of it, that is the current content.
+			type_stack.pop()
+			# Take next non-typedef type.
+			while type_stack:
+				parent_type = type_stack.pop()
+				if not isinstance(parent_type, cparser.CTypedef):
+					break
+
+		if getattr(content, "_comppy_constructing", None):
+			if parent_type is not None:
+				# If the parent referred to us as a pointer, it's fine,
+				# we can use our incomplete type and don't need to construct it now.
+				if cparser.isPointerType(parent_type, alsoFuncPtr=True, alsoArray=False):
+					return
+			# Otherwise, we must construct it now.
+			content._comppy_constructing.append(parent_type)
+			if len(content._comppy_constructing) > 2:
+				# We got called more than once. This is an infinite loop.
+				raise self.RecursiveConstruction(
+					"The parent types when we were called: %s" % (content._comppy_constructing,))
+		else:
+			content._comppy_constructing = [parent_type]
+		fields = []
+		try:
+			for c in content.body.contentlist:
+				if not isinstance(c, cparser.CVarDecl): continue
+				t = self.get_py_type(c.type)
+				if c.arrayargs:
+					if len(c.arrayargs) != 1: raise Exception(str(c) + " has too many array args")
+					n = c.arrayargs[0].value
+					t = "%s * %i" % (t, n)
+				if hasattr(c, "bitsize"):
+					fields.append("(%r, %s, %s)" % (str(c.name), t, c.bitsize))
+				else:
+					fields.append("(%r, %s)" % (str(c.name), t))
+		finally:
+			content._comppy_constructing.pop()
+
 		# finalize the type
-		f.write("_class_%s_%s.fields = _fields_%s_%s\n" % (base_type, content.name, base_type, content.name))
-		f.write("%ss.%s = _class_%s_%s\n" % (base_type, content.name, base_type, content.name))
-		f.write("del _class_%s_%s\n" % (base_type, content.name))
-		f.write("\n")
-		self.delayed_structs.remove(content)
+		if content.name not in struct_dict:
+			struct_dict[content.name] = content
+			f.write("_class_%s_%s.fields = [\n    %s]\n" % (base_type, content.name, ",\n    ".join(fields)))
+			f.write("del _class_%s_%s\n" % (base_type, content.name))
+			f.write("\n")
 
 	def write_delayed_structs(self):
+		self._py_in_delayed = True
 		f = self.f
-		while self.delayed_structs:
-			self._write_delayed_struct(self.delayed_structs[0])
+		for t in self.delayed_structs:
+			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
+			struct_dict = getattr(self, "%ss" % base_type)
+			if t.name in struct_dict: continue  # could be written meanwhile
+			self._write_delayed_struct(t)
+		del self.delayed_structs[:]
 		f.write("\n\n")
+		self._py_in_delayed = False
 
 	def get_py_type(self, t):
+		self._get_py_type_stack.append(t)
+		try:
+			return self._get_py_type(t)
+		finally:
+			self._get_py_type_stack.pop()
+
+	def _get_py_type(self, t):
 		if isinstance(t, cparser.CTypedef):
 			if self._py_in_globals:
 				assert t.name, "typedef target typedef must have name"
