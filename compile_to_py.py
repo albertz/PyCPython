@@ -427,7 +427,21 @@ class CodeGen:
 				elif isinstance(content, cparser.CTypedef):
 					f.write("    %s = %s\n" % (content.name, self.get_py_type(content.type)))
 				elif isinstance(content, cparser.CVarDecl):
-					f.write("    %s = 'Dummy vardecl'\n" % content.name)  # TODO
+					# See cparser.interpreter.GlobalScope.getVar() for reference.
+					f.write("    %s = " % content.name)
+					decl_type, bodyAst, bodyType = \
+						self.interpreter.globalScope._getDeclTypeBodyAstAndType(content)
+					pyEmptyAst = self.interpreter.globalScope._getEmptyValueAst(decl_type)
+					Unparser(pyEmptyAst, file=f)
+					f.write("\n")
+					bodyValueAst = self.interpreter.globalScope._getVarBodyValueAst(
+						content, decl_type, bodyAst, bodyType)
+					if bodyValueAst is not None:
+						# TODO ...
+						#self.interpreter.helpers.assign(self.vars[name], value)
+						f.write("    # TODO init %s with " % content.name)
+						Unparser(pyEmptyAst, file=f)
+						f.write("\n")
 				elif isinstance(content, cparser.CEnum):
 					int_type_name = content.getMinCIntType()
 					f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
