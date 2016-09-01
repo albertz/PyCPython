@@ -474,63 +474,6 @@ class CodeGen:
 		f.write("\n")
 
 
-def make_struct(baseClass, obj, stateStruct):
-
-	def _construct(obj):
-		fields = []
-		for c in obj.body.contentlist:
-			if not isinstance(c, cparser.CVarDecl): continue
-			try:
-				obj._construct_struct_attrib = c.type
-				t = get_py_type(c.type, stateStruct)
-			finally:
-				obj._construct_struct_attrib = None
-			if c.arrayargs:
-				if len(c.arrayargs) != 1: raise Exception(str(c) + " has too many array args")
-				n = c.arrayargs[0].value
-				t = "%s * %i" % (t, n)
-			if hasattr(c, "bitsize"):
-				fields += [(str(c.name), t, c.bitsize)]
-			else:
-				fields += [(str(c.name), t)]
-		if obj._ctype_is_constructing:
-			obj._ctype._fields_ = fields
-			obj._ctype_is_constructing = False
-
-	def construct(obj):
-		try:
-			stateStruct._construct_struct_type_stack += [obj]
-			_construct(obj)
-		finally:
-			stateStruct._construct_struct_type_stack.pop()
-
-	if getattr(obj, "_ctype_is_constructing", None):
-		# If the parent referred to us as a pointer, it's fine,
-		# we can return our incomplete type.
-		if isPointerType(
-				stateStruct._construct_struct_type_stack[-1]._construct_struct_attrib,
-				alsoFuncPtr=True, alsoArray=False):
-			return obj._ctype
-		# Otherwise, try to construct it now.
-		if obj._ctype_construct_need_now:
-			raise RecursiveStructConstruction("Recursive construction of type %s" % obj)
-		obj._ctype_construct_need_now = True
-		construct(obj)
-		return obj._ctype
-
-	if hasattr(obj, "_ctype"): return obj._ctype
-	if not hasattr(obj, "body"): raise CTypeConstructionException("%s must have the body attrib" % obj)
-	if obj.body is None: raise CTypeConstructionException("%s.body must not be None. maybe it was only forward-declarated?" % obj)
-
-	class ctype(baseClass): pass
-	ctype.__name__ = str(obj.name or "<anonymous-struct>")
-	obj._ctype = ctype
-	obj._ctype_is_constructing = True
-	obj._ctype_construct_need_now = False
-	construct(obj)
-	return ctype
-
-
 def main(argv):
 	state = CPythonState()
 
