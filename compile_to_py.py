@@ -505,6 +505,7 @@ def main(argv):
 	code_gen.write_structs()
 	code_gen.write_unions()
 	code_gen.write_delayed_structs()
+	code_gen.write_values()
 	code_gen.write_globals()
 	code_gen.write_footer()
 	f.close()
