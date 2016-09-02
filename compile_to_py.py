@@ -93,6 +93,7 @@ class CodeGen:
 		self._py_in_unions = False
 		self._py_in_delayed = False
 		self._py_in_globals = False
+		self._py_globals = {}
 		self._get_py_type_stack = []
 		self._anonymous_name_counter = 0
 
@@ -388,6 +389,14 @@ class CodeGen:
 			if isinstance(value, ast.Attribute) \
 					and isinstance(value.value, ast.Name) \
 					and value.value.id == "g":  # found one
+				assert value.attr in self._py_globals
+				if isinstance(self._py_globals[value.attr], cparser.CFunc):
+					# overwrite this with "something.__func__" to resolve the staticmethod
+					return ast.Attribute(
+						value=ast.Name(id=value.attr, ctx=ast.Load()),
+						attr="__func__",
+						ctx=ast.Load()
+					)
 				# overwrite this with just "something"
 				return ast.Name(id=value.attr, ctx=ast.Load())
 			return value
@@ -405,7 +414,6 @@ class CodeGen:
 		self._py_in_globals = True
 		f = self.f
 		f.write("class g:\n")
-		g_names = set()
 		last_log_time = time.time()
 		count = count_incomplete = 0
 		for i, content in enumerate(self.state.contentlist):
@@ -430,10 +438,11 @@ class CodeGen:
 				count += 1
 				if content.name:
 					fix_name(content)
-					if content.name in g_names:
-						print "Error (ignored): %r defined twice" % content.name
+					if content.name in self._py_globals:
+						print "Error (ignored): %r defined twice, earlier as %r, now as %r" % (
+							content.name, self._py_globals[content.name], content)
 						continue
-					g_names.add(content.name)
+					self._py_globals[content.name] = content
 				else:
 					continue
 				if isinstance(content, cparser.CFunc):
@@ -460,11 +469,9 @@ class CodeGen:
 						content, decl_type, bodyAst, bodyType)
 					if bodyValueAst is not None:
 						self._fixup_global_g_inner(bodyValueAst)
-						# TODO ...
-						#self.interpreter.helpers.assign(self.vars[name], value)
-						f.write("    # TODO init %s with " % content.name)
+						f.write("    helpers.assign(%s, " % content.name)
 						Unparser(bodyValueAst, file=f)
-						f.write("\n")
+						f.write(")\n")
 				elif isinstance(content, cparser.CEnum):
 					int_type_name = content.getMinCIntType()
 					f.write("    %s = ctypes_wrapped.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
