@@ -255,7 +255,7 @@ class CodeGen:
 			else:
 				raise self.IncompleteStructCannotCompleteHere()
 
-	def _write_delayed_struct(self, content):
+	def _write_delayed_struct(self, content, indent=""):
 		# See cparser._getCTypeStruct for reference.
 		f = self.f
 		assert content.name
@@ -264,8 +264,8 @@ class CodeGen:
 		assert content.name not in struct_dict
 		ctype_base = {"struct": "ctypes.Structure", "union": "ctypes.Union"}[base_type]
 		if not getattr(content, "_wrote_header", False):
-			f.write("class _class_%s_%s(%s): pass\n" % (base_type, content.name, ctype_base))
-			f.write("%ss.%s = _class_%s_%s\n" % (base_type, content.name, base_type, content.name))
+			f.write("%sclass _class_%s_%s(%s): pass\n" % (indent, base_type, content.name, ctype_base))
+			f.write("%s%ss.%s = _class_%s_%s\n" % (indent, base_type, content.name, base_type, content.name))
 			content._wrote_header = True
 		if content.body is None:
 			return
@@ -314,8 +314,10 @@ class CodeGen:
 		# finalize the type
 		if content.name not in struct_dict:
 			struct_dict[content.name] = content
-			f.write("_class_%s_%s.fields = [\n    %s]\n" % (base_type, content.name, ",\n    ".join(fields)))
-			f.write("del _class_%s_%s\n" % (base_type, content.name))
+			f.write("%s_class_%s_%s.fields = [\n%s    %s]\n" % (
+				indent, base_type, content.name, indent,
+				(",\n%s    " % indent).join(fields)))
+			f.write("%sdel _class_%s_%s\n" % (indent, base_type, content.name))
 			f.write("\n")
 
 	def write_delayed_structs(self):
@@ -479,7 +481,19 @@ class CodeGen:
 
 	def _new_wrapped_value_callback(self, name, value):
 		assert self._py_in_globals
-		self.f.write("    %s = None  # TODO _new_wrapped_value_callback ...\n" % name)
+		assert isinstance(value, cparser.CWrapValue)
+		if issubclass(value.value, (ctypes.Structure, ctypes.Union)):
+			# Created via cparser._getCTypeStruct().
+			assert isinstance(value.value._ctype, (cparser.CStruct, cparser.CUnion))
+			t = value.value._py
+			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
+			assert not t.name
+			t.name = "_local_" + self._get_anonymous_name()
+			self._write_delayed_struct(t, indent="    ")
+			self.f.write("    values.%s = %ss.%s\n" % (name, base_type, t.name))
+		else:
+			self.f.write("    values.%s = None  # TODO CWrapValue(value=%r, decl=%r, name=%r)\n" % (
+				name, value.value, value.decl, value.name))
 
 	def write_values(self):
 		f = self.f
@@ -497,8 +511,8 @@ class CodeGen:
 			maybe_add_wrap_value("vars", varname, var)
 		for varname, var in sorted(self.state.funcs.items()):
 			maybe_add_wrap_value("funcs", varname, var)
-		for wrap_name in sorted(self.interpreter.wrappedValues.list.difference(handled_list)):
-			f.write("    %s = None  # TODO wrapped value ...\n" % wrap_name)
+		remaining = self.interpreter.wrappedValues.list.difference(handled_list)
+		assert not remaining
 		f.write("\n\n")
 
 		if self._new_wrapped_value_callback not in self.interpreter.wrappedValues.callbacks_register_new:
