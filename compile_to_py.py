@@ -484,13 +484,13 @@ class CodeGen:
 		assert isinstance(value, cparser.CWrapValue)
 		if issubclass(value.value, (ctypes.Structure, ctypes.Union)):
 			# Created via cparser._getCTypeStruct().
-			assert isinstance(value.value._ctype, (cparser.CStruct, cparser.CUnion))
+			assert isinstance(value.value._py, (cparser.CStruct, cparser.CUnion))
 			t = value.value._py
 			base_type = {cparser.CStruct: "struct", cparser.CUnion: "union"}[type(t)]
 			assert not t.name
 			t.name = "_local_" + self._get_anonymous_name()
 			self._write_delayed_struct(t, indent="    ")
-			self.f.write("    values.%s = %ss.%s\n" % (name, base_type, t.name))
+			self.f.write("    values.%s = cparser.CWrapValue(%ss.%s)\n" % (name, base_type, t.name))
 		else:
 			self.f.write("    values.%s = None  # TODO CWrapValue(value=%r, decl=%r, name=%r)\n" % (
 				name, value.value, value.decl, value.name))
