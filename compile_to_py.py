@@ -380,6 +380,25 @@ class CodeGen:
 			return self.get_py_type(t.type)
 		raise Exception("unexpected type: %s" % type(t))
 
+	def _fixup_global_g_inner(self, a):
+		def maybe_replace(value):
+			# search for attrib access like "g.something"
+			if isinstance(value, ast.Attribute) \
+					and isinstance(value.value, ast.Name) \
+					and value.value.id == "g":  # found one
+				# overwrite this with just "something"
+				return ast.Name(id=value.attr, ctx=ast.Load())
+			return value
+		for node in ast.walk(a):
+			for fieldname, value in ast.iter_fields(node):
+				if isinstance(value, ast.AST):
+					setattr(node, fieldname, maybe_replace(value))
+				elif isinstance(value, list):
+					for i in range(len(value)):
+						value[i] = maybe_replace(value[i])
+				elif isinstance(value, tuple):
+					setattr(node, fieldname, tuple(map(maybe_replace, value)))
+
 	def write_globals(self):
 		self._py_in_globals = True
 		f = self.f
@@ -428,23 +447,25 @@ class CodeGen:
 					f.write("    %s = %s\n" % (content.name, self.get_py_type(content.type)))
 				elif isinstance(content, cparser.CVarDecl):
 					# See cparser.interpreter.GlobalScope.getVar() for reference.
-					f.write("    %s = " % content.name)
 					decl_type, bodyAst, bodyType = \
 						self.interpreter.globalScope._getDeclTypeBodyAstAndType(content)
 					pyEmptyAst = self.interpreter.globalScope._getEmptyValueAst(decl_type)
+					self._fixup_global_g_inner(pyEmptyAst)
+					f.write("    %s = " % content.name)
 					Unparser(pyEmptyAst, file=f)
 					f.write("\n")
 					bodyValueAst = self.interpreter.globalScope._getVarBodyValueAst(
 						content, decl_type, bodyAst, bodyType)
 					if bodyValueAst is not None:
+						self._fixup_global_g_inner(bodyValueAst)
 						# TODO ...
 						#self.interpreter.helpers.assign(self.vars[name], value)
 						f.write("    # TODO init %s with " % content.name)
-						Unparser(pyEmptyAst, file=f)
+						Unparser(bodyValueAst, file=f)
 						f.write("\n")
 				elif isinstance(content, cparser.CEnum):
 					int_type_name = content.getMinCIntType()
-					f.write("    %s = ctypes.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
+					f.write("    %s = ctypes_wrapped.%s\n" % (content.name, stdint_ctypes_name(int_type_name)))
 				else:
 					raise Exception("unexpected content type: %s" % type(content))
 			except Exception as exc:
@@ -456,19 +477,19 @@ class CodeGen:
 		f.write("\n\n")
 		self._py_in_globals = False
 
+	def _new_wrapped_value_callback(self, name, value):
+		assert self._py_in_globals
+		self.f.write("    %s = None  # TODO _new_wrapped_value_callback ...\n" % name)
+
 	def write_values(self):
 		f = self.f
 		f.write("class values:\n")
 
+		handled_list = set()
 		def maybe_add_wrap_value(container_name, var_name, var):
 			if not isinstance(var, cparser.CWrapValue): return
-			v = cparser.interpreter.getAstForWrapValue(self.interpreter, var)
-			assert isinstance(v, ast.Attribute)
-			assert isinstance(v.value, ast.Name)
-			assert v.value.id == "values"
-			wrap_name = v.attr
-			var2 = getattr(self.interpreter.wrappedValues, wrap_name, None)
-			assert var2 is var
+			wrap_name = self.interpreter.wrappedValues.get_value(var)
+			handled_list.add(wrap_name)
 			f.write("    %s = intp.stateStructs[0].%s[%r]\n" % (wrap_name, container_name, var_name))
 
 		# These are added by globalincludewrappers.
@@ -476,7 +497,12 @@ class CodeGen:
 			maybe_add_wrap_value("vars", varname, var)
 		for varname, var in sorted(self.state.funcs.items()):
 			maybe_add_wrap_value("funcs", varname, var)
+		for wrap_name in sorted(self.interpreter.wrappedValues.list.difference(handled_list)):
+			f.write("    %s = None  # TODO wrapped value ...\n" % wrap_name)
 		f.write("\n\n")
+
+		if self._new_wrapped_value_callback not in self.interpreter.wrappedValues.callbacks_register_new:
+			self.interpreter.wrappedValues.callbacks_register_new.append(self._new_wrapped_value_callback)
 
 	def write_footer(self):
 		f = self.f
