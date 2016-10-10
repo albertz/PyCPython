@@ -106,7 +106,7 @@ class CodeGen:
 		f.write("import better_exchook\n")
 		f.write("import cparser\n")
 		f.write("import cparser.interpreter\n")
-		f.write("import cparser.cparser_utils")
+		f.write("import cparser.cparser_utils\n")
 		f.write("import ctypes\n")
 		f.write("\n")
 		f.write("better_exchook.install()\n")
