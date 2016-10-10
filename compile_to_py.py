@@ -110,7 +110,7 @@ class CodeGen:
 		f.write("import ctypes\n")
 		f.write("\n")
 		f.write("better_exchook.install()\n")
-		f.write("cparser.cparser_utils.setup_Structure_debug_helper()")
+		f.write("cparser.cparser_utils.setup_Structure_debug_helper()\n")
 		f.write("intp = cparser.interpreter.Interpreter()\n")
 		f.write("intp.setupStatic()\n")
 		f.write("helpers = intp.helpers\n")
