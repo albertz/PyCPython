@@ -106,9 +106,11 @@ class CodeGen:
 		f.write("import better_exchook\n")
 		f.write("import cparser\n")
 		f.write("import cparser.interpreter\n")
+		f.write("import cparser.cparser_utils")
 		f.write("import ctypes\n")
 		f.write("\n")
 		f.write("better_exchook.install()\n")
+		f.write("cparser.cparser_utils.setup_Structure_debug_helper()")
 		f.write("intp = cparser.interpreter.Interpreter()\n")
 		f.write("intp.setupStatic()\n")
 		f.write("helpers = intp.helpers\n")
@@ -315,7 +317,7 @@ class CodeGen:
 		# finalize the type
 		if content.name not in struct_dict:
 			struct_dict[content.name] = content
-			f.write("%s_class_%s_%s.fields = [\n%s    %s]\n" % (
+			f.write("%s_class_%s_%s._fields_ = [\n%s    %s]\n" % (
 				indent, base_type, content.name, indent,
 				(",\n%s    " % indent).join(fields)))
 			f.write("%sdel _class_%s_%s\n" % (indent, base_type, content.name))
