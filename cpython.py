@@ -1,12 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # PyCPython - interpret CPython in Python
 # by Albert Zeyer, 2011
 # code under BSD 2-Clause License
 
-import better_exchook
-better_exchook.install()
+from __future__ import print_function
 
-import sys, os, os.path
+import argparse
+import os
+import sys
+
 if __name__ == '__main__':
 	MyDir = os.path.dirname(sys.argv[0])
 else:
@@ -16,7 +18,7 @@ CPythonDir = MyDir + "/CPython"
 
 import cparser
 import cparser.interpreter
-import argparse
+
 
 class CPythonState(cparser.State):
 
@@ -108,8 +110,8 @@ def init_faulthandler(sigusr1_chain=False):
 	"""
 	try:
 		import faulthandler
-	except ImportError, e:
-		print "faulthandler import error. %s" % e
+	except ImportError as e:
+		print("faulthandler import error. %s" % e)
 		return
 	# Only enable if not yet enabled -- otherwise, leave it in its current state.
 	if not faulthandler.is_enabled():
@@ -123,10 +125,13 @@ def init_faulthandler(sigusr1_chain=False):
 
 
 def register_sigusr1_print_backtrace():
-	if os.name == "nt": return
+	if os.name == "nt":
+		return
+
 	def sigusr1_handler(sig, frame):
-		print "--- SIGUSR1 handler"
+		print("--- SIGUSR1 handler")
 		better_exchook.print_tb(tb=frame)
+
 	import signal
 	signal.signal(signal.SIGUSR1, sigusr1_handler)
 
@@ -148,28 +153,28 @@ def main(argv):
 		help="Prints what functions and global vars we are going to translate.")
 	args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 	argv = argv[:1] + argv_rest
-	print "PyCPython -", argparser.description,
-	print "(use --pycpython-help for help)"
+	print("PyCPython -", argparser.description,)
+	print("(use --pycpython-help for help)")
 
 	state = CPythonState()
 
-	print "Parsing CPython...",
+	print("Parsing CPython...", end="")
 	state.parse_cpython()
 
 	if state._errors:
-		print "finished, parse errors:"
+		print("finished, parse errors:")
 		for m in state._errors:
-			print m
+			print(m)
 	else:
-		print "finished, no parse errors."
+		print("finished, no parse errors.")
 
 	interpreter = cparser.interpreter.Interpreter()
 	interpreter.register(state)
 
 	if args_ns.dump_python:
 		for fn in args_ns.dump_python:
-			print
-			print "PyAST of %s:" % fn
+			print()
+			print("PyAST of %s:" % fn)
 			interpreter.dumpFunc(fn)
 		sys.exit()
 
@@ -178,11 +183,13 @@ def main(argv):
 		interpreter.debug_print_getVar = True
 
 	args = ("Py_Main", len(argv), argv + [None])
-	print "Run", args, ":"
+	print("Run", args, ":")
 	interpreter.runFunc(*args)
 
 
 if __name__ == '__main__':
+	import better_exchook
+	better_exchook.install()
 	register_sigusr1_print_backtrace()
 	init_faulthandler(sigusr1_chain=True)
 	main(sys.argv)
