@@ -55,6 +55,7 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_STDARG_PROTOTYPES"] = cparser.Macro(rightside="1")
+                self.macros["_POSIX_THREADS"] = cparser.Macro(rightside="1")
                 # _GNU_SOURCE, _POSIX_C_SOURCE or so?
                 return
                 yield None # make it a generator
