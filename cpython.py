@@ -49,6 +49,7 @@ class CPythonState(cparser.State):
 				self.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
 				self.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
 				self.macros["SIZEOF_PTHREAD_T"] = self.macros["SIZEOF_LONG"]
+				self.macros["SIZEOF_WCHAR_T"] = self.macros["SIZEOF_INT"]
 				self.macros["SIZEOF_PID_T"] = self.macros["SIZEOF_INT"]
 				self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
 				self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
