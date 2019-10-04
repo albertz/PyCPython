@@ -49,12 +49,14 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
                 self.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
                 self.macros["SIZEOF_PTHREAD_T"] = self.macros["SIZEOF_LONG"]
-                self.macros["SIZEOF_WCHAR_T"] = self.macros["SIZEOF_INT"]
+                self.macros["SIZEOF_WCHAR_T"] = sizeofMacro(ctypes.c_wchar)
                 self.macros["SIZEOF_PID_T"] = self.macros["SIZEOF_INT"]
                 self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
                 self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_STDARG_PROTOTYPES"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_STD_ATOMIC"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_WCHAR_H"] = cparser.Macro(rightside="1")
                 self.macros["_POSIX_THREADS"] = cparser.Macro(rightside="1")
                 # _GNU_SOURCE, _POSIX_C_SOURCE or so?
                 return
@@ -66,6 +68,8 @@ class CPythonState(cparser.State):
         # We keep all in the same state, i.e. the same static space.
         # This also means that we don't reset macro definitions. This speeds up header includes.
         # Usually this is not a problem.
+        self.macros["Py_BUILD_CORE"] = cparser.Macro(rightside="1")  # Makefile
+        self.macros["Py_BUILD_CORE_BUILTIN"] = cparser.Macro(rightside="1")  # Makefile
         cparser.parse(CPythonDir + "/Modules/main.c", self) # Py_Main
         self.macros["FAST_LOOPS"] = cparser.Macro(rightside="0")  # not sure where this would come from
         cparser.parse(CPythonDir + "/Python/ceval.c", self) # PyEval_EvalFrameEx etc
