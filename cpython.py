@@ -177,6 +177,34 @@ def main(argv):
     interpreter = cparser.interpreter.Interpreter()
     interpreter.register(state)
 
+    # Py_GetPrefix/ExecPrefix/Path/PythonHome/ProgramFullPath are defined in
+    # pathconfig.c, which is intentionally not parsed.  Their C implementation
+    # calls _PyPathConfig_Init() (from Modules/getpath.c, also not parsed),
+    # which walks the real filesystem to discover where CPython is installed.
+    # That filesystem-discovery logic is platform-specific, requires many
+    # unwrapped syscalls, and would return the *wrong* paths anyway — we want
+    # the host Python's prefix/path so the interpreted CPython can find its
+    # stdlib.  We therefore supply these values directly from the host runtime.
+    import ctypes as _ctypes
+
+    def _make_wchar_const(s):
+        """Create a wchar_t* constant string suitable for returning from Py_Get* functions."""
+        buf = interpreter._make_wchar_string(s)
+        return _ctypes.cast(buf, _ctypes.c_void_p).value or 0
+
+    for _fn, _s in [
+        ("Py_GetProgramFullPath", argv[0]),
+        ("Py_GetPrefix", sys.prefix),
+        ("Py_GetExecPrefix", sys.exec_prefix),
+        ("Py_GetPath", ":".join(sys.path)),
+        ("Py_GetPythonHome", ""),
+    ]:
+        def _make_path_func(s=_s):
+            return _make_wchar_const(s)
+        _make_path_func.C_argTypes = None
+        _make_path_func.C_resType = _ctypes.c_void_p
+        interpreter._func_cache[_fn] = _make_path_func
+
     if args_ns.dump_python:
         for fn in args_ns.dump_python:
             print()
