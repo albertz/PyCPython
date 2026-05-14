@@ -88,6 +88,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/getopt.c", self) # _PyOS_GetOpt
         cparser.parse(CPythonDir + "/Python/pythonrun.c", self) # Py_Initialize
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
+        self.macros.pop("NAME", None)  # token.h defines NAME=1; sysmodule.c redefines it as "cpython"
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         if os.path.exists(CPythonDir + "/Python/random.c"):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
