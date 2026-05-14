@@ -54,6 +54,9 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
                 self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_ERRNO_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_FCNTL_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_SYS_STAT_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_SYS_TYPES_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_UNISTD_H"] = cparser.Macro(rightside="1")
                 # Force strict ANSI mode so pymacro.h uses the simple Py_ARRAY_LENGTH
                 # (without GCC-extension typeof/__builtin_types_compatible_p).
