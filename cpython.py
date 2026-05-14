@@ -23,6 +23,7 @@ class CPythonState(cparser.State):
         super(CPythonState, self).__init__()
         self.autoSetupSystemMacros()
         self.autoSetupGlobalIncludeWrappers()
+        self.included_files = set()  # type: set[str]
 
     def findIncludeFullFilename(self, filename, local):
         fullfn = CPythonDir + "/Include/" + filename
@@ -32,6 +33,8 @@ class CPythonState(cparser.State):
     def readLocalInclude(self, filename):
         #print " ", filename, "..."
         if filename == "pyconfig.h":
+            if filename in self.included_files: return "", None
+            self.included_files.add(filename)
             def reader():
                 # see CPython/pyconfig.h.in for reference
                 import ctypes
@@ -66,6 +69,9 @@ class CPythonState(cparser.State):
                 return
                 yield None # make it a generator
             return reader(), None
+        fullfn = self.findIncludeFullFilename(filename, True)
+        if fullfn and fullfn in self.included_files: return "", fullfn
+        if fullfn: self.included_files.add(fullfn)
         return super(CPythonState, self).readLocalInclude(filename)
 
     def readGlobalInclude(self, filename):
