@@ -9,10 +9,7 @@ import argparse
 import os
 import sys
 
-if __name__ == '__main__':
-    MyDir = os.path.dirname(sys.argv[0])
-else:
-    MyDir = "."
+MyDir = os.path.dirname(os.path.abspath(__file__))
 
 CPythonDir = MyDir + "/CPython"
 
