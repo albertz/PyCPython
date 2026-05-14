@@ -68,6 +68,13 @@ class CPythonState(cparser.State):
             return reader(), None
         return super(CPythonState, self).readLocalInclude(filename)
 
+    def readGlobalInclude(self, filename):
+        """Fall back to CPython/Include/<filename> for any unhandled global include."""
+        fullfn = os.path.join(CPythonDir, "Include", filename)
+        if os.path.exists(fullfn):
+            return self.readLocalInclude(fullfn)
+        return super(CPythonState, self).readGlobalInclude(filename)
+
     def parse_cpython(self):
         # We keep all in the same state, i.e. the same static space.
         # This also means that we don't reset macro definitions. This speeds up header includes.
