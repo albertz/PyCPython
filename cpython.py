@@ -50,6 +50,13 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF_PID_T"] = self.macros["SIZEOF_INT"]
                 self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
                 self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_ERRNO_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_UNISTD_H"] = cparser.Macro(rightside="1")
+                # Force strict ANSI mode so pymacro.h uses the simple Py_ARRAY_LENGTH
+                # (without GCC-extension typeof/__builtin_types_compatible_p).
+                self.macros["__STRICT_ANSI__"] = cparser.Macro(rightside="1")
+                # _PYTHONFRAMEWORK: name of the macOS framework bundle (empty when not bundled)
+                self.macros["_PYTHONFRAMEWORK"] = cparser.Macro(rightside='""')
                 self.macros["HAVE_SIGNAL_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_STDARG_PROTOTYPES"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_STD_ATOMIC"] = cparser.Macro(rightside="1")
