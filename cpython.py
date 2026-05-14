@@ -82,7 +82,8 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/pythonrun.c", self) # Py_Initialize
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
-        cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
+        if os.path.exists(CPythonDir + "/Python/random.c"):
+            cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
@@ -94,7 +95,8 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/dictobject.c", self)  # PyDict_New
         # We need this macro hack because stringobject.c will use the same var.
         self.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
-        cparser.parse(CPythonDir + "/Objects/stringobject.c", self)  # PyString_FromString
+        if os.path.exists(CPythonDir + "/Objects/stringobject.c"):
+            cparser.parse(CPythonDir + "/Objects/stringobject.c", self)  # PyString_FromString
         cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
         cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
         cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
