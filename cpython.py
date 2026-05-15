@@ -102,6 +102,8 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/getopt.c", self) # _PyOS_GetOpt
         cparser.parse(CPythonDir + "/Python/pythonrun.c", self) # Py_Initialize
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
+        cparser.parse(CPythonDir + "/Python/errors.c", self) # PyErr_Clear
+        cparser.parse(CPythonDir + "/Python/import.c", self) # _PyImport_Fini2
         cparser.parse(CPythonDir + "/Python/thread.c", self) # PyThread_allocate_lock
         cparser.parse(CPythonDir + "/Python/bootstrap_hash.c", self) # _Py_ReadHashSeed
         cparser.parse(CPythonDir + "/Python/pylifecycle.c", self) # _PyRuntime_Initialize, _Py_SetLocaleFromEnv
