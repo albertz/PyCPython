@@ -134,6 +134,13 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/listobject.c", self) # PyList_New
         cparser.parse(CPythonDir + "/Objects/abstract.c", self) # PySequence_List
         cparser.parse(CPythonDir + "/Python/modsupport.c", self) # Py_BuildValue
+        # fileutils.c must come before traceback.c (provides _Py_write_noraise)
+        cparser.parse(CPythonDir + "/Python/fileutils.c", self) # _Py_ResetForceASCII, _Py_open_noraise
+        cparser.parse(CPythonDir + "/Python/pathconfig.c", self) # _PyPathConfig_Init
+        cparser.parse(CPythonDir + "/Python/traceback.c", self) # _Py_DumpTracebackThreads
+        self.macros.pop("PUTS", None)  # traceback.c and faulthandler.c both define PUTS identically
+        self.macros.pop("OFF", None)   # traceback.c and faulthandler.c both define OFF differently
+        cparser.parse(CPythonDir + "/Modules/faulthandler.c", self) # _PyFaulthandler_Fini
 
 
 def init_faulthandler(sigusr1_chain=False):
@@ -230,6 +237,19 @@ def main(argv):
         _make_path_func.C_argTypes = None
         _make_path_func.C_resType = _ctypes.c_void_p
         interpreter._func_cache[_fn] = _make_path_func
+
+    # _PyPathConfig_Calculate is defined in Modules/getpath.c (not parsed).
+    # It fills a _PyPathConfig struct from the filesystem.  We provide a stub
+    # that returns success (_PyInitError with msg=NULL) and leaves the config
+    # fields at zero — the public Py_Get* functions above supply the real values.
+    _PyInitError_ctype = interpreter.getCType(state.typedefs['_PyInitError'])
+
+    def _path_config_calculate_stub(*args):
+        return _PyInitError_ctype()  # all-zero = success (msg=NULL)
+
+    _path_config_calculate_stub.C_argTypes = None
+    _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
+    interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
 
     if args_ns.dump_python:
         for fn in args_ns.dump_python:
