@@ -47,6 +47,7 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF_FLOAT"] = sizeofMacro(ctypes.c_float)
                 self.macros["SIZEOF_VOID_P"] = sizeofMacro(ctypes.c_void_p)
                 self.macros["SIZEOF_SIZE_T"] = sizeofMacro(ctypes.c_size_t)
+                self.macros["SIZE_MAX"] = cparser.Macro(rightside=str(ctypes.c_size_t(-1).value))
                 self.macros["SIZEOF_UINTPTR_T"] = sizeofMacro(ctypes.POINTER(ctypes.c_uint))
                 self.macros["SIZEOF_PTHREAD_T"] = self.macros["SIZEOF_LONG"]
                 self.macros["SIZEOF_WCHAR_T"] = sizeofMacro(ctypes.c_wchar)
