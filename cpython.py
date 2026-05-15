@@ -104,6 +104,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         if os.path.exists(CPythonDir + "/Python/random.c"):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
+        cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
