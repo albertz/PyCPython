@@ -73,8 +73,13 @@ class CPythonState(cparser.State):
                 yield None # make it a generator
             return reader(), None
         fullfn = self.findIncludeFullFilename(filename, True)
-        if fullfn and fullfn in self.included_files: return "", fullfn
-        if fullfn: self.included_files.add(fullfn)
+        # Stringlib headers are template headers: they are intentionally included
+        # multiple times with different macro definitions (STRINGLIB=ucs1lib_ etc.)
+        # and must NOT be deduplicated by filename.
+        is_template_header = fullfn and os.path.join(CPythonDir, "Objects", "stringlib") in fullfn
+        if not is_template_header:
+            if fullfn and fullfn in self.included_files: return "", fullfn
+            if fullfn: self.included_files.add(fullfn)
         return super(CPythonState, self).readLocalInclude(filename)
 
     def readGlobalInclude(self, filename):
