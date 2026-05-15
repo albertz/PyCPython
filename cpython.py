@@ -106,6 +106,7 @@ class CPythonState(cparser.State):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
         cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
+        cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
         del self.macros["Return"]  # will be used differently
