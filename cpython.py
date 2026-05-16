@@ -326,4 +326,8 @@ if __name__ == '__main__':
     better_exchook.install()
     register_sigusr1_print_backtrace()
     init_faulthandler(sigusr1_chain=True)
-    main(sys.argv)
+    try:
+        main(sys.argv)
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt")
+        sys.exit(1)
