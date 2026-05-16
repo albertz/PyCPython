@@ -227,6 +227,8 @@ def main(argv):
     argparser.add_argument(
         '--dump-python', action='store', nargs=1,
         help="Dumps the converted Python code of the specified function, e.g. Py_Main.")
+    argparser.add_argument("--interactive-c", action="store_true", help="Interactive C mode")
+    argparser.add_argument("--interactive-py", action="store_true", help="Interactive Python mode")
     argparser.add_argument(
         '--verbose-jit', action='store_true',
         help="Prints what functions and global vars we are going to translate.")
@@ -322,6 +324,18 @@ def main(argv):
     if args_ns.verbose_jit:
         interpreter.debug_print_getFunc = True
         interpreter.debug_print_getVar = True
+
+    if args_ns.interactive_c:
+        print("Interactive C mode")
+        from cparser.interactive_interpreter import InteractiveInterpreter
+        interactive_interpreter = InteractiveInterpreter(state=state, interpreter=interpreter)
+        interactive_interpreter.loop()
+        sys.exit()
+
+    if args_ns.interactive_py:
+        print("Interactive Python mode")
+        better_exchook.debug_shell(locals(), globals())
+        sys.exit()
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
