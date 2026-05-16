@@ -186,6 +186,35 @@ def register_sigusr1_print_backtrace():
     signal.signal(signal.SIGUSR1, sigusr1_handler)
 
 
+def watchdog_thread(timeout, mem_limit_gb):
+    import time
+    import os
+    import signal
+    import resource
+    start_time = time.time()
+    last_traceback = time.time()
+    mem_limit = mem_limit_gb * 1024**3
+    while True:
+        elapsed = time.time() - start_time
+        if timeout > 0 and elapsed > timeout:
+            print("\nWatchdog: Timeout reached (%ds). Terminating." % timeout, file=sys.stderr)
+            os._exit(1)
+
+        if mem_limit > 0:
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if sys.platform != "darwin":
+                usage *= 1024  # Linux: kilobytes to bytes
+            if usage > mem_limit:
+                print("\nWatchdog: Memory limit exceeded (%.1fMB). Terminating." % (usage / 1024**2), file=sys.stderr)
+                os._exit(1)
+
+        if time.time() - last_traceback > 30:
+            os.kill(os.getpid(), signal.SIGUSR1)
+            last_traceback = time.time()
+
+        time.sleep(5)
+
+
 def main(argv):
     argparser = argparse.ArgumentParser(
         usage="%s [PyCPython options, see below] [CPython options, see via --help]" % argv[0],
@@ -201,7 +230,21 @@ def main(argv):
     argparser.add_argument(
         '--verbose-jit', action='store_true',
         help="Prints what functions and global vars we are going to translate.")
+    argparser.add_argument(
+        '--watchdog-timeout', type=int, default=0,
+        help="Timeout in seconds for the watchdog thread (default 0, disabled).")
+    argparser.add_argument(
+        '--watchdog-memory', type=float, default=0,
+        help="Memory limit in GB for the watchdog thread (default 0, disabled).")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
+
+    if args_ns.watchdog_timeout > 0 or args_ns.watchdog_memory > 0:
+        import threading
+        t = threading.Thread(
+            target=watchdog_thread,
+            args=(args_ns.watchdog_timeout, args_ns.watchdog_memory),
+            daemon=True)
+        t.start()
     argv = argv[:1] + argv_rest
     print("PyCPython -", argparser.description,)
     print("(use --pycpython-help for help)")
