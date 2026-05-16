@@ -186,7 +186,7 @@ def register_sigusr1_print_backtrace():
     signal.signal(signal.SIGUSR1, sigusr1_handler)
 
 
-def watchdog_thread(timeout, mem_limit_gb):
+def watchdog_thread(*, timeout, mem_limit_gb, report_traceback_interval=None):
     import time
     import os
     import signal
@@ -208,7 +208,7 @@ def watchdog_thread(timeout, mem_limit_gb):
                 print("\nWatchdog: Memory limit exceeded (%.1fMB). Terminating." % (usage / 1024**2), file=sys.stderr)
                 os._exit(1)
 
-        if time.time() - last_traceback > 30:
+        if report_traceback_interval is not None and time.time() - last_traceback > report_traceback_interval:
             os.kill(os.getpid(), signal.SIGUSR1)
             last_traceback = time.time()
 
@@ -236,13 +236,20 @@ def main(argv):
     argparser.add_argument(
         '--watchdog-memory', type=float, default=0,
         help="Memory limit in GB for the watchdog thread (default 0, disabled).")
+    argparser.add_argument("--report-extended-tracebacks", action="store_true")
+    argparser.add_argument("--watchdog-report-traceback-interval", type=int, default=None)
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
-    if args_ns.watchdog_timeout > 0 or args_ns.watchdog_memory > 0:
+    if args_ns.report_extended_tracebacks:
+        register_sigusr1_print_backtrace()
+    init_faulthandler(sigusr1_chain=args_ns.report_extended_tracebacks)
+
+    if args_ns.watchdog_timeout > 0 or args_ns.watchdog_memory > 0 or args_ns.watchdog_report_traceback_interval is not None:
         import threading
         t = threading.Thread(
             target=watchdog_thread,
-            args=(args_ns.watchdog_timeout, args_ns.watchdog_memory),
+            kwargs={"timeout": args_ns.watchdog_timeout, "mem_limit_gb": args_ns.watchdog_memory,
+                    "report_traceback_interval": args_ns.watchdog_report_traceback_interval},
             daemon=True)
         t.start()
     argv = argv[:1] + argv_rest
@@ -324,8 +331,6 @@ def main(argv):
 if __name__ == '__main__':
     import better_exchook
     better_exchook.install()
-    register_sigusr1_print_backtrace()
-    init_faulthandler(sigusr1_chain=True)
     try:
         main(sys.argv)
     except KeyboardInterrupt:
