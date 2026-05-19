@@ -121,6 +121,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
+        cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         cparser.parse(CPythonDir + "/Objects/longobject.c", self) # PyLong_FromVoidPtr, PyLong_FromLong etc.
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
