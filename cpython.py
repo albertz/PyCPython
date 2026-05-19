@@ -107,7 +107,12 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/import.c", self) # _PyImport_Fini2
         cparser.parse(CPythonDir + "/Python/thread.c", self) # PyThread_allocate_lock
         cparser.parse(CPythonDir + "/Python/bootstrap_hash.c", self) # _Py_ReadHashSeed
+        cparser.parse(CPythonDir + "/Python/codecs.c", self) # Py_hexdigits
+        # Collision: static void fatal_error(...) in pylifecycle.c vs static struct fatal_error in faulthandler.c.
+        # We rename them via macros to unique names to avoid shadowing in the global funcs/vars dicts.
+        self.macros["fatal_error"] = cparser.Macro(rightside="fatal_error_pylifecycle")
         cparser.parse(CPythonDir + "/Python/pylifecycle.c", self) # _PyRuntime_Initialize, _Py_SetLocaleFromEnv
+        self.macros.pop("fatal_error")
         self.macros.pop("NAME", None)  # token.h defines NAME=1; sysmodule.c redefines it as "cpython"
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         if os.path.exists(CPythonDir + "/Python/random.c"):
@@ -153,7 +158,10 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/traceback.c", self) # _Py_DumpTracebackThreads
         self.macros.pop("PUTS", None)  # traceback.c and faulthandler.c both define PUTS identically
         self.macros.pop("OFF", None)   # traceback.c and faulthandler.c both define OFF differently
+        # Rename static struct fatal_error to fatal_error_faulthandler.
+        self.macros["fatal_error"] = cparser.Macro(rightside="fatal_error_faulthandler")
         cparser.parse(CPythonDir + "/Modules/faulthandler.c", self) # _PyFaulthandler_Fini
+        self.macros.pop("fatal_error")
 
 
 def init_faulthandler(sigusr1_chain=False):
