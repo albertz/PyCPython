@@ -119,13 +119,19 @@ class CPythonState(cparser.State):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
         cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
+        self.macros["free_list"] = cparser.Macro(rightside="free_list_bool")
+        cparser.parse(CPythonDir + "/Objects/boolobject.c", self) # PyBool_Type
+        self.macros["free_list"] = cparser.Macro(rightside="free_list_float")
+        cparser.parse(CPythonDir + "/Objects/floatobject.c", self) # PyFloat_Type
+        self.macros.pop("free_list")
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         cparser.parse(CPythonDir + "/Objects/longobject.c", self) # PyLong_FromVoidPtr, PyLong_FromLong etc.
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
+        self.macros["free_list"] = cparser.Macro(rightside="free_list_tuple")
+        self.macros["numfree"] = cparser.Macro(rightside="numfree_tuple")
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
-        del self.macros["Return"]  # will be used differently
         # We need these macro hacks because dictobject.c will use the same vars.
         self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
         self.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
