@@ -127,7 +127,40 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
+        # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
+        # that have METH_STATIC / METH_CLASS methods) so that PyStaticMethod_Type
+        # / PyClassMethod_Type / PyFunction_Type get their static initializer
+        # (tp_alloc = PyType_GenericAlloc etc.).  Without it, add_methods()
+        # calls PyStaticMethod_New() which finds tp_alloc == NULL and returns
+        # NULL, making PyType_Ready fail with no Python-level error message.
+        cparser.parse(CPythonDir + "/Objects/funcobject.c", self) # PyStaticMethod_New, PyFunction_Type
         cparser.parse(CPythonDir + "/Objects/longobject.c", self) # PyLong_FromVoidPtr, PyLong_FromLong etc.
+        # bytes_methods.c provides the _Py_<method>__doc__ docstring
+        # globals that both bytearrayobject.c and bytesobject.c reference
+        # in their PyMethodDef tables (declared in Include/bytes_methods.h).
+        # Stringlib template macros leaked from unicodedefs.h (via
+        # unicodeobject.c) and need to be popped so bytes_methods.c can
+        # set up the byte-flavoured stringlib cleanly.
+        for _m in ("STRINGLIB_WANT_CONTAINS_OBJ",
+                   "STRINGLIB_STR", "STRINGLIB_LEN",
+                   "STRINGLIB_NEW", "STRINGLIB_CHECK", "STRINGLIB_CHECK_EXACT",
+                   "STRINGLIB_TOSTR", "STRINGLIB_TOASCII",
+                   "STRINGLIB_FAST_MEMCHR",
+                   "STRINGLIB", "STRINGLIB_CHAR", "STRINGLIB_SIZEOF_CHAR",
+                   "STRINGLIB_ISSPACE", "STRINGLIB_ISLINEBREAK",
+                   "FASTSEARCH",
+                   # ADJUST_INDICES is re-defined identically in
+                   # bytes_methods.c, unicodeobject.c, and probably more.
+                   "ADJUST_INDICES"):
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Objects/bytes_methods.c", self)
+        # bytearrayobject.c #defines STRINGLIB_* macros that asciilib.h
+        # (included via unicodeobject.c above) already defined.  Drop the
+        # earlier definitions so the file can re-#define them locally.
+        for _m in ("STRINGLIB_ISSPACE", "STRINGLIB_ISLINEBREAK",
+                   "STRINGLIB_CHECK_EXACT"):
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Objects/bytearrayobject.c", self) # PyByteArray_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
         self.macros["free_list"] = cparser.Macro(rightside="free_list_tuple")
         self.macros["numfree"] = cparser.Macro(rightside="numfree_tuple")
@@ -147,6 +180,7 @@ class CPythonState(cparser.State):
         # We need these macro hacks because methodobject.c will use the same vars.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
+        self.macros.pop("OFF", None)  # funcobject.c defines OFF; methodobject.c redefines it
         cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
         # We need these macro hacks because methodobject.c used the same vars.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
