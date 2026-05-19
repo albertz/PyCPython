@@ -14,16 +14,18 @@ Typical usage during development::
     ./debug_cpython.py --timeout 60 --interval 5    # longer watchdog
     ./debug_cpython.py --no-traceback               # only timeout, no SIGUSR1
     ./debug_cpython.py --tail 80                    # show last N lines only
+    ./debug_cpython.py --grep TypeError             # only lines matching regex
+    ./debug_cpython.py --grep 'PyCParser_'  -A 1    # +1 line of context after
 
-The script intentionally takes no Python-side configuration -- it just forwards
-to `cpython.py`.  It's small enough to live at the repo root next to the other
-top-level scripts.
+All filtering happens in-process (no shell pipes) so a single script
+invocation gives the final, filtered output.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -50,7 +52,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Shortcut for --interval 0.")
     p.add_argument(
         "--tail", type=int, default=0,
-        help="Only print the last N lines of output (default 0 = print all).")
+        help="Only print the last N lines of output (default 0 = print all). "
+             "Applied AFTER --grep.")
+    p.add_argument(
+        "--grep", action="append", default=[],
+        help="Regex (Python re); only lines matching are printed. May be "
+             "repeated, in which case lines matching ANY pattern are kept "
+             "(like grep -e). Applied BEFORE --tail.")
+    p.add_argument(
+        "--grep-invert", "-v", action="store_true",
+        help="Invert --grep (print lines NOT matching).")
+    p.add_argument(
+        "--grep-ignore-case", "-i", action="store_true",
+        help="Make --grep case-insensitive.")
+    p.add_argument(
+        "-A", "--after-context", type=int, default=0,
+        help="With --grep: print N lines of context AFTER each match.")
+    p.add_argument(
+        "-B", "--before-context", type=int, default=0,
+        help="With --grep: print N lines of context BEFORE each match.")
+    p.add_argument(
+        "-C", "--context", type=int, default=0,
+        help="Shortcut for -A N -B N.")
     p.add_argument(
         "--python", default=sys.executable,
         help="Python interpreter to run cpython.py with (default: %(default)s).")
@@ -100,13 +123,37 @@ def main(argv: list[str]) -> int:
         out += f"\n[debug_cpython] hard timeout {hard_timeout}s exceeded; subprocess killed.\n"
 
     lines = out.splitlines()
+    raw_total = len(lines)
+
+    if args.grep:
+        flags = re.IGNORECASE if args.grep_ignore_case else 0
+        patterns = [re.compile(p, flags) for p in args.grep]
+        before = max(args.before_context, args.context)
+        after = max(args.after_context, args.context)
+
+        def is_match(s: str) -> bool:
+            hit = any(p.search(s) for p in patterns)
+            return (not hit) if args.grep_invert else hit
+
+        keep = [False] * len(lines)
+        for i, ln in enumerate(lines):
+            if is_match(ln):
+                lo = max(0, i - before)
+                hi = min(len(lines), i + after + 1)
+                for j in range(lo, hi):
+                    keep[j] = True
+        lines = [ln for ln, k in zip(lines, keep) if k]
+
     if args.tail > 0 and len(lines) > args.tail:
         print(f"[debug_cpython] (omitting {len(lines) - args.tail} earlier lines; --tail {args.tail})")
         lines = lines[-args.tail:]
     for ln in lines:
         print(ln)
 
-    print(f"[debug_cpython] exit code: {rc}", flush=True)
+    msg_parts = [f"exit code: {rc}"]
+    if args.grep:
+        msg_parts.append(f"grep kept {len(lines)} of {raw_total} lines")
+    print("[debug_cpython] " + "; ".join(msg_parts), flush=True)
     return 0 if rc == 0 else 1
 
 
