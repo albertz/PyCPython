@@ -15,7 +15,6 @@ CPythonDir = MyDir + "/CPython"
 
 import cparser
 import cparser.interpreter
-from cparser.interpreter import CAbortException
 
 
 class CPythonState(cparser.State):
@@ -352,7 +351,4 @@ if __name__ == '__main__':
         main(sys.argv)
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt")
-        sys.exit(1)
-    except CAbortException:
-        print("\nCaught CAbortException")
         sys.exit(1)
