@@ -161,6 +161,27 @@ class CPythonState(cparser.State):
                    "STRINGLIB_CHECK_EXACT"):
             self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Objects/bytearrayobject.c", self) # PyByteArray_Type
+        # bytesobject.c includes stringlib/stringdefs.h which redefines a
+        # bunch of STRINGLIB_* macros that asciilib.h (via unicodeobject.c)
+        # already set up, plus the ADJUST_INDICES helper that bytearray and
+        # unicodeobject both define.  Pop them all so the second definitions
+        # aren't rejected as duplicates.
+        for _m in (# stringlib template parameters
+                   "STRINGLIB_WANT_CONTAINS_OBJ",
+                   "STRINGLIB_STR", "STRINGLIB_LEN",
+                   "STRINGLIB_NEW", "STRINGLIB_CHECK", "STRINGLIB_CHECK_EXACT",
+                   "STRINGLIB_TOSTR", "STRINGLIB_TOASCII",
+                   "STRINGLIB_FAST_MEMCHR",
+                   "STRINGLIB", "STRINGLIB_CHAR", "STRINGLIB_SIZEOF_CHAR",
+                   "STRINGLIB_ISSPACE", "STRINGLIB_ISLINEBREAK",
+                   # stringdefs.h vs asciilib.h overlap
+                   "STRINGLIB_OBJECT", "STRINGLIB_TYPE_NAME",
+                   "STRINGLIB_PARSE_CODE", "STRINGLIB_EMPTY",
+                   "STRINGLIB_ISDECIMAL", "STRINGLIB_TODECIMAL",
+                   # helpers
+                   "FASTSEARCH", "ADJUST_INDICES"):
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Objects/bytesobject.c", self) # PyBytes_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
         self.macros["free_list"] = cparser.Macro(rightside="free_list_tuple")
         self.macros["numfree"] = cparser.Macro(rightside="numfree_tuple")
