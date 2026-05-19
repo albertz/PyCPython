@@ -116,6 +116,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
+        cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
         del self.macros["Return"]  # will be used differently
         # We need these macro hacks because dictobject.c will use the same vars.
