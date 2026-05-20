@@ -183,6 +183,8 @@ class CPythonState(cparser.State):
             self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Objects/bytesobject.c", self) # PyBytes_Type
         cparser.parse(CPythonDir + "/Objects/rangeobject.c", self) # PyRange_Type
+        cparser.parse(CPythonDir + "/Objects/odictobject.c", self) # PyODict_Type, PyODictKeys/Values/Items/Iter_Type
+        cparser.parse(CPythonDir + "/Objects/setobject.c", self) # PySet_Type, PyFrozenSet_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
         self.macros["free_list"] = cparser.Macro(rightside="free_list_tuple")
         self.macros["numfree"] = cparser.Macro(rightside="numfree_tuple")
