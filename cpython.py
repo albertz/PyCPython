@@ -126,6 +126,15 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/moduleobject.c", self) # _PyModule_CreateInitialized, PyModule_New, etc.
+        # provide getversion (Py_GetVersion) before modules that call it
+        cparser.parse(CPythonDir + "/Python/getversion.c", self) # Py_GetVersion
+        # buildinfo, compiler id and snprintf wrappers used during init
+        cparser.parse(CPythonDir + "/Modules/getbuildinfo.c", self) # Py_GetBuildInfo, _Py_gitversion, _Py_gitidentifier
+        # __VERSION__ is a compiler-provided macro; define a safe default
+        self.macros["__VERSION__"] = cparser.Macro(rightside='"GCC"')
+        cparser.parse(CPythonDir + "/Python/getcompiler.c", self) # Py_GetCompiler
+        self.macros.pop("__VERSION__", None)
+        cparser.parse(CPythonDir + "/Python/mysnprintf.c", self) # PyOS_snprintf, PyOS_vsnprintf
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
