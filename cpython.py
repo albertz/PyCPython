@@ -126,6 +126,7 @@ class CPythonState(cparser.State):
         self.macros.pop("free_list")
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
+        cparser.parse(CPythonDir + "/Objects/moduleobject.c", self) # _PyModule_CreateInitialized, PyModule_New, etc.
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
         # that have METH_STATIC / METH_CLASS methods) so that PyStaticMethod_Type
