@@ -221,6 +221,7 @@ class CPythonState(cparser.State):
         self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
         self.macros.pop("OFF", None)  # funcobject.c defines OFF; methodobject.c redefines it
         cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
+        cparser.parse(CPythonDir + "/Objects/classobject.c", self) # PyMethod_Type
         # We need these macro hacks because methodobject.c used the same vars.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__list")
