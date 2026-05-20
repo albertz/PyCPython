@@ -223,6 +223,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/hamt.c", self) # _PyHamt_Init, PyHamt_Type
         cparser.parse(CPythonDir + "/Python/context.c", self) # _PyContext_Init, PyContext_Type
         cparser.parse(CPythonDir + "/Python/frozen.c", self) # _PyImport_FrozenModules, PyImport_FrozenModules
+        cparser.parse(CPythonDir + "/Python/marshal.c", self) # PyMarshal_ReadObjectFromString
         cparser.parse(CPythonDir + "/Objects/complexobject.c", self) # PyComplex_Type
         cparser.parse(CPythonDir + "/Objects/memoryobject.c", self) # _PyManagedBuffer_Type, PyMemoryView_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
