@@ -118,6 +118,7 @@ class CPythonState(cparser.State):
         if os.path.exists(CPythonDir + "/Python/random.c"):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
         cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
+        cparser.parse(CPythonDir + "/Python/pyctype.c", self) # _Py_ctype_table, _Py_ctype_tolower, _Py_ctype_toupper
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
         self.macros["free_list"] = cparser.Macro(rightside="free_list_bool")
         cparser.parse(CPythonDir + "/Objects/boolobject.c", self) # PyBool_Type
