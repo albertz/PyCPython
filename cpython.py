@@ -189,6 +189,12 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/codeobject.c", self) # PyCode_Type
         self.macros.pop("OFF", None)  # frameobject.c redefines it
         cparser.parse(CPythonDir + "/Objects/frameobject.c", self) # PyFrame_Type
+        cparser.parse(CPythonDir + "/Objects/genobject.c", self) # PyGen_Type, PyCoro_Type, PyAsyncGen_Type
+        cparser.parse(CPythonDir + "/Objects/namespaceobject.c", self) # _PyNamespace_Type
+        cparser.parse(CPythonDir + "/Objects/capsule.c", self) # PyCapsule_Type
+        cparser.parse(CPythonDir + "/Objects/cellobject.c", self) # PyCell_Type
+        cparser.parse(CPythonDir + "/Objects/iterobject.c", self) # PyCallIter_Type, PySeqIter_Type
+        cparser.parse(CPythonDir + "/Objects/structseq.c", self) # PyStructSequence_InitType2
         cparser.parse(CPythonDir + "/Objects/odictobject.c", self) # PyODict_Type, PyODictKeys/Values/Items/Iter_Type
         cparser.parse(CPythonDir + "/Objects/setobject.c", self) # PySet_Type, PyFrozenSet_Type
         # setobject.c defines `#define dummy (&_dummy_struct)`,
