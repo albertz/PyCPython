@@ -217,6 +217,12 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/sliceobject.c", self) # PySlice_Type, Py_Ellipsis
         cparser.parse(CPythonDir + "/Objects/exceptions.c", self) # PyExc_BaseException, PyExc_SystemError, all PyExc_*
         cparser.parse(CPythonDir + "/Python/bltinmodule.c", self) # Py_UTF8Mode, builtin functions
+        # _warnings.c defines its own MODULE_NAME; pop the one bltinmodule.c left.
+        self.macros.pop("MODULE_NAME", None)
+        cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
+        cparser.parse(CPythonDir + "/Python/hamt.c", self) # _PyHamt_Init, PyHamt_Type
+        cparser.parse(CPythonDir + "/Python/context.c", self) # _PyContext_Init, PyContext_Type
+        cparser.parse(CPythonDir + "/Python/frozen.c", self) # _PyImport_FrozenModules, PyImport_FrozenModules
         cparser.parse(CPythonDir + "/Objects/complexobject.c", self) # PyComplex_Type
         cparser.parse(CPythonDir + "/Objects/memoryobject.c", self) # _PyManagedBuffer_Type, PyMemoryView_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
