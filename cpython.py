@@ -131,6 +131,7 @@ class CPythonState(cparser.State):
         # buildinfo, compiler id and snprintf wrappers used during init
         cparser.parse(CPythonDir + "/Modules/getbuildinfo.c", self) # Py_GetBuildInfo, _Py_gitversion, _Py_gitidentifier
         cparser.parse(CPythonDir + "/Python/getcopyright.c", self) # Py_GetCopyright
+        cparser.parse(CPythonDir + "/Python/getplatform.c", self) # Py_GetPlatform
         # __VERSION__ is a compiler-provided macro; define a safe default
         self.macros["__VERSION__"] = cparser.Macro(rightside='"GCC"')
         cparser.parse(CPythonDir + "/Python/getcompiler.c", self) # Py_GetCompiler
