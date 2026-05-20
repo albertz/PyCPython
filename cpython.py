@@ -114,7 +114,6 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/pylifecycle.c", self) # _PyRuntime_Initialize, _Py_SetLocaleFromEnv
         self.macros.pop("fatal_error")
         self.macros.pop("NAME", None)  # token.h defines NAME=1; sysmodule.c redefines it as "cpython"
-        cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         if os.path.exists(CPythonDir + "/Python/random.c"):
             cparser.parse(CPythonDir + "/Python/random.c", self) # _PyRandom_Init
         cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
@@ -127,6 +126,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/moduleobject.c", self) # _PyModule_CreateInitialized, PyModule_New, etc.
+        cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
         # that have METH_STATIC / METH_CLASS methods) so that PyStaticMethod_Type
