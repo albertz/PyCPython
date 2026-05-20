@@ -183,6 +183,12 @@ class CPythonState(cparser.State):
             self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Objects/bytesobject.c", self) # PyBytes_Type
         cparser.parse(CPythonDir + "/Objects/rangeobject.c", self) # PyRange_Type
+        cparser.parse(CPythonDir + "/Objects/enumobject.c", self) # PyEnum_Type
+        cparser.parse(CPythonDir + "/Objects/fileobject.c", self) # PyStdPrinter_Type
+        self.macros.pop("OFF", None)  # funcobject.c defines OFF; codeobject.c redefines it
+        cparser.parse(CPythonDir + "/Objects/codeobject.c", self) # PyCode_Type
+        self.macros.pop("OFF", None)  # frameobject.c redefines it
+        cparser.parse(CPythonDir + "/Objects/frameobject.c", self) # PyFrame_Type
         cparser.parse(CPythonDir + "/Objects/odictobject.c", self) # PyODict_Type, PyODictKeys/Values/Items/Iter_Type
         cparser.parse(CPythonDir + "/Objects/setobject.c", self) # PySet_Type, PyFrozenSet_Type
         # setobject.c defines `#define dummy (&_dummy_struct)`,
