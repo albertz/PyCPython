@@ -441,6 +441,59 @@ def main(argv):
     _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
     interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
 
+    # Many of the C modules listed in `_PyImport_Inittab` (PC/config.c) --
+    # `_thread`, `_io`, `itertools`, ... -- live in C source files we
+    # don't parse.  Their `PyInit_xxx` is therefore a body-less function
+    # that silently returns Python `None` -> NULL pointer when called.
+    # During importlib bootstrap, `_imp.create_builtin(spec)` calls
+    # `(*p->initfunc)()` and treats a NULL return as failure; the C
+    # contract requires the initfunc to have set a Python error before
+    # returning NULL.  Our silent-NULL stub violates that contract, the
+    # eventual `_Py_CheckFunctionResult` raises "%R returned NULL
+    # without setting an error", and importlib install fails.  Replace
+    # the missing-body stub for every `PyInit_*` (and similarly-shaped)
+    # initfunc with one that sets ImportError properly.
+    _PyErr_SetString_func = interpreter.getFunc("PyErr_SetString")
+
+    def _make_pyinit_stub(modname):
+        msg = (
+            "module not available in PyCPython "
+            "(C source for PyInit_%s is not parsed): %s"
+            % (modname, modname)
+        )
+        # Pre-build the message buffer once.  `_make_string` returns a
+        # ctypes c_byte array stored in `interp.constStrings` (strong
+        # ref kept for the lifetime of the interpreter).
+        _msg_buf = interpreter._make_string(msg)
+        _msg_ptr = _ctypes.cast(_msg_buf, _ctypes.POINTER(_ctypes.c_byte))
+        # `PyExc_ImportError` is a global; getVar returns the ctype value.
+        _exc = interpreter.globalsWrapper.PyExc_ImportError
+
+        def _stub():
+            # Set ImportError and return NULL.  We bypass `runFunc`'s arg
+            # marshaling (which expects Python str/int/list, not ctypes)
+            # and call the translated PyErr_SetString directly -- both
+            # args are already in ctypes form.
+            _PyErr_SetString_func(_exc, _msg_ptr)
+            return 0  # NULL PyObject*
+        _stub.C_argTypes = []
+        _stub.C_resType = _ctypes.c_void_p
+        return _stub
+
+    from cparser.cparser import CFunc as _CFunc
+    for _fn, _cf in list(state.funcs.items()):
+        if not isinstance(_cf, _CFunc):
+            continue
+        if _cf.body is not None:
+            continue
+        if not _fn.startswith("PyInit_"):
+            continue
+        if _fn in interpreter._func_cache:
+            continue
+        print("TODO (missing C source code file): %s is not loaded yet. Installing stub." % _fn)
+        _modname = _fn[len("PyInit_"):]  # Derive module name from "PyInit_<modname>".
+        interpreter._func_cache[_fn] = _make_pyinit_stub(_modname)
+
     # `--instrument FUNC[,FUNC...]` wraps the named translated C functions
     # with entry/exit logging.  This is the simplest way to find which call
     # in a long chain silently returns 0/NULL when the C contract was
