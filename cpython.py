@@ -360,6 +360,12 @@ def main(argv):
         help="Memory limit in GB for the watchdog thread (default 0, disabled).")
     argparser.add_argument("--report-extended-tracebacks", action="store_true")
     argparser.add_argument("--watchdog-report-traceback-interval", type=int, default=None)
+    argparser.add_argument(
+        '--instrument', action='append', default=[],
+        metavar="FUNC[,FUNC...]",
+        help="Wrap each named (translated) C function with entry/exit logging "
+             "to stderr.  Useful for finding which call in a chain silently "
+             "returns 0/NULL.  May be repeated; values may be comma-separated.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -433,6 +439,62 @@ def main(argv):
     _path_config_calculate_stub.C_argTypes = None
     _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
     interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
+
+    # `--instrument FUNC[,FUNC...]` wraps the named translated C functions
+    # with entry/exit logging.  This is the simplest way to find which call
+    # in a long chain silently returns 0/NULL when the C contract was
+    # broken (e.g. some helper returns failure without setting a Python
+    # error, then a downstream `assert(PyErr_Occurred())` finally trips).
+    # The wrapping happens after parsing but before the runFunc, so it
+    # works for any function in state.funcs.
+    _instrument_names = set()
+    for _spec in args_ns.instrument:
+        for _name in _spec.split(","):
+            _name = _name.strip()
+            if _name:
+                _instrument_names.add(_name)
+    if _instrument_names:
+        from cparser.interpreter import _ctype_ptr_get_value as _gv
+        def _short_arg(a):
+            if a is None:
+                return "None"
+            if isinstance(a, int):
+                return "0x%x" % a
+            if hasattr(a, "value"):
+                v = a.value
+                if v is None:
+                    return "%s(NULL)" % type(a).__name__
+                if isinstance(v, int):
+                    return "0x%x" % v
+                return repr(v)[:60]
+            return type(a).__name__
+        def _wrap(_name):
+            orig = interpreter.getFunc(_name)
+            def _wrapped(*args):
+                print("[instr] >>> %s(%s)" % (
+                    _name, ", ".join(_short_arg(a) for a in args)),
+                    file=sys.stderr, flush=True)
+                try:
+                    r = orig(*args)
+                except BaseException as e:
+                    print("[instr] !!! %s raised %s: %s" % (
+                        _name, type(e).__name__, str(e)[:120]),
+                        file=sys.stderr, flush=True)
+                    raise
+                print("[instr] <<< %s -> %s" % (_name, _short_arg(r)),
+                      file=sys.stderr, flush=True)
+                return r
+            _wrapped.C_argTypes = orig.C_argTypes
+            _wrapped.C_resType = orig.C_resType
+            _wrapped.C_cFunc = getattr(orig, "C_cFunc", None)
+            interpreter._func_cache[_name] = _wrapped
+        for _name in sorted(_instrument_names):
+            if _name not in state.funcs:
+                print("[instr] warning: function %r not in parsed C source; skipping"
+                      % _name, file=sys.stderr)
+                continue
+            _wrap(_name)
+            print("[instr] wrapped %s" % _name, file=sys.stderr)
 
     if args_ns.dump_python:
         for fn in args_ns.dump_python:
