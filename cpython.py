@@ -105,6 +105,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
         cparser.parse(CPythonDir + "/Python/errors.c", self) # PyErr_Clear
         cparser.parse(CPythonDir + "/Python/getargs.c", self) # PyArg_ParseTuple, _PyArg_UnpackStack, etc.
+        self.macros.pop("FLAG_SIZE_T", None)
         cparser.parse(CPythonDir + "/PC/config.c", self) # _PyImport_Inittab
         cparser.parse(CPythonDir + "/Python/import.c", self) # _PyImport_Fini2
         cparser.parse(CPythonDir + "/Python/thread.c", self) # PyThread_allocate_lock
