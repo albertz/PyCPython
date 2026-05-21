@@ -527,6 +527,21 @@ def main(argv):
                 return "None"
             if isinstance(a, int):
                 return "0x%x" % a
+            # Best-effort decode of `char *` / `const char *` (LP_c_byte
+            # or LP_wrapCTypeClass_c_byte) as a C string -- useful for
+            # PyErr_Format format strings, method names, etc.  Also
+            # surface NULL pointers explicitly so they don't look like
+            # any other typed pointer.
+            if isinstance(a, _ctypes._Pointer):
+                raw = _ctypes.cast(a, _ctypes.c_void_p).value
+                if not raw:
+                    return "%s(NULL)" % type(a).__name__
+                elem_t = type(a)._type_
+                if issubclass(elem_t, _ctypes.c_byte) or issubclass(elem_t, _ctypes.c_char):
+                    s = _ctypes.cast(a, _ctypes.c_char_p).value
+                    if s is not None:
+                        return "%r" % s.decode("utf-8", "replace")[:80]
+                return "%s(0x%x)" % (type(a).__name__, raw)
             if hasattr(a, "value"):
                 v = a.value
                 if v is None:
