@@ -367,6 +367,45 @@ def main(argv):
         help="Wrap each named (translated) C function with entry/exit logging "
              "to stderr.  Useful for finding which call in a chain silently "
              "returns 0/NULL.  May be repeated; values may be comma-separated.")
+    argparser.add_argument(
+        '--no-better-exchook', action='store_true',
+        help="Disable better_exchook installation in __main__.  Use stdlib "
+             "traceback.print_exc instead for uncaught exceptions.  "
+             "better_exchook's `get_func_from_code_object` calls "
+             "gc.get_referrers(co) which walks the entire GC heap; if our "
+             "ctypes object graph has any invariant break (a freed object "
+             "still in some `_objects`, a dangling `_b_base_`, ...) that "
+             "walk segfaults.  Using stdlib traceback avoids the deep "
+             "reflection so we at least see the actual exception.")
+    argparser.add_argument(
+        '--gc-check-interval', type=int, default=0, metavar="N",
+        help="Call gc.get_referrers every N checkedFuncPtrCall "
+             "invocations on a known-alive code object, and log the "
+             "call count + status.  Cheap survey to find the rough "
+             "iteration band where the GC heap goes bad.  Note: the "
+             "absolute count varies with N because gc.get_referrers "
+             "itself allocates -- use --gc-check-at for proper bisection.  "
+             "N=0 (default) disables.")
+    argparser.add_argument(
+        '--gc-check-at', action='append', default=[],
+        metavar="N[,N...]",
+        help="Bisection mode: at exactly the named checkedFuncPtrCall "
+             "iteration(s) (comma-separated or repeated), run "
+             "gc.get_referrers(co) and dump the current Python call "
+             "stack to stderr.  Typical usage is to pass at least the "
+             "expected good and bad endpoints plus a midpoint -- e.g. "
+             "`--gc-check-at 8000,9000,9500,9800` -- so a single run "
+             "yields multiple data points.  Memory-corruption probes "
+             "are often non-deterministic; the more probe points the "
+             "better the chance of catching the crash.")
+    argparser.add_argument(
+        '--gc-check-range', action='append', default=[],
+        metavar="START:END:STEP",
+        help="Like --gc-check-at but as a range: do a gc-check at every "
+             "STEP-th iteration in [START, END] (inclusive).  E.g. "
+             "`--gc-check-range 9000:9800:100` probes 9000, 9100, ..., "
+             "9800.  Combine with --gc-check-at for ad-hoc additional "
+             "points.  May be repeated.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -601,16 +640,98 @@ def main(argv):
         better_exchook.debug_shell(locals(), globals())
         sys.exit()
 
+    # `--gc-check-interval N` and `--gc-check-at N1,N2,...`: hook
+    # `Helpers.checkedFuncPtrCall` (called for every C function-pointer
+    # dispatch, roughly the most frequent "step") and at the chosen
+    # iteration(s) call `gc.get_referrers(co)` on a known-alive code
+    # object.  If the heap is healthy the call is harmless; once it's
+    # corrupt the call segfaults.  Use `--gc-check-at` for proper
+    # binary-search bisection -- it does single, targeted checks.
+    _gc_check_at = set()
+    for _spec in args_ns.gc_check_at:
+        for _part in _spec.split(","):
+            _part = _part.strip()
+            if _part:
+                _gc_check_at.add(int(_part))
+    for _spec in args_ns.gc_check_range:
+        _parts = _spec.split(":")
+        if len(_parts) != 3:
+            raise ValueError(
+                "--gc-check-range expects START:END:STEP, got %r" % _spec)
+        _start, _end, _step = (int(_p) for _p in _parts)
+        if _step <= 0:
+            raise ValueError(
+                "--gc-check-range STEP must be > 0, got %d" % _step)
+        if _end < _start:
+            raise ValueError(
+                "--gc-check-range END (%d) must be >= START (%d)"
+                % (_end, _start))
+        # Inclusive on both ends.
+        _i = _start
+        while _i <= _end:
+            _gc_check_at.add(_i)
+            _i += _step
+    if args_ns.gc_check_interval > 0 or _gc_check_at:
+        import gc as _gc_mod
+        import traceback as _gc_tb
+        _gc_co = interpreter.getFunc("Py_Main").__code__
+        _gc_interval = args_ns.gc_check_interval
+        _gc_count = [0]
+        _orig_call = interpreter.helpers.checkedFuncPtrCall
+        def _gc_check_wrapped(f, *args):
+            _gc_count[0] += 1
+            n = _gc_count[0]
+            do_check = (_gc_interval > 0 and n % _gc_interval == 0) or (n in _gc_check_at)
+            if do_check:
+                # Log BEFORE the call -- so if the segfault is during
+                # gc.get_referrers, the last line on stderr is exactly
+                # the count where things blew up.
+                print("[gc-check %d] calling gc.get_referrers..."
+                      % n, file=sys.stderr, flush=True)
+                if n in _gc_check_at:
+                    # For bisection points: also dump the current Python
+                    # call stack so we know which interpreter operation
+                    # was running at that exact iteration.
+                    print("[gc-check %d] current stack (innermost last):"
+                          % n, file=sys.stderr, flush=True)
+                    _gc_tb.print_stack(file=sys.stderr)
+                refs = _gc_mod.get_referrers(_gc_co)
+                print("[gc-check %d] ok (%d referrers)"
+                      % (n, len(refs)), file=sys.stderr, flush=True)
+            return _orig_call(f, *args)
+        interpreter.helpers.checkedFuncPtrCall = _gc_check_wrapped
+        print("[gc-check] hooked checkedFuncPtrCall, interval=%d, at=%s"
+              % (_gc_interval, sorted(_gc_check_at) or "[]"),
+              file=sys.stderr)
+
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
     interpreter.runFunc(*args)
 
 
 if __name__ == '__main__':
-    import better_exchook
-    better_exchook.install()
-    try:
-        main(sys.argv)
-    except KeyboardInterrupt:
-        print("\nKeyboardInterrupt")
-        sys.exit(1)
+    # `--no-better-exchook` is parsed inside main() but we need to peek
+    # at it here to decide whether to install the global handler.  Do
+    # a cheap pre-scan instead of a full argparse pass (which would
+    # consume the unknown CPython options we forward).
+    if "--no-better-exchook" in sys.argv:
+        import traceback
+        try:
+            main(sys.argv)
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt", file=sys.stderr)
+            sys.exit(1)
+        except BaseException:
+            # Stdlib traceback: prints frame info from the existing
+            # traceback object without walking the GC heap, so a
+            # corrupt ctypes graph won't crash the handler itself.
+            traceback.print_exc()
+            sys.exit(1)
+    else:
+        import better_exchook
+        better_exchook.install()
+        try:
+            main(sys.argv)
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt")
+            sys.exit(1)
