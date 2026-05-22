@@ -8,6 +8,7 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+import ctypes
 
 MyDir = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,7 +38,6 @@ class CPythonState(cparser.State):
             self.included_files.add(filename)
             def reader():
                 # see CPython/pyconfig.h.in for reference
-                import ctypes
                 sizeofMacro = lambda t: cparser.Macro(rightside=str(ctypes.sizeof(t)))
                 self.macros["SIZEOF_SHORT"] = sizeofMacro(ctypes.c_short)
                 self.macros["SIZEOF_INT"] = sizeofMacro(ctypes.c_int)
@@ -424,6 +424,22 @@ def main(argv):
              "either segfaults (dereferencing junk) or enters a wrong "
              "list and loops forever.  This option detects exactly "
              "which entry's link changed and identifies the object.")
+    argparser.add_argument(
+        '--watch-write', action='append', default=[],
+        metavar="ADDR",
+        help="Hex address (eg. 0x1006f2e70) -- abort with a backtrace "
+             "the moment any interp write goes through "
+             "``_ctype_ptr_set_value`` to that exact cell address.  "
+             "Repeatable.  Combine with --gc-list-diff to first "
+             "identify the victim PyGC_Head, then re-run with "
+             "--watch-write set to that address to pinpoint the "
+             "exact interp instruction performing the write.")
+    argparser.add_argument(
+        '--watch-write-gen2-weakrefs', action='store_true',
+        help="Auto-populate --watch-write with the PyGC_Head._gc_next "
+             "address of every gen2 weakref present at startup.  Wide "
+             "net for catching the first write to any of them -- "
+             "useful when the corruption victim varies between runs.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -465,12 +481,11 @@ def main(argv):
     # unwrapped syscalls, and would return the *wrong* paths anyway — we want
     # the host Python's prefix/path so the interpreted CPython can find its
     # stdlib.  We therefore supply these values directly from the host runtime.
-    import ctypes as _ctypes
 
     def _make_wchar_const(s):
         """Create a wchar_t* constant string suitable for returning from Py_Get* functions."""
         buf = interpreter._make_wchar_string(s)
-        return _ctypes.cast(buf, _ctypes.c_void_p).value or 0
+        return ctypes.cast(buf, ctypes.c_void_p).value or 0
 
     for _fn, _s in [
         ("Py_GetProgramFullPath", argv[0]),
@@ -482,7 +497,7 @@ def main(argv):
         def _make_path_func(s=_s):
             return _make_wchar_const(s)
         _make_path_func.C_argTypes = None
-        _make_path_func.C_resType = _ctypes.c_void_p
+        _make_path_func.C_resType = ctypes.c_void_p
         interpreter._func_cache[_fn] = _make_path_func
 
     # _PyPathConfig_Calculate is defined in Modules/getpath.c (not parsed).
@@ -507,7 +522,7 @@ def main(argv):
     def _py_gil_state_check():
         return 1
     _py_gil_state_check.C_argTypes = []
-    _py_gil_state_check.C_resType = _ctypes.c_int
+    _py_gil_state_check.C_resType = ctypes.c_int
     interpreter._func_cache["PyGILState_Check"] = _py_gil_state_check
 
 
@@ -535,7 +550,7 @@ def main(argv):
         # ctypes c_byte array stored in `interp.constStrings` (strong
         # ref kept for the lifetime of the interpreter).
         _msg_buf = interpreter._make_string(msg)
-        _msg_ptr = _ctypes.cast(_msg_buf, _ctypes.POINTER(_ctypes.c_byte))
+        _msg_ptr = ctypes.cast(_msg_buf, ctypes.POINTER(ctypes.c_byte))
         # `PyExc_ImportError` is a global; getVar returns the ctype value.
         _exc = interpreter.globalsWrapper.PyExc_ImportError
 
@@ -547,7 +562,7 @@ def main(argv):
             _PyErr_SetString_func(_exc, _msg_ptr)
             return 0  # NULL PyObject*
         _stub.C_argTypes = []
-        _stub.C_resType = _ctypes.c_void_p
+        _stub.C_resType = ctypes.c_void_p
         return _stub
 
     from cparser.cparser import CFunc as _CFunc
@@ -589,13 +604,13 @@ def main(argv):
             # PyErr_Format format strings, method names, etc.  Also
             # surface NULL pointers explicitly so they don't look like
             # any other typed pointer.
-            if isinstance(a, _ctypes._Pointer):
-                raw = _ctypes.cast(a, _ctypes.c_void_p).value
+            if isinstance(a, ctypes._Pointer):
+                raw = ctypes.cast(a, ctypes.c_void_p).value
                 if not raw:
                     return "%s(NULL)" % type(a).__name__
                 elem_t = type(a)._type_
-                if issubclass(elem_t, _ctypes.c_byte) or issubclass(elem_t, _ctypes.c_char):
-                    s = _ctypes.cast(a, _ctypes.c_char_p).value
+                if issubclass(elem_t, ctypes.c_byte) or issubclass(elem_t, ctypes.c_char):
+                    s = ctypes.cast(a, ctypes.c_char_p).value
                     if s is not None:
                         return "%r" % s.decode("utf-8", "replace")[:80]
                 return "%s(0x%x)" % (type(a).__name__, raw)
@@ -743,7 +758,6 @@ def main(argv):
     _gc_diff_baseline = None
     if args_ns.gc_list_diff:
         import gc as _gcl_mod
-        import ctypes as _gcl_ct
         _gcl_mod.collect()
         _gcl_mod.collect()
         # Snapshot gen2 by walking the linked list from a tracked
@@ -766,19 +780,55 @@ def main(argv):
         import weakref as _gcl_wr
         _gen2 = _gcl_mod.get_objects(generation=2)
         _gen2_size = len(_gen2)
-        _weakref_ids = [id(_o) for _o in _gen2 if isinstance(_o, _gcl_wr.ref)]
-        del _gen2
-        print("[gc-list-diff] gen2 size at snapshot: %d, weakrefs: %d"
-              % (_gen2_size, len(_weakref_ids)), file=sys.stderr)
+        # Capture (head_addr, _gc_next_value, identity-string) per
+        # weakref while the heap is still healthy.  The identity
+        # string is built from referent type + repr so we can
+        # identify post-run without dereferencing potentially-
+        # corrupt pointers.  Don't retain the weakref object itself.
         def _gcl_u64(addr):
-            return _gcl_ct.cast(addr, _gcl_ct.POINTER(_gcl_ct.c_uint64))[0]
+            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
+        # Pre-build a set of id(v) for every value currently in our
+        # interp's pointerStorage.  Then we can tag weakrefs that
+        # refer to one of our pointerStorage entries -- these are the
+        # KeyedRef instances WeakValueDictionary creates internally.
+        _ps_value_ids = set()
+        try:
+            for _k in list(interpreter.pointerStorage):
+                _v = interpreter.pointerStorage.get(_k)
+                if _v is not None:
+                    _ps_value_ids.add(id(_v))
+                    del _v
+        except BaseException:
+            pass
         _baseline = {}
-        for _oid in _weakref_ids:
-            _head = _oid - 16  # sizeof(PyGC_Head) = 16 on Python 3.13
+        _identity = {}  # head_addr -> string
+        for _o in _gen2:
+            if not isinstance(_o, _gcl_wr.ref):
+                continue
+            _head = id(_o) - 16
             _baseline[_head] = _gcl_u64(_head)
+            try:
+                _ref = _o()
+            except BaseException:
+                _ref = None
+            if _ref is None:
+                _ident = "weakref(dead)"
+            else:
+                _tname = type(_ref).__name__
+                _in_ps = (id(_ref) in _ps_value_ids)
+                _tag = " [interp.pointerStorage value]" if _in_ps else ""
+                if isinstance(_ref, type):
+                    _ident = "weakref to type %r%s" % (_ref.__name__, _tag)
+                else:
+                    _ident = "weakref to %s instance at 0x%x%s" % (
+                        _tname, id(_ref), _tag)
+                del _ref
+            _identity[_head] = _ident
+        del _gen2, _ps_value_ids
+        print("[gc-list-diff] gen2 size at snapshot: %d, weakrefs: %d"
+              % (_gen2_size, len(_baseline)), file=sys.stderr)
         _gc_diff_baseline = _baseline
-        print("[gc-list-diff] snapshotted %d weakref PyGC_Head._gc_next values"
-              % len(_baseline), file=sys.stderr)
+        _gc_diff_identity = _identity
         _gc_diff_helpers = (_gcl_u64, interpreter)
 
     def _gc_list_diff_report(label):
@@ -789,7 +839,6 @@ def main(argv):
         if _gc_diff_baseline is None:
             return
         _u64, _interp = _gc_diff_helpers
-        import ctypes as _gcl_ct
         _changed = []
         for _head, _before in _gc_diff_baseline.items():
             try:
@@ -834,8 +883,9 @@ def main(argv):
                 _rc = _tp = 0
             _benign = (_after in _known_heads)
             _classify = "benign-shuffle" if _benign else "UNKNOWN-target"
-            print("[gc-list-diff %s]   PyGC_Head 0x%x  [%s]:"
-                  % (label, _head, _classify), file=sys.stderr)
+            _ident = _gc_diff_identity.get(_head, "(no identity)")
+            print("[gc-list-diff %s]   PyGC_Head 0x%x  [%s]: %s"
+                  % (label, _head, _classify, _ident), file=sys.stderr)
             print("[gc-list-diff %s]     _gc_next was 0x%x -> now 0x%x"
                   % (label, _before, _after if _after is not None else 0),
                   file=sys.stderr)
@@ -849,11 +899,53 @@ def main(argv):
                     _ref_tp = _u64(_ref_obj + 8)
                     # tp_name is at offset 24 in PyTypeObject.
                     _name_ptr = _u64(_ref_tp + 24)
-                    _name = _gcl_ct.string_at(_name_ptr) if _name_ptr else b""
+                    _name = ctypes.string_at(_name_ptr) if _name_ptr else b""
                     print("[gc-list-diff %s]     -> weakref to instance of %r "
                           "(refcnt=%d) at 0x%x"
                           % (label, _name.decode("ascii", "replace"),
                              _ref_rc, _ref_obj), file=sys.stderr)
+                    # If the referent is a type (Python real or our
+                    # interp's), also dump ITS own tp_name (the class
+                    # it represents).  Defensive: reading garbage
+                    # tp_name pointers segfaults, so guard.
+                    if _name in (b"type", b"_typeobject"):
+                        _own_name_ptr = _u64(_ref_obj + 24)
+                        # Only attempt the read if the pointer looks
+                        # plausibly like a c-string address (heap
+                        # range and aligned).
+                        _own_name = b""
+                        if (_own_name_ptr
+                                and 0x100_000_000 <= _own_name_ptr < 0x1_000_000_000):
+                            try:
+                                _own_name = ctypes.string_at(
+                                    _own_name_ptr, size=64).split(b"\x00", 1)[0]
+                            except (OSError, ValueError):
+                                _own_name = b"<unreadable>"
+                        print("[gc-list-diff %s]        referent type tp_name: %r"
+                              % (label,
+                                 _own_name.decode("ascii", "replace")),
+                              file=sys.stderr)
+                    # Is the referent inside one of our interp's
+                    # malloc'd buffers?  If yes, the weakref refers
+                    # to memory that our interp owns -- pinpoints
+                    # ctype objs we constructed via ``_malloc``.
+                    _from_mallocs = False
+                    if hasattr(_interp, "mallocs"):
+                        for _b, _bv in _interp.mallocs.items():
+                            try:
+                                _bsz = ctypes.sizeof(_bv)
+                            except (TypeError, OSError):
+                                continue
+                            if _b <= _ref_obj < _b + _bsz:
+                                _from_mallocs = True
+                                print("[gc-list-diff %s]        referent IS in "
+                                      "interp.mallocs base=0x%x size=%d offset=%d"
+                                      % (label, _b, _bsz, _ref_obj - _b),
+                                      file=sys.stderr)
+                                break
+                    if not _from_mallocs:
+                        print("[gc-list-diff %s]        referent NOT in interp.mallocs"
+                              % label, file=sys.stderr)
                     if _ref_obj == _ps_id:
                         print("[gc-list-diff %s]        ** is interp.pointerStorage **"
                               % label, file=sys.stderr)
@@ -864,6 +956,89 @@ def main(argv):
                 else:
                     print("[gc-list-diff %s]     -> weakref with dead referent"
                           % label, file=sys.stderr)
+
+    # --watch-write: trap any write whose target cell lands on one of
+    # the named addresses.  Targets the most common interp write path
+    # (`_ctype_ptr_set_value` from `helpers.assignPtr` -> `_storePtr`).
+    # If a match is found, print stack and re-raise -- the backtrace
+    # identifies the exact translated-C function and source line that
+    # wrote the corrupting value.
+    _watch_addrs = set()
+    for _spec in args_ns.watch_write:
+        _spec = _spec.strip()
+        if _spec:
+            _watch_addrs.add(int(_spec, 0))
+    if args_ns.watch_write_gen2_weakrefs:
+        import gc as _ww_gc
+        import weakref as _ww_wr
+        _ww_gc.collect(); _ww_gc.collect()
+        _gen2 = _ww_gc.get_objects(generation=2)
+        for _o in _gen2:
+            if isinstance(_o, _ww_wr.ref):
+                _watch_addrs.add(id(_o) - 16)
+        del _gen2
+        print("[watch-write] populated %d addresses from gen2 weakrefs"
+              % len(_watch_addrs), file=sys.stderr)
+    if _watch_addrs:
+        import traceback as _ww_tb
+        _ctypes_addressof = ctypes.addressof
+        _ctypes_sizeof = ctypes.sizeof
+        _watch_set = frozenset(_watch_addrs)
+        # Range-overlap: the write may cover [addr, addr+sizeof(value))
+        # which can encompass a watched cell.  For the 16-byte
+        # PyGC_Head we care about, even a 1-byte write inside the
+        # 16-byte window matters.  Compute the watched 16-byte
+        # windows once and use a fast point-in-range check at each
+        # write.  (Using sorted list + bisect for O(log n) lookup.)
+        import bisect as _ww_bisect
+        _watch_starts = sorted(_watch_set)
+        _WATCH_HEAD_SIZE = 16
+
+        def _ww_overlaps(write_start, write_size):
+            # Find the watched-window with the largest start ``<= write_start + write_size``.
+            _i = _ww_bisect.bisect_right(_watch_starts, write_start + write_size - 1)
+            if _i == 0:
+                return None
+            _w = _watch_starts[_i - 1]
+            if _w + _WATCH_HEAD_SIZE > write_start:
+                return _w
+            return None
+
+        def _ww_report(kind, write_start, write_size, value_descr):
+            _w = _ww_overlaps(write_start, write_size)
+            if _w is None:
+                return
+            print("\n[watch-write] *** HIT *** %s overlaps watched window"
+                  " [0x%x, 0x%x): write=[0x%x, 0x%x), value=%s"
+                  % (kind, _w, _w + _WATCH_HEAD_SIZE,
+                     write_start, write_start + write_size, value_descr),
+                  file=sys.stderr, flush=True)
+            _ww_tb.print_stack(file=sys.stderr)
+
+        # Hook ``_ctype_ptr_set_value`` (writes 8 bytes at addressof(ptr)).
+        _real_set = cparser.interpreter._ctype_ptr_set_value
+        def _ww_hooked_set(ptr, addr):
+            _ww_report("_ctype_ptr_set_value",
+                       _ctypes_addressof(ptr), 8, "0x%x" % addr)
+            return _real_set(ptr, addr)
+        cparser.interpreter._ctype_ptr_set_value = _ww_hooked_set
+
+        # Hook ``Helpers.assign`` (struct copy: writes sizeof(a) bytes).
+        _real_assign = cparser.interpreter.Helpers.assign
+        def _ww_hooked_assign(self, a, b):
+            try:
+                _addr = _ctypes_addressof(a)
+                _sz = _ctypes_sizeof(a)
+            except (TypeError, ctypes.ArgumentError):
+                _addr = _sz = None
+            if _addr is not None:
+                _ww_report("Helpers.assign", _addr, _sz, repr(b)[:80])
+            return _real_assign(self, a, b)
+        cparser.interpreter.Helpers.assign = _ww_hooked_assign
+
+        print("[watch-write] watching %d cell-address window(s) of "
+              "%d bytes each" % (len(_watch_set), _WATCH_HEAD_SIZE),
+              file=sys.stderr)
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
