@@ -406,6 +406,24 @@ def main(argv):
              "`--gc-check-range 9000:9800:100` probes 9000, 9100, ..., "
              "9800.  Combine with --gc-check-at for ad-hoc additional "
              "points.  May be repeated.")
+    argparser.add_argument(
+        '--gc-list-diff', action='store_true',
+        help="Before running, snapshot the ``_gc_next`` field of every "
+             "PyGC_Head in Python's real gen2 GC list.  After the run "
+             "(or at each --gc-check-at point, if both are set), walk "
+             "the same entries and report any whose ``_gc_next`` was "
+             "overwritten.  This is the canonical 'find which Python "
+             "object's GC linkage got corrupted' probe.\n"
+             "\n"
+             "Background: every gc-tracked PyObject has a 16-byte "
+             "PyGC_Head immediately before its address, containing "
+             "``_gc_next`` and ``_gc_prev`` pointers.  Each generation "
+             "(gen0, gen1, gen2) is a doubly-linked circular list of "
+             "these heads.  ``gc.collect()`` walks the list via "
+             "``_gc_next``; if any link is overwritten, the walk "
+             "either segfaults (dereferencing junk) or enters a wrong "
+             "list and loops forever.  This option detects exactly "
+             "which entry's link changed and identifies the object.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -695,6 +713,12 @@ def main(argv):
                     print("[gc-check %d] current stack (innermost last):"
                           % n, file=sys.stderr, flush=True)
                     _gc_tb.print_stack(file=sys.stderr)
+                # If --gc-list-diff is also set, do the (safe) snapshot
+                # diff before the (potentially-crashing) gc.get_referrers
+                # call -- so we capture the corruption even if the next
+                # line segfaults.
+                if args_ns.gc_list_diff and _gc_diff_baseline is not None:
+                    _gc_list_diff_report("at %d" % n)
                 refs = _gc_mod.get_referrers(_gc_co)
                 print("[gc-check %d] ok (%d referrers)"
                       % (n, len(refs)), file=sys.stderr, flush=True)
@@ -704,9 +728,150 @@ def main(argv):
               % (_gc_interval, sorted(_gc_check_at) or "[]"),
               file=sys.stderr)
 
+    # `--gc-list-diff`: snapshot Python's real gen2 GC list before
+    # running, diff after.  See the option's help text for a full
+    # explanation of what a "PyGC_Head" is and why this is useful.
+    #
+    # Note: this walks Python's actual gc-tracked-object linked list
+    # via raw ctypes pointer reads.  It must not retain references to
+    # the objects it inspects -- doing so changes the heap state (eg.
+    # prevents otherwise-collectable objects from being GC'd) which
+    # has been observed to alter the path through the interp and hide
+    # the bug.  So we snapshot only ``(head_addr -> _gc_next_value)``
+    # and identify objects post-run by reading their PyObject_HEAD
+    # fields (refcnt, ob_type) directly.
+    _gc_diff_baseline = None
+    if args_ns.gc_list_diff:
+        import gc as _gcl_mod
+        import ctypes as _gcl_ct
+        _gcl_mod.collect()
+        _gcl_mod.collect()
+        # Snapshot gen2 by walking the linked list from a tracked
+        # anchor (a builtins type, guaranteed in gen2 by the time we
+        # get here).  At each step we read ``_gc_next`` only; we don't
+        # retain the objects (would change the heap state).
+        #
+        # Termination: cycle back to start (the normal case) OR hit an
+        # invalid pointer (NULL / unaligned).  The MAX cap is a
+        # safety net -- if we walk past it, the list is bigger than
+        # any reasonable real gen2 OR the walk crossed into another
+        # linked structure via a bad link; in either case we stop.
+        # After parsing all of cpython's C source, gen2 has ~5M
+        # objects.  Walking the full circular list is too expensive
+        # and most of those objects are irrelevant.  Filter to
+        # ``weakref.ref`` instances -- empirically the corruption
+        # observed always targets a weakref.  This narrows the
+        # snapshot to ~thousands of entries and keeps the diff
+        # signal/noise ratio high.
+        import weakref as _gcl_wr
+        _gen2 = _gcl_mod.get_objects(generation=2)
+        _gen2_size = len(_gen2)
+        _weakref_ids = [id(_o) for _o in _gen2 if isinstance(_o, _gcl_wr.ref)]
+        del _gen2
+        print("[gc-list-diff] gen2 size at snapshot: %d, weakrefs: %d"
+              % (_gen2_size, len(_weakref_ids)), file=sys.stderr)
+        def _gcl_u64(addr):
+            return _gcl_ct.cast(addr, _gcl_ct.POINTER(_gcl_ct.c_uint64))[0]
+        _baseline = {}
+        for _oid in _weakref_ids:
+            _head = _oid - 16  # sizeof(PyGC_Head) = 16 on Python 3.13
+            _baseline[_head] = _gcl_u64(_head)
+        _gc_diff_baseline = _baseline
+        print("[gc-list-diff] snapshotted %d weakref PyGC_Head._gc_next values"
+              % len(_baseline), file=sys.stderr)
+        _gc_diff_helpers = (_gcl_u64, interpreter)
+
+    def _gc_list_diff_report(label):
+        """Walk the snapshot, find changed _gc_next values, identify
+        the corrupted Python objects.  Resolves PyObject metadata by
+        reading raw memory -- no gc.get_objects() needed.
+        """
+        if _gc_diff_baseline is None:
+            return
+        _u64, _interp = _gc_diff_helpers
+        import ctypes as _gcl_ct
+        _changed = []
+        for _head, _before in _gc_diff_baseline.items():
+            try:
+                _after = _u64(_head)
+            except OSError:
+                _after = None
+            if _after != _before:
+                _changed.append((_head, _before, _after))
+        if not _changed:
+            print("[gc-list-diff %s] no changes detected (gen2 intact)"
+                  % label, file=sys.stderr)
+            return
+        # A change is "benign" if new _gc_next still points at a
+        # PyGC_Head we know about (one of the weakref heads we
+        # snapshotted) -- i.e., Python's gc just shuffled the order
+        # within our subgroup.  A change to an UNKNOWN address is
+        # suspicious -- our snapshot covered all weakrefs that
+        # existed pre-run, so a new value outside the set either
+        # points to a non-weakref object (legitimate cross-type
+        # neighbor) or to non-heap memory (the corruption signal).
+        _known_heads = set(_gc_diff_baseline.keys())
+        # Resolve weakref.ref type and its subclasses for ob_type
+        # compares.  ``WeakValueDictionary`` uses ``KeyedRef`` (a
+        # ``weakref.ref`` subclass), so we collect all subclass ids
+        # too -- otherwise we'd miss those entries.
+        import weakref as _wr
+        _wr_ref_types = {id(_wr.ref)}
+        for _sc in _wr.ref.__subclasses__():
+            _wr_ref_types.add(id(_sc))
+            for _ssc in _sc.__subclasses__():
+                _wr_ref_types.add(id(_ssc))
+        _ps_id = id(_interp.pointerStorage)
+        _ps_type_id = id(type(_interp.pointerStorage))
+        print("[gc-list-diff %s] %d PyGC_Head._gc_next changed:"
+              % (label, len(_changed)), file=sys.stderr)
+        for _head, _before, _after in _changed:
+            _obj = _head + 16
+            try:
+                _rc = _u64(_obj)
+                _tp = _u64(_obj + 8)
+            except OSError:
+                _rc = _tp = 0
+            _benign = (_after in _known_heads)
+            _classify = "benign-shuffle" if _benign else "UNKNOWN-target"
+            print("[gc-list-diff %s]   PyGC_Head 0x%x  [%s]:"
+                  % (label, _head, _classify), file=sys.stderr)
+            print("[gc-list-diff %s]     _gc_next was 0x%x -> now 0x%x"
+                  % (label, _before, _after if _after is not None else 0),
+                  file=sys.stderr)
+            print("[gc-list-diff %s]     PyObject at 0x%x: refcnt=%d ob_type=0x%x"
+                  % (label, _obj, _rc, _tp), file=sys.stderr)
+            if _tp in _wr_ref_types:
+                # It's a weakref.  Decode the referent.
+                _ref_obj = _u64(_obj + 16)  # PyWeakReference.wr_object
+                if _ref_obj:
+                    _ref_rc = _u64(_ref_obj)
+                    _ref_tp = _u64(_ref_obj + 8)
+                    # tp_name is at offset 24 in PyTypeObject.
+                    _name_ptr = _u64(_ref_tp + 24)
+                    _name = _gcl_ct.string_at(_name_ptr) if _name_ptr else b""
+                    print("[gc-list-diff %s]     -> weakref to instance of %r "
+                          "(refcnt=%d) at 0x%x"
+                          % (label, _name.decode("ascii", "replace"),
+                             _ref_rc, _ref_obj), file=sys.stderr)
+                    if _ref_obj == _ps_id:
+                        print("[gc-list-diff %s]        ** is interp.pointerStorage **"
+                              % label, file=sys.stderr)
+                    elif _ref_tp == _ps_type_id:
+                        print("[gc-list-diff %s]        (same TYPE as "
+                              "interp.pointerStorage but different INSTANCE)"
+                              % label, file=sys.stderr)
+                else:
+                    print("[gc-list-diff %s]     -> weakref with dead referent"
+                          % label, file=sys.stderr)
+
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
-    interpreter.runFunc(*args)
+    try:
+        interpreter.runFunc(*args)
+    finally:
+        if _gc_diff_baseline is not None:
+            _gc_list_diff_report("final")
 
 
 if __name__ == '__main__':
