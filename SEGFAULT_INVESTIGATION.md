@@ -538,11 +538,131 @@ with lazy name resolution from `_func_cache.C_cFunc` addresses.
 Most function pointers don't have entries in `_func_cache` (they are
 inline-dispatched), so most names resolve to `fn@0x...`.
 
+## 2026-05-24 update #14: precise call-site identification via targeted-watch
+
+Added `--targeted-watch` -- per-iter check of just the byte at
+`obj+40` for each known PyMethodObject (cheap, ~200 reads, doesn't
+perturb timing).  Captured the exact iter:
+
+    [targeted-watch iter=54592] BUFFER OVERFLOW DETECTED:
+        method obj_addr=0x376d19608
+        byte+40 transitioned from 0x376d1e140 -> 0
+
+(Note: the captured byte is `obj+40` = first byte AFTER the
+PyMethodObject's body = the adjacent host PyGC_Head's `_gc_next`
+field.  The transition `0x376d1e140 -> 0` means: that field
+USED to point to an object at 0x376d1e140, then it was nulled.)
+
+The Python stack at iter 54592 is fully captured -- it ends at:
+
+    PyFile_WriteObject (line 12)
+      _PyObject_GetAttrId (line 9)        -- "write" attribute lookup
+        PyObject_GetAttr (line 10)
+          [checkedFuncPtrCall calls tp_getattro]
+            PyObject_GenericGetAttr (line 5)
+              _PyObject_GenericGetAttrWithDict (line 224)
+                [checkedFuncPtrCall calls f = descr->ob_type->tp_descr_get]
+                  (descr is some descriptor for file.write)
+
+Mapping to CPython source (Objects/object.c:1235):
+
+    res = f(descr, obj, (PyObject *)obj->ob_type);
+
+This is the **descriptor `__get__` call** for the `write` attribute
+on the file object that the traceback is being printed to.
+
+What `f` does: typically `method_descr_get` (for builtin methods),
+which calls `PyCFunction_NewEx` -- ALLOCATES a new
+PyCFunctionObject (basicsize=48, total alloc 24+48=72 bytes -- so
+it doesn't reuse a 64-byte slot).  Or for plain methods,
+`method_descr_get` calls `PyMethod_New` -- allocates PyMethodObject
+(basicsize=40, total alloc 64).
+
+Hypothesis (revised):
+- During the descriptor get call, some allocation happens
+- Pymalloc's free-list returns a 64-byte slot that USED to be a
+  PyMethodObject
+- During the init of the new object, the LAST 8 bytes get cleared
+- But the next pymalloc slot is now an adjacent host obj's PyGC_Head
+- Result: that host obj's _gc_next is nulled
+
+## 2026-05-24 update #15: 🎯 ROOT CAUSE -- file-scope static collision
+
+`free_list` is declared as `static` in BOTH `Objects/classobject.c`
+(PyMethodObject *) and `Objects/methodobject.c` (PyCFunctionObject *).
+These should be SEPARATE variables in C (file-scope static).  Our
+cparser does NOT distinguish them -- a probe confirms only ONE
+`free_list` exists in the parsed state, declared as
+`PyCFunctionObject *` (whichever file was parsed last wins).
+
+Consequence:
+1. `method_dealloc` pushes dead PyMethodObjects onto "the" free_list,
+   thinking it's the PyMethodObject list.
+2. `PyCFunction_NewEx` pops from the same free_list, thinks it's a
+   PyCFunctionObject, and initializes 48 bytes of body data
+   (`m_ml`, `m_self`, `m_module`, `m_weakreflist`).
+3. The slot was actually a 40-byte PyMethodObject body -- writes
+   to fields `m_module` and `m_weakreflist` overflow by exactly
+   8 bytes past the slot end.
+4. Those 8 overflow bytes are written with NULL (e.g.
+   `m_weakreflist = NULL` per `PyCFunction_NewEx` init).
+5. The next pymalloc slot's first 8 bytes are the adjacent
+   gc-tracked obj's `_gc_next` -- they get nulled.
+6. gc.collect later walks the chain, follows predecessor's _gc_next
+   to this now half-untracked obj, dereferences NULL, crashes.
+
+Math:
+- PyMethodObject:    PyObject_HEAD(16) + 3 ptr(24) = 40 bytes
+- PyCFunctionObject: PyObject_HEAD(16) + 4 ptr(32) = 48 bytes
+- Diff = 8 bytes = exactly what overflows
+- 64-byte slot (24 PyGC_Head + 40 body) -- consistent observation
+
+Stack at corruption (iter 54592):
+- _PyObject_GenericGetAttrWithDict line 224
+- calls `f(descr, obj, type)` where descr is `method_descriptor`,
+  obj is `stderrprinter`, type is `type`
+- f = `method_get` (from descrobject.c) calls `PyCFunction_NewEx`
+- `PyCFunction_NewEx` pops from shared free_list → bug fires
+
+## The fix
+
+`cparser` (the parser) needs to handle file-level `static`
+declarations properly -- give them file-scoped names (e.g.
+mangled with the source-file basename) so they don't collide
+across files.  The interp's `_func_cache` / global scope lookup
+should then resolve them per-source-file.
+
+The function-local static handling already exists (around
+interpreter.py:2244, mangles as `<funcname>__<varname>`).
+A similar mechanism for file-level statics would mangle as
+`<filename>__<varname>` and prevent the collision.
+
+Specifically affected pairs (likely more than just `free_list`):
+
+    grep -n "^static" CPython/Objects/*.c
+        -- shows many `static` declarations across files; any
+        duplicate names cause the same kind of silent collision.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Use lldb hardware watchpoints (not Python instrumentation).**
+0. **Implement file-scope static mangling in cparser.**
+   Mirror the function-local static logic at interpreter.py:2244.
+   When parsing a file-level `CVarDecl` with `static` attrib,
+   mangle the name with the source file basename
+   (e.g. `methodobject_c__free_list`).  Then references inside
+   each .c file resolve to the right one.
+
+   Verify: the probe `/tmp/probe_freelist.py` from update #15
+   should show TWO entries after the fix, with different mangled
+   names.
+
+   After the fix, `./cpython.py -c "print('hi')"` should run to
+   completion (or at least without the shutdown-gc segfault that
+   this bug causes).
+
+1. **Use lldb hardware watchpoints (not Python instrumentation).**
    lldb watchpoints don't perturb the program -- they trap on CPU
    memory-access exceptions.  Procedure:
    1. Set `PYCPYTHON_LLDB_TRAP=1` env var.

@@ -246,11 +246,23 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
         cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
         cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
-        # We need these macro hacks because methodobject.c will use the same vars.
+        # We need these macro hacks because methodobject.c and classobject.c
+        # both declare ``static free_list`` and ``static numfree`` at file
+        # scope -- of DIFFERENT types (PyCFunctionObject* vs PyMethodObject*).
+        # Our cparser doesn't distinguish file-scope statics; without renaming,
+        # both end up as the SAME global var, causing
+        # ``method_dealloc`` to push PyMethodObjects onto the list that
+        # ``PyCFunction_NewEx`` then pops -- it interprets a 40-byte PyMethod
+        # slot as a 48-byte PyCFunction and writes 8 bytes past the slot,
+        # corrupting the next pymalloc allocation's PyGC_Head._gc_next.
+        # Each file gets a UNIQUE mangled name so the variables stay
+        # separate.  Same trick as for bool/float/dict above.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
         self.macros.pop("OFF", None)  # funcobject.c defines OFF; methodobject.c redefines it
         cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
+        self.macros["numfree"] = cparser.Macro(rightside="numfree__classobj")
+        self.macros["free_list"] = cparser.Macro(rightside="free_list__classobj")
         cparser.parse(CPythonDir + "/Objects/classobject.c", self) # PyMethod_Type
         # We need these macro hacks because methodobject.c used the same vars.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
@@ -477,6 +489,13 @@ def main(argv):
              "list via PyGC_Head and check the doubly-linked invariant. "
              "First detection of a break is the iter when corruption "
              "happens.  N=0 (default) disables.")
+    argparser.add_argument(
+        '--targeted-watch', action='store_true', default=False,
+        help="At every interp iter, check the 8 bytes immediately "
+             "AFTER each known PyMethodObject 64-byte buffer.  If any "
+             "transitions to NULL (was non-NULL on snapshot, is now "
+             "NULL), report the iter + buffer.  Fast per-iter (~200 "
+             "buffer reads).  Combine with --gen2-bisect.")
     argparser.add_argument(
         '--invariant-check-window', type=str, default="0:0",
         metavar="START:END",
@@ -981,6 +1000,147 @@ def main(argv):
         _hooked_gcnew.C_cFunc = getattr(_orig_gcnew, "C_cFunc", None)
         interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew
 
+        # If --targeted-watch is also enabled, hook _PyObject_GC_New
+        # to track method-type allocations specifically.  We'll scan
+        # the byte at obj_addr+40 = the first byte past basicsize=40,
+        # which IS the next pymalloc slot's first byte (= the adjacent
+        # host gc obj's _gc_next if there is one).
+        if args_ns.targeted_watch:
+            global _targeted_method_addrs, _targeted_baseline
+            _targeted_method_addrs = []  # list of obj_addr for 'method' allocs
+            _targeted_baseline = {}     # obj_addr -> initial value at obj+40
+
+            _orig_gcnew_tw = interpreter._func_cache["_PyObject_GC_New"]
+
+            def _hooked_gcnew_tw(*args):
+                r = _orig_gcnew_tw(*args)
+                tp_ptr = args[0]
+                tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
+                obj_addr = ctypes.cast(r, ctypes.c_void_p).value
+                if tp_addr and obj_addr:
+                    name_ptr = ctypes.cast(
+                        tp_addr + 24,
+                        ctypes.POINTER(ctypes.c_void_p))[0]
+                    if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
+                        nm = ctypes.string_at(
+                            name_ptr, 16).split(b"\x00", 1)[0]
+                        if nm == b"method":
+                            _targeted_method_addrs.append(obj_addr)
+                            # Read initial value at obj+40 (the byte we
+                            # care about).
+                            try:
+                                v = ctypes.cast(
+                                    obj_addr + 40,
+                                    ctypes.POINTER(ctypes.c_uint64))[0]
+                                _targeted_baseline[obj_addr] = v
+                            except OSError:
+                                pass
+                return r
+            _hooked_gcnew_tw.C_argTypes = _orig_gcnew_tw.C_argTypes
+            _hooked_gcnew_tw.C_resType = _orig_gcnew_tw.C_resType
+            _hooked_gcnew_tw.C_cFunc = getattr(_orig_gcnew_tw, "C_cFunc", None)
+            interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew_tw
+
+            # And hook checkedFuncPtrCall to scan after each call.
+            _tw_orig_call = interpreter.helpers.checkedFuncPtrCall
+            _tw_count = [0]
+            _tw_detected = [False]
+
+            def _tw_wrapped(f, *args):
+                # Capture info about THIS call before it runs.
+                try:
+                    f_addr = ctypes.cast(f, ctypes.c_void_p).value
+                except (TypeError, ctypes.ArgumentError):
+                    f_addr = id(f)
+                # Snapshot the watched bytes BEFORE the call.
+                pre_state = {}
+                for ma in _targeted_method_addrs:
+                    base = _targeted_baseline.get(ma)
+                    if base is None or base == 0:
+                        continue
+                    try:
+                        v = ctypes.cast(
+                            ma + 40,
+                            ctypes.POINTER(ctypes.c_uint64))[0]
+                    except OSError:
+                        continue
+                    pre_state[ma] = v
+
+                r = _tw_orig_call(f, *args)
+                _tw_count[0] += 1
+                if _tw_detected[0]:
+                    return r
+                # Scan: find any byte that transitioned to 0 IN THIS CALL.
+                for ma, pre_v in pre_state.items():
+                    if pre_v == 0:
+                        continue
+                    try:
+                        post_v = ctypes.cast(
+                            ma + 40,
+                            ctypes.POINTER(ctypes.c_uint64))[0]
+                    except OSError:
+                        continue
+                    if post_v == 0:
+                        # This very call did it.
+                        print("[targeted-watch iter=%d] BUFFER OVERFLOW "
+                              "DETECTED *in this call*: method obj_addr"
+                              "=0x%x byte+40 was 0x%x BEFORE call, 0 AFTER"
+                              % (_tw_count[0], ma, pre_v),
+                              file=sys.stderr, flush=True)
+                        arg_addrs = [
+                            (ctypes.cast(a, ctypes.c_void_p).value
+                             if hasattr(a, "_b_needsfree_") else None)
+                            for a in args]
+                        print("[targeted-watch] call was: f=0x%x args=%s"
+                              % (f_addr, arg_addrs), file=sys.stderr)
+                        # Resolve each arg as a PyObject*: read ob_type
+                        # and tp_name.
+                        for i, a in enumerate(arg_addrs):
+                            if a is None or not (0x100_000_000 <= a < 0x10_000_000_000):
+                                continue
+                            try:
+                                rc = ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+                                tp = ctypes.cast(a + 8, ctypes.POINTER(ctypes.c_uint64))[0]
+                                nm_ptr = (ctypes.cast(tp + 24, ctypes.POINTER(ctypes.c_uint64))[0]
+                                          if tp else 0)
+                                nm = b""
+                                if 0x100_000_000 <= nm_ptr < 0x10_000_000_000:
+                                    nm = ctypes.string_at(
+                                        nm_ptr, 64).split(b"\x00", 1)[0]
+                                print("[targeted-watch]   arg[%d] addr=0x%x "
+                                      "refcnt=%d ob_type=0x%x tp_name=%r"
+                                      % (i, a, rc, tp,
+                                         nm.decode("ascii", "replace")),
+                                      file=sys.stderr)
+                            except OSError:
+                                pass
+                        # Also reverse-lookup f's name from _func_cache.
+                        for cand_name, cand_fn in interpreter._func_cache.items():
+                            cf = getattr(cand_fn, "C_cFunc", None)
+                            if cf is None:
+                                continue
+                            try:
+                                cf_addr = ctypes.cast(cf, ctypes.c_void_p).value
+                            except (TypeError, ctypes.ArgumentError):
+                                continue
+                            if cf_addr == f_addr:
+                                print("[targeted-watch] f resolves to: %s"
+                                      % cand_name, file=sys.stderr)
+                                break
+                        else:
+                            print("[targeted-watch] f does NOT resolve to "
+                                  "any name in _func_cache "
+                                  "(inline-dispatched func ptr)",
+                                  file=sys.stderr)
+                        import traceback as _t
+                        _t.print_stack(file=sys.stderr)
+                        _tw_detected[0] = True
+                        break
+                return r
+            interpreter.helpers.checkedFuncPtrCall = _tw_wrapped
+            print("[targeted-watch] hooked checkedFuncPtrCall",
+                  file=sys.stderr)
+
         # Also hook _PyObject_GC_NewVar so we cover variable-size objs.
         _orig_gcnewvar = interpreter.getFunc("_PyObject_GC_NewVar")
 
@@ -1111,6 +1271,8 @@ _gen2_bisect_pre_set_ids = frozenset()  # set by main() before runFunc
 _gen2_bisect_size64_log = {}  # base_addr -> stack-trace
 _gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
 _gen2_bisect_abort_set_ids = frozenset()  # set by _hooked_abort
+_targeted_method_addrs = []  # list of obj_addrs for 'method' allocs
+_targeted_baseline = {}  # obj_addr -> initial *(uint64*)(obj+40)
 
 
 def _gen2_bisect_after_runfunc():
