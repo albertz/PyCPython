@@ -461,6 +461,20 @@ def main(argv):
              "entry_id values.  Print stack + full context the "
              "moment each named id is being registered.  Requires "
              "--track-pointer-storage.")
+    argparser.add_argument(
+        '--mprotect-at-iter', type=int, default=0, metavar="N",
+        help="(EXPERIMENTAL, **macOS BROKEN**) At iter N of "
+             "checkedFuncPtrCall, ``mprotect`` READ-ONLY the 16 KB "
+             "pages of each captured KeyedRef PyGC_Head (from "
+             "--watch-pointer-storage-id) and/or every gen2 weakref "
+             "(from --gc-list-diff).  The intent is to make any "
+             "write -- including ctypes C-level writes hidden from "
+             "Python-level hooks -- raise SIGSEGV with a Python "
+             "stack via faulthandler.  Status: BUS-errors on macOS "
+             "even on a single Python-heap page (verified with both "
+             "``mprotect`` and ``mach_vm_protect`` -- the kernel "
+             "rejects protection changes on pages allocated by "
+             "pymalloc-style ``mmap``).  May still work on Linux.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -557,9 +571,17 @@ def main(argv):
                         _tps_keyedref_heads.append(
                             (_eid, _kref_head, key, _tname))
                         _tps_keyedref_addr_set.add(_kref_head)
+                        # Stamp with current checkedFuncPtrCall iter so
+                        # we can tell when registration happens vs the
+                        # known corruption iter (1343).
+                        _iter_now = getattr(
+                            interpreter.helpers.checkedFuncPtrCall,
+                            "_count", [None])
+                        _iter_val = _iter_now[0] if isinstance(_iter_now, list) else None
                         print("[track-ps]   -> KeyedRef PyGC_Head at 0x%x "
-                              "(armed for --watch-write)"
-                              % _kref_head, file=sys.stderr, flush=True)
+                              "(armed for --watch-write)  "
+                              "[at checkedFuncPtrCall iter ~%s]"
+                              % (_kref_head, _iter_val), file=sys.stderr, flush=True)
                     except KeyError:
                         pass
 
@@ -1176,6 +1198,124 @@ def main(argv):
         print("[watch-write] watching %d cell-address window(s) of "
               "%d bytes each" % (len(_watch_set), _WATCH_HEAD_SIZE),
               file=sys.stderr)
+
+    # --mprotect-at-iter: at the named iter, make the page(s)
+    # containing each watched KeyedRef READ-ONLY.  Subsequent writes
+    # to those pages -- including the ctypes C-level writes our
+    # Python hooks can't see -- raise SIGSEGV; faulthandler then
+    # dumps the Python stack at the crash.
+    if args_ns.mprotect_at_iter > 0:
+        import ctypes.util as _mp_ctu
+        _mp_libc_path = _mp_ctu.find_library("c") or "libc.dylib"
+        _mp_libc = ctypes.CDLL(_mp_libc_path, use_errno=True)
+        _mp_libc.mprotect.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        _mp_libc.mprotect.restype = ctypes.c_int
+        _MP_PROT_READ = 1
+        _MP_PAGE_SIZE = 16384  # macOS arm64 / Linux can be 4096; 16384 covers both safely
+        _mp_count = [0]
+        _mp_armed = [False]
+        _mp_orig_call = interpreter.helpers.checkedFuncPtrCall
+
+        def _mp_wrapped(f, *args):
+            _mp_count[0] += 1
+            if _mp_count[0] == args_ns.mprotect_at_iter and not _mp_armed[0]:
+                _mp_armed[0] = True
+                _pages = set()
+                _addrs = []
+                # Source 1: --watch-pointer-storage-id captured KeyedRef
+                # addresses (may be empty if entry_ids register AFTER
+                # the corruption iter; that turned out to be the case
+                # for the known cpython.py bug, where the supposed
+                # KeyedRef entries are slot-collision misidentifications
+                # of pre-existing real Python weakrefs).
+                try:
+                    for _eid, _kh, _key, _tname in _tps_keyedref_heads:
+                        _addrs.append(("kref_id=%d" % _eid, _kh))
+                except NameError:
+                    pass
+                # Source 2: --gc-list-diff captured gen2 weakref
+                # PyGC_Head addresses BEFORE runFunc.  These are the
+                # actual victims in cpython.py's bug -- real Python
+                # weakrefs that pre-exist our pointerStorage activity.
+                try:
+                    for _h in _gc_diff_baseline:
+                        _addrs.append(("gen2_weakref", _h))
+                except NameError:
+                    pass
+                if not _addrs:
+                    print("[mprotect] WARN: no addresses to protect "
+                          "(need --watch-pointer-storage-id or "
+                          "--gc-list-diff).", file=sys.stderr)
+                else:
+                    # Pre-compute unique pages WITHOUT calling mprotect.
+                    for _tag, _addr in _addrs:
+                        _pages.add(_addr & ~(_MP_PAGE_SIZE - 1))
+                    print("[mprotect] would protect %d unique pages "
+                          "covering %d addresses; about to mprotect..."
+                          % (len(_pages), len(_addrs)),
+                          file=sys.stderr, flush=True)
+                    # Sort pages so the run-order is reproducible.
+                    _pages_sorted = sorted(_pages)
+                    # Now actually mprotect.  ANY further write to
+                    # these pages -- including writes done by the
+                    # tail of THIS function (eg. ``print``-related
+                    # heap activity that happens to allocate on a
+                    # protected page) -- will BUS-error.  So we keep
+                    # the rest of this branch minimal: no prints, no
+                    # allocations.  Page-list is logged BEFORE.
+                    _ok = 0
+                    _fail = 0
+                    for _page in _pages_sorted:
+                        _rc = _mp_libc.mprotect(
+                            _page, _MP_PAGE_SIZE, _MP_PROT_READ)
+                        if _rc != 0:
+                            _fail += 1
+                        else:
+                            _ok += 1
+                    # Stash counts on the function object so we can
+                    # log later if we survive.
+                    _mp_wrapped._ok = _ok
+                    _mp_wrapped._fail = _fail
+            return _mp_orig_call(f, *args)
+        # Expose the iter counter so other code (TrackedPointerStorage's
+        # registration logger) can report "at iter ~N" stamps.
+        _mp_wrapped._count = _mp_count
+        interpreter.helpers.checkedFuncPtrCall = _mp_wrapped
+        print("[mprotect] hook installed; will arm at iter %d "
+              "(KeyedRef pages captured by --watch-pointer-storage-id "
+              "during runFunc)" % args_ns.mprotect_at_iter,
+              file=sys.stderr)
+
+    # Marker for lldb: under ``PYCPYTHON_LLDB_TRAP=1``, raise SIGTRAP
+    # right here -- *after* gc-list-diff baseline / tracked
+    # pointerStorage state is built, *before* the interp's iter loop
+    # starts.  Ideal point to attach lldb watchpoints on PyGC_Head
+    # addresses we want to catch writes to.  Combine with lldb's
+    # ``settings set target.disable-aslr true`` so the addresses
+    # observed in one run carry over to the next.
+    if os.environ.get("PYCPYTHON_LLDB_TRAP"):
+        # Optionally dump the captured gc-list-diff baseline addresses
+        # to a file so lldb can read them and set watchpoints on the
+        # same PyGC_Head's that will be corrupted later.
+        _lldb_addrs_path = os.environ.get(
+            "PYCPYTHON_LLDB_ADDRS_FILE", "/tmp/pycpython_lldb_addrs.txt")
+        try:
+            _base = _gc_diff_baseline
+        except NameError:
+            _base = None
+        if _base:
+            with open(_lldb_addrs_path, "w") as _f:
+                for _h in _base:
+                    _f.write("0x%x\n" % _h)
+            print("[lldb-trap] wrote %d baseline weakref addresses to %s"
+                  % (len(_base), _lldb_addrs_path),
+                  file=sys.stderr, flush=True)
+        import signal as _sig_lldb
+        print("[lldb-trap] PID=%d, raising SIGTRAP -- lldb should now "
+              "stop here; set watchpoints and 'continue'."
+              % os.getpid(), file=sys.stderr, flush=True)
+        os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
