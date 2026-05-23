@@ -288,11 +288,84 @@ dict, Name, dict.  AST nodes + ctypes py_object near the leaker --
 suggests interp activity involving ctypes objects and ast was running
 when the leak happened.
 
+## 2026-05-23 update #6: REVISED diagnosis -- gc linked list corruption
+
+After more testing, the "refcnt=0 set" was a **misleading
+intermittent symptom**, not the root cause.  New diagnostic
+(`_fork_call_gc_collect`):
+
+    [gen2-bisect] sets with broken body invariants: 0
+    [gen2-bisect] objects with refcnt=0 still in gc-list: 0
+    [gen2-bisect] objects with _gc_prev=0 still in gc-list: 0
+    [gen2-bisect] explicitly calling gc.collect()...
+    [gen2-bisect] gc.collect() CRASHES -- bug IS in gen-list walk machinery
+
+So even when gen0 looks structurally clean (no zero-refcnt, no
+zero-_gc_prev, no weird set bodies), `gc.collect()` still crashes.
+The corruption is in the gen-list's **doubly-linked invariant** --
+specifically, somewhere `prev->_gc_next != cur` or
+`cur->_gc_prev != prev`, which our forward-only walker tolerates
+but `gc_collect_main`'s `validate_list` fails on.
+
+The "refcnt=0 set" we sometimes saw was a SECONDARY artifact:
+when `gc.collect()` runs incrementally, it can leave individual
+objects in inconsistent state mid-collect; our walker happens to
+observe them at a bad moment.
+
+Note: the bug is **heap-timing-sensitive**.  Adding extra
+instrumentation (eg. an abort-time gen0 scan) can perturb timing
+enough to make the bug NOT reproduce.  Run multiple times to
+confirm.
+
+## 2026-05-23 update #7: FOUND IT -- half-untracked dict
+
+Bidirectional walk reveals exactly ONE broken link in 14.9M entries:
+
+    [gen2-bisect] doubly-linked invariant breaks: 1
+    [gen2-bisect]   broken-link head=0x371b22ab0 type='dict':
+                    nxt invalid 0x0
+
+A **dict** object with `_gc_next == NULL` -- but still reachable
+via its predecessor's `_gc_next` pointer.  This is a HALF-UNTRACKED
+state: `_PyObject_GC_UnTrack` partially ran:
+- `gc->_gc_next = 0` and `_PyGCHead_SET_PREV(gc, NULL)` DID execute
+- BUT `_PyGCHead_SET_NEXT(prev, next)` did NOT -- prev's forward
+  link still points at this dict
+
+When `gc.collect()` walks the list, it follows prev's `_gc_next`
+to this half-untracked dict, then reads `dict->_gc_next == NULL`
+and crashes (or for the iter-loop in `validate_list`, fails an
+assertion).
+
+**The bug is in our interp's `_PyObject_GC_UnTrack` translation.**
+It's supposed to atomically unlink from the doubly-linked list,
+but our interp executes the unlinking steps as separate
+interpreter operations -- if an exception unwinds between
+"clear my pointers" and "fix neighbors' pointers", we leave a
+half-untracked obj.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Hook host-set allocation via gen0-walk-on-each-`checkedFuncPtrCall`.**
+0. **Inspect the interp's translation of `_PyObject_GC_UnTrack`.**
+   Find where this function is generated; check whether the four
+   pointer updates run as a single atomic block or if there's an
+   interleaving point.  Possibly add try/finally semantics so the
+   neighbor-fixup ALWAYS runs even if a step raises.
+
+   Note: `_PyObject_GC_UnTrack` is typically an inline-macro in
+   CPython source (`#define _PyObject_GC_UNTRACK(o) ...`).  Our
+   parser may expand the macro at every call site -- those expanded
+   sites are individual statement blocks in the interp.  If our
+   interp ever throws between the statements (e.g. via a watchdog
+   or signal handler), we leak.
+   For each obj, verify `obj._gc_prev._gc_next == obj` and
+   `obj._gc_next._gc_prev == obj`.  The single broken link is
+   what `gc.collect()`'s `validate_list` trips on.  Add this to
+   the bisect's post-runFunc forensics.
+
+1. **Hook host-set allocation via gen0-walk-on-each-`checkedFuncPtrCall`.**
    Even though gc.callbacks don't fire when gc is disabled, we can
    manually walk gen0 via PyGC_Head at every K-th interp iter (or
    only during the last M iters) and snapshot host-set IDs.  Compare

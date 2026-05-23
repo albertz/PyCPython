@@ -821,39 +821,11 @@ def main(argv):
         _gc_pre.disable()
         print("[gen2-bisect] gc.disable() before runFunc",
               file=sys.stderr)
-        # Hook our interp's _abort so we can snapshot host-set IDs at
-        # the exact moment CAbortException is raised.  After runFunc
-        # we compare this snapshot to the final state -- any new set
-        # in the diff was created during exception unwinding.
-        _orig_abort = interpreter._abort
-        global _gen2_bisect_abort_set_ids
-        def _hooked_abort(*a, **kw):
-            global _gen2_bisect_abort_set_ids
-            # Walk gen0 via PyGC_Head, capture all host-set IDs.
-            # Don't use gc.get_objects (allocates a list, perturbs heap).
-            HEAD_SIZE = 16
-            PTR_MASK = ~0xF
-            host_set_id = id(set)
-            def _u64(addr):
-                return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
-            tmp_anchor = []
-            head = id(tmp_anchor) - HEAD_SIZE
-            seen = {head}
-            ids = set()
-            cur = _u64(head) & PTR_MASK
-            while cur and not (cur & 0x7) and cur not in seen:
-                seen.add(cur)
-                obj = cur + HEAD_SIZE
-                if _u64(obj + 8) == host_set_id:
-                    ids.add(obj)
-                cur = _u64(cur) & PTR_MASK
-            _gen2_bisect_abort_set_ids = frozenset(ids)
-            print("[gen2-bisect/abort-hook] captured %d host-set IDs "
-                  "at the moment of CAbortException"
-                  % len(_gen2_bisect_abort_set_ids),
-                  file=sys.stderr, flush=True)
-            return _orig_abort(*a, **kw)
-        interpreter._abort = _hooked_abort
+        # NOTE: a previous version of this code hooked interp._abort
+        # to snapshot host-set IDs at the moment of CAbortException.
+        # That perturbed timing enough to make the bug NOT reproduce
+        # (heap-sensitive corruption).  Removed -- if you need an
+        # abort-time snapshot, do it lazily / lighter-weight.
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
@@ -957,29 +929,36 @@ def _gen2_bisect_after_runfunc():
             print("[gen2-bisect]   %s[%d]: addr=0x%x refcnt=%d ob_type=0x%x tp_name=%r"
                   % (label, i, a, _u64x(a), tp,
                      nm.decode("ascii", "replace")), file=sys.stderr)
-    # Scan for ALL objects with refcnt=0 in the gen list -- these are
-    # "dead" objects that should have been deallocated and untracked
-    # but somehow stayed in the gc list.  Each one is a candidate for
-    # the bug.
+    # Scan for ALL objects with refcnt=0 OR _gc_prev=0 in the gen list
+    # -- both are indicators of an object that should have been
+    # deallocated/untracked but stayed in gc-list.
     refcnt_zero = []
+    gp_zero = []
     for a in addrs:
         if _u64x(a) == 0:
             refcnt_zero.append(a)
+        if _u64x(a - 8) == 0:  # _gc_prev field
+            gp_zero.append(a)
     print("[gen2-bisect] objects with refcnt=0 still in gc-list: %d"
           % len(refcnt_zero), file=sys.stderr)
-    # Dump up to first 20 with their type names.
-    for i, a in enumerate(refcnt_zero[:20]):
-        tp = _u64x(a + 8)
-        nm = b""
-        if tp:
-            npr = _u64x(tp + 24)
-            if 0x100_000_000 <= npr < 0x10_000_000_000:
-                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
-        # Also dump _gc_prev (often 0x0 for the broken ones).
-        _gp = _u64x(a - 16 + 8)
-        print("[gen2-bisect]   refcnt=0[%d]: addr=0x%x type=%r _gc_prev=0x%x"
-              % (i, a, nm.decode("ascii", "replace"), _gp),
-              file=sys.stderr)
+    print("[gen2-bisect] objects with _gc_prev=0 still in gc-list: %d"
+          % len(gp_zero), file=sys.stderr)
+    for label, suspects in [("refcnt=0", refcnt_zero),
+                            ("_gc_prev=0", gp_zero)]:
+        for i, a in enumerate(suspects[:10]):
+            tp = _u64x(a + 8)
+            nm = b""
+            if tp:
+                npr = _u64x(tp + 24)
+                if 0x100_000_000 <= npr < 0x10_000_000_000:
+                    nm = ctypes.string_at(
+                        npr, 64).split(b"\x00", 1)[0]
+            rc = _u64x(a)
+            gp = _u64x(a - 8)
+            print("[gen2-bisect]   %s[%d]: addr=0x%x rc=%d type=%r "
+                  "_gc_prev=0x%x"
+                  % (label, i, a, rc, nm.decode("ascii", "replace"), gp),
+                  file=sys.stderr)
     # Reconstruct Python object refs from addresses.  ctypes
     # ``py_object`` cast reads the PyObject* at the address (treating
     # the address-int as a value of type ``void*`` then casting).  We
@@ -996,7 +975,93 @@ def _gen2_bisect_after_runfunc():
           % len(all_objs), file=sys.stderr, flush=True)
     if not all_objs:
         return
-    # Quick sanity: does the whole-set traverse crash?  If not, the bug
+    # Probe 0: walk the linked list bidirectionally and check the
+    # doubly-linked invariant.  For each obj at head h, verify
+    # ``u64(h) == h_next`` AND ``u64(h_next + 8) == h`` (h_next's
+    # _gc_prev should point back to h).  Any break is the bug.
+    print("[gen2-bisect] checking doubly-linked invariants in gen0...",
+          file=sys.stderr, flush=True)
+    HEAD_SIZE = 16
+    PTR_MASK = ~0xF
+    def _u64v(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    bad_links = []
+    for a in addrs:
+        head = a - HEAD_SIZE
+        nxt = _u64v(head) & PTR_MASK
+        if nxt == 0 or (nxt & 0x7):
+            bad_links.append((head, "nxt invalid 0x%x" % nxt))
+            continue
+        # nxt is the NEXT object's PyGC_Head address.  nxt's _gc_prev
+        # should equal head (modulo low-bit flags).
+        nxt_prev = _u64v(nxt + 8) & PTR_MASK
+        if nxt_prev != head:
+            bad_links.append((head,
+                              "nxt(0x%x)._gc_prev=0x%x but expected 0x%x"
+                              % (nxt, nxt_prev, head)))
+    print("[gen2-bisect] doubly-linked invariant breaks: %d"
+          % len(bad_links), file=sys.stderr)
+    for head, msg in bad_links[:10]:
+        # Decode the obj at this head.
+        obj = head + HEAD_SIZE
+        rc = _u64v(obj)
+        tp = _u64v(obj + 8)
+        nm = b""
+        if tp:
+            npr = _u64v(tp + 24)
+            if 0x100_000_000 <= npr < 0x10_000_000_000:
+                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
+        # Is this a host object or interp-managed?  Host types live in
+        # the host Python binary (low addresses); interp types live in
+        # our _malloc'd memory.
+        is_host_dict = (tp == id(dict))
+        is_host_set = (tp == id(set))
+        is_host_list = (tp == id(list))
+        is_host_tuple = (tp == id(tuple))
+        host_str = ""
+        if is_host_dict: host_str = " HOST dict"
+        elif is_host_set: host_str = " HOST set"
+        elif is_host_list: host_str = " HOST list"
+        elif is_host_tuple: host_str = " HOST tuple"
+        print("[gen2-bisect]   broken-link head=0x%x obj=0x%x rc=%d "
+              "type=%r%s: %s"
+              % (head, obj, rc, nm.decode("ascii", "replace"),
+                 host_str, msg),
+              file=sys.stderr)
+        # Try to identify the dict's content: dict basic layout
+        # (CPython 3.7): ob_refcnt (8) ob_type (8) ma_used (8)
+        # ma_version_tag (8) ma_keys (8) ma_values (8).  Read ma_used.
+        if is_host_dict:
+            ma_used = _u64v(obj + 16)
+            print("[gen2-bisect]     ma_used=%d (dict size at break time)"
+                  % ma_used, file=sys.stderr)
+        # Also try to find what's in interp.mallocs or any other ref
+        # to this address.
+        interp = _gen2_bisect_interp
+        if interp is not None and hasattr(interp, "mallocs"):
+            for _base, _buf in interp.mallocs.items():
+                try:
+                    _sz = ctypes.sizeof(_buf)
+                except (TypeError, OSError):
+                    continue
+                if _base <= obj < _base + _sz:
+                    print("[gen2-bisect]     in interp.mallocs at base=0x%x "
+                          "offset=%d" % (_base, obj - _base),
+                          file=sys.stderr)
+                    break
+    # Probe 1: does an explicit gc.collect() (mirroring what host
+    # shutdown does) trigger the bug?  This walks the gen linked
+    # list, different code path than get_referents/tp_traverse.
+    print("[gen2-bisect] explicitly calling gc.collect()...",
+          file=sys.stderr, flush=True)
+    crashed_in_collect = _fork_call_gc_collect()
+    if crashed_in_collect:
+        print("[gen2-bisect] gc.collect() CRASHES -- bug IS in gen-list "
+              "walk machinery", file=sys.stderr)
+    else:
+        print("[gen2-bisect] gc.collect() did NOT crash",
+              file=sys.stderr)
+    # Probe 2: does the whole-set traverse crash?  If not, the bug
     # is in the gen-list walk machinery, not any single object.
     crashed = _fork_traverse_subset(all_objs, 0, len(all_objs))
     if not crashed:
@@ -1046,14 +1111,9 @@ def _gen2_bisect_after_runfunc():
         print("[gen2-bisect]   bad set existed BEFORE runFunc -- it's a "
               "pre-existing host set whose body got clobbered during runFunc",
               file=sys.stderr)
-    elif bad_addr_val in _gen2_bisect_abort_set_ids:
-        print("[gen2-bisect]   bad set existed at moment of CAbortException "
-              "(before exception unwind) -- created during normal runFunc "
-              "execution, NOT during unwind",
-              file=sys.stderr)
     else:
-        print("[gen2-bisect]   bad set was created DURING EXCEPTION UNWIND "
-              "(not in pre-runFunc set, not in abort-time set)",
+        print("[gen2-bisect]   bad set was created DURING runFunc -- "
+              "leak happened via interp activity",
               file=sys.stderr)
     # Is the bad set's ob_type the HOST `set` type (= same as `id(set)`)?
     # If yes: this is a HOST python set, leaked by something our interp
@@ -1152,6 +1212,23 @@ def _walk_gen_via_pygc_head():
         nxt = u64(cur) & PTR_MASK
         cur = nxt
     return addrs
+
+
+def _fork_call_gc_collect():
+    """Fork a child, re-enable gc, call gc.collect().  Returns True
+    if the child died from a crash (signal or _exit 134/138/139)."""
+    import gc as _gc
+    pid = os.fork()
+    if pid == 0:
+        _gc.enable()
+        _gc.collect()
+        os._exit(0)
+    _pid, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        return True
+    if os.WEXITSTATUS(status) in (134, 138, 139):
+        return True
+    return False
 
 
 def _fork_traverse_subset(all_objs, lo, hi):
