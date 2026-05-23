@@ -804,6 +804,68 @@ def main(argv):
         os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
     if args_ns.gen2_bisect:
+        # Hook _addPointerStorageRange to log a stack for every
+        # 64-byte c_byte_Array_64 registration -- after the bisect
+        # finds the broken obj, we look up the registration matching
+        # range_end == broken_head to identify the C-source site.
+        global _gen2_bisect_size64_log
+        _gen2_bisect_size64_log = {}  # range_base -> (size, stack)
+        _orig_addrange = interpreter._addPointerStorageRange
+
+        import traceback as _t_bisect
+        def _hooked_addrange(start, size):
+            if size == 64:
+                fr = _t_bisect.extract_stack(limit=12)
+                slim = [(f.filename.rsplit("/", 1)[-1], f.lineno, f.name)
+                        for f in fr]
+                _gen2_bisect_size64_log[start] = slim
+            return _orig_addrange(start, size)
+        interpreter._addPointerStorageRange = _hooked_addrange
+
+        # Hook _PyObject_GC_New: log the (tp_basicsize, tp_name) of
+        # every newly-allocated GC obj.  We capture which TYPE
+        # corresponds to each 64-byte allocation.  Then the broken
+        # buffer's range_base tells us the type.
+        global _gen2_bisect_alloc_type_log
+        _gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
+
+        # Populate _func_cache via getFunc, then hook.
+        try:
+            _orig_gcnew = interpreter.getFunc("_PyObject_GC_New")
+        except (KeyError, AttributeError):
+            _orig_gcnew = None
+        if _orig_gcnew is not None:
+            def _hooked_gcnew(tp_ptr, *a):
+                obj = _orig_gcnew(tp_ptr, *a)
+                # tp_ptr is a ctypes pointer to PyTypeObject.  Read
+                # tp_basicsize at offset (sizeof(PyVarObject)) = 32
+                # bytes from struct start.  PyTypeObject layout:
+                # PyObject_VAR_HEAD (32) + tp_name (8) + tp_basicsize
+                # ... so basicsize is at offset 40.
+                try:
+                    tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
+                    if tp_addr:
+                        basicsize = ctypes.cast(
+                            tp_addr + 40, ctypes.POINTER(ctypes.c_ssize_t))[0]
+                        name_ptr = ctypes.cast(
+                            tp_addr + 24, ctypes.POINTER(ctypes.c_void_p))[0]
+                        name = b""
+                        if name_ptr:
+                            try:
+                                name = ctypes.string_at(name_ptr, 64).split(b"\x00", 1)[0]
+                            except OSError:
+                                pass
+                        obj_addr = ctypes.cast(obj, ctypes.c_void_p).value
+                        if obj_addr:
+                            _gen2_bisect_alloc_type_log[obj_addr] = (
+                                int(basicsize), name.decode("ascii", "replace"))
+                except (OSError, AttributeError, TypeError):
+                    pass
+                return obj
+            _hooked_gcnew.C_argTypes = getattr(_orig_gcnew, "C_argTypes", None)
+            _hooked_gcnew.C_resType = getattr(_orig_gcnew, "C_resType", None)
+            interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew
+
         # Disable Python's automatic gc during runFunc -- with gc
         # disabled, nothing gets promoted past gen0, so post-runFunc
         # we enumerate via gc.get_objects(0).
@@ -840,6 +902,8 @@ def main(argv):
 
 _gen2_bisect_interp = None  # set by main() before calling the bisect
 _gen2_bisect_pre_set_ids = frozenset()  # set by main() before runFunc
+_gen2_bisect_size64_log = {}  # base_addr -> stack-trace
+_gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
 _gen2_bisect_abort_set_ids = frozenset()  # set by _hooked_abort
 
 
@@ -864,6 +928,25 @@ def _gen2_bisect_after_runfunc():
     # tp_traverse to build a Python list and crashes on the bad obj
     # for the same reason gc.collect does.  Walk PyGC_Head links
     # manually (no tp_traverse) to enumerate addresses.
+    # Diagnostic: dump all unique 64-byte registrations and their
+    # ctype types -- helps identify what kinds of 64-byte buffers
+    # our interp creates.
+    interp = _gen2_bisect_interp
+    if interp is not None and hasattr(interp, "pointerStorageRanges"):
+        size64_count = 0
+        size64_types = {}
+        for _r in interp.pointerStorageRanges:
+            if isinstance(_r, tuple) and len(_r) == 2 and _r[1] == 64:
+                size64_count += 1
+                obj = interp.pointerStorage.get(_r[0])
+                if obj is not None:
+                    tname = type(obj).__name__
+                    size64_types[tname] = size64_types.get(tname, 0) + 1
+        print("[gen2-bisect] 64-byte registrations in pointerStorageRanges: %d"
+              % size64_count, file=sys.stderr)
+        for tname, cnt in sorted(size64_types.items(), key=lambda x: -x[1]):
+            print("[gen2-bisect]   ctype=%s count=%d" % (tname, cnt),
+                  file=sys.stderr)
     addrs = _walk_gen_via_pygc_head()
     print("[gen2-bisect] gen0 size (via PyGC_Head walk): %d"
           % len(addrs), file=sys.stderr, flush=True)
@@ -1049,6 +1132,105 @@ def _gen2_bisect_after_runfunc():
                           "offset=%d" % (_base, obj - _base),
                           file=sys.stderr)
                     break
+        # Is the broken dict's address (or its PyGC_Head) tracked by
+        # our interp's pointerStorage?  If yes, the interp held a
+        # pointer into host Python's heap -- and likely wrote through
+        # it, clobbering the dict's gc-list links.
+        if interp is not None and hasattr(interp, "pointerStorage"):
+            # pointerStorage is a WeakValueDictionary keyed by int addr.
+            # Check exact obj addr and head addr.
+            for _check_addr, _label in [(obj, "obj"), (head, "head"),
+                                         (head + 0, "head._gc_next"),
+                                         (head + 8, "head._gc_prev")]:
+                if _check_addr in interp.pointerStorage:
+                    print("[gen2-bisect]     pointerStorage HAS entry "
+                          "at 0x%x (%s) -- interp had a ctypes "
+                          "pointer here!"
+                          % (_check_addr, _label),
+                          file=sys.stderr)
+            # Find any pointerStorageRanges entry whose END is the
+            # broken obj's PyGC_Head start -- that's the
+            # buffer-overflow source.
+            if hasattr(interp, "pointerStorageRanges"):
+                for _r in interp.pointerStorageRanges:
+                    if isinstance(_r, tuple) and len(_r) == 2:
+                        _ra, _rs = _r
+                        # End-adjacent OR head inside the range.
+                        if _ra <= head < _ra + _rs + 16:
+                            print("[gen2-bisect]     pointerStorageRanges "
+                                  "covers head: range_base=0x%x size=%d "
+                                  "(head offset=%d)"
+                                  % (_ra, _rs, head - _ra),
+                                  file=sys.stderr)
+                            # Look up the live ctype object for this range.
+                            if hasattr(interp, "pointerStorage"):
+                                _obj = interp.pointerStorage.get(_ra)
+                                if _obj is not None:
+                                    print("[gen2-bisect]     range_base "
+                                          "0x%x -> ctype %r "
+                                          "(type=%s, size=%d via sizeof)"
+                                          % (_ra, _obj,
+                                             type(_obj).__name__,
+                                             ctypes.sizeof(_obj)
+                                             if hasattr(_obj, "_b_needsfree_")
+                                             else -1),
+                                          file=sys.stderr)
+                                    # Walk the _b_base_ chain to find
+                                    # the parent struct that contains
+                                    # this 64-byte field (if any).
+                                    _b = _obj
+                                    _depth = 0
+                                    while hasattr(_b, "_b_base_") and _b._b_base_ is not None and _depth < 8:
+                                        _b = _b._b_base_
+                                        _depth += 1
+                                        print("[gen2-bisect]     "
+                                              "_b_base_[%d] = %r "
+                                              "(type=%s, size=%d)"
+                                              % (_depth, _b,
+                                                 type(_b).__name__,
+                                                 ctypes.sizeof(_b)
+                                                 if hasattr(_b, "_b_needsfree_")
+                                                 else -1),
+                                              file=sys.stderr)
+                                    # Look up the type allocated AT
+                                    # this address via _PyObject_GC_New.
+                                    typeinfo = _gen2_bisect_alloc_type_log.get(_ra)
+                                    if typeinfo:
+                                        bs, tn = typeinfo
+                                        print("[gen2-bisect]     "
+                                              "_PyObject_GC_New for THIS "
+                                              "addr was type %r "
+                                              "tp_basicsize=%d"
+                                              % (tn, bs), file=sys.stderr)
+                                    # Look up the captured stack for
+                                    # this range's last registration.
+                                    stk = _gen2_bisect_size64_log.get(_ra)
+                                    if stk:
+                                        print("[gen2-bisect]     LAST "
+                                              "registration stack (top "
+                                              "of stack last):",
+                                              file=sys.stderr)
+                                        for f, ln, n in stk[-10:]:
+                                            print("[gen2-bisect]       "
+                                                  "%s:%d %s" % (f, ln, n),
+                                                  file=sys.stderr)
+                                    # Dump 64 bytes content of the buffer.
+                                    raw = bytes(_obj)
+                                    printable = "".join(
+                                        chr(b) if 32 <= b < 127 else "."
+                                        for b in raw)
+                                    print("[gen2-bisect]     buf bytes: %r"
+                                          % printable, file=sys.stderr)
+                                    print("[gen2-bisect]     buf hex: %s"
+                                          % raw.hex(), file=sys.stderr)
+                                else:
+                                    print("[gen2-bisect]     range_base "
+                                          "0x%x -> pointerStorage entry "
+                                          "is DEAD (weakref expired) -- "
+                                          "the overflowing buffer was "
+                                          "already deallocated"
+                                          % _ra, file=sys.stderr)
+                            break
     # Probe 1: does an explicit gc.collect() (mirroring what host
     # shutdown does) trigger the bug?  This walks the gen linked
     # list, different code path than get_referents/tp_traverse.

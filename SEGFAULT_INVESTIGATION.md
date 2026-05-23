@@ -344,11 +344,79 @@ interpreter operations -- if an exception unwinds between
 "clear my pointers" and "fix neighbors' pointers", we leave a
 half-untracked obj.
 
+## 2026-05-23 update #8: SMOKING GUN -- buffer overflow into adjacent host obj
+
+Reproducible across runs (the BROKEN obj type varies -- dict, tuple,
+etc. -- but the pattern is identical):
+
+    [gen2-bisect]   broken-link head=0x374d855f0 obj=0x374d855f0+16
+                    rc=2 type='tuple' HOST tuple: nxt invalid 0x0
+    [gen2-bisect]     pointerStorageRanges covers head:
+                      range_base=0x374d855b0 size=64 (head offset=64)
+
+The 64-byte buffer in `pointerStorageRanges` ends at byte
+`0x374d855f0`, which is EXACTLY where the broken host object's
+PyGC_Head starts.  Our 64-byte buffer's *last* offset is byte 63
+(= 0x374d855ef); byte 64 onward belongs to a different object's
+PyGC_Head.
+
+**The bug: our interp writes past the end of a 64-byte ctypes
+buffer.**  Bytes 64+ of the write overflow into the next pymalloc
+slot -- the host tuple's `_gc_next` (which gets nulled, since we
+typically write zeros past our buffer end).
+
+This matches all earlier observations:
+- `_gc_next=NULL`: it's a zero write from buffer overflow.
+- Bad obj is always HOST python obj (in pymalloc arena adjacent to
+  our buffer).
+- Bad obj has normal refcnt (it's perfectly alive -- just its
+  gc-list link was clobbered).
+- "set/dict/tuple" varies (whatever happens to neighbor our buffer
+  in pymalloc).
+- The body fields of the bad obj (when it's a set) sometimes look
+  garbage -- that's MORE bytes of our overflow going further.
+
+Old "memory aliasing" hypothesis we ruled out (Investigation #3 in
+the original "What we ruled OUT" section) was based on
+`interp._malloc` ranges -- but the leaker buffer here is in
+**pymalloc's arena**, registered via `pointerStorageRanges`, NOT
+allocated by our `_malloc`.  So the earlier ruling-out missed this
+case.
+
+## 2026-05-23 update #9: overflowing buffer is `c_byte_Array_64`
+
+Identified the ctype:
+
+    range_base 0x374e91070 -> ctype <cparser.cparser.wrapCTypeClass_c_byte_Array_64
+                                     object at 0x374ea0dd0>
+                              (type=wrapCTypeClass_c_byte_Array_64, size=64)
+
+So the overflowing buffer is a `c_byte[64]` array.  In CPython
+source there's `char msgbuf[64]` in `Objects/obmalloc.c`
+(`_PyMem_DebugCheckAddress`) but that's only used in
+PYMALLOC_DEBUG builds (not active in our runs).
+
+The actual culprit `char[64]` is elsewhere -- needs targeted
+instrumentation of `_addPointerStorageRange` to capture the
+stack at the moment a `c_byte[64]` buffer is registered.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Inspect the interp's translation of `_PyObject_GC_UnTrack`.**
+0. **Identify the C-source site declaring the 64-byte buffer.**
+   Hook `_addPointerStorageRange`: when called with `size == 64`
+   AND `ctype is wrapCTypeClass_c_byte_Array_64`, log a Python
+   stack trace (via `traceback.extract_stack()`).  After runFunc,
+   look at the registered range whose end matches the broken
+   obj's head -- the stack at registration tells us which
+   interpreted C function declares this buffer.
+
+   Once identified: audit that C function's code for an
+   off-by-one access (e.g., `buf[64]` instead of `buf[63]`),
+   a strcpy/snprintf with wrong size, or a sizeof bug.
+
+1. **Inspect the interp's translation of `_PyObject_GC_UnTrack`.**
    Find where this function is generated; check whether the four
    pointer updates run as a single atomic block or if there's an
    interleaving point.  Possibly add try/finally semantics so the
