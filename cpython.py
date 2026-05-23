@@ -407,74 +407,15 @@ def main(argv):
              "9800.  Combine with --gc-check-at for ad-hoc additional "
              "points.  May be repeated.")
     argparser.add_argument(
-        '--gc-list-diff', action='store_true',
-        help="Before running, snapshot the ``_gc_next`` field of every "
-             "PyGC_Head in Python's real gen2 GC list.  After the run "
-             "(or at each --gc-check-at point, if both are set), walk "
-             "the same entries and report any whose ``_gc_next`` was "
-             "overwritten.  This is the canonical 'find which Python "
-             "object's GC linkage got corrupted' probe.\n"
-             "\n"
-             "Background: every gc-tracked PyObject has a 16-byte "
-             "PyGC_Head immediately before its address, containing "
-             "``_gc_next`` and ``_gc_prev`` pointers.  Each generation "
-             "(gen0, gen1, gen2) is a doubly-linked circular list of "
-             "these heads.  ``gc.collect()`` walks the list via "
-             "``_gc_next``; if any link is overwritten, the walk "
-             "either segfaults (dereferencing junk) or enters a wrong "
-             "list and loops forever.  This option detects exactly "
-             "which entry's link changed and identifies the object.")
-    argparser.add_argument(
-        '--watch-write', action='append', default=[],
-        metavar="ADDR",
-        help="Hex address (eg. 0x1006f2e70) -- abort with a backtrace "
-             "the moment any interp write goes through "
-             "``_ctype_ptr_set_value`` to that exact cell address.  "
-             "Repeatable.  Combine with --gc-list-diff to first "
-             "identify the victim PyGC_Head, then re-run with "
-             "--watch-write set to that address to pinpoint the "
-             "exact interp instruction performing the write.")
-    argparser.add_argument(
-        '--watch-write-gen2-weakrefs', action='store_true',
-        help="Auto-populate --watch-write with the PyGC_Head._gc_next "
-             "address of every gen2 weakref present at startup.  Wide "
-             "net for catching the first write to any of them -- "
-             "useful when the corruption victim varies between runs.")
-    argparser.add_argument(
-        '--track-pointer-storage', action='store_true',
-        help="Replace ``interp.pointerStorage`` with a tracking "
-             "subclass that assigns a sequential ``entry_id`` to "
-             "every registration, recording (entry_id, key, value "
-             "type, registration stack).  Combined with "
-             "--gc-list-diff, the diagnostic reports the entry_id "
-             "and registration site of each corrupted weakref's "
-             "referent.  Because the registration order is "
-             "deterministic across runs, this lets us pinpoint the "
-             "creation site of the values whose KeyedRef weakrefs "
-             "get corrupted -- and re-run with "
-             "--watch-pointer-storage-id to halt at that exact "
-             "registration.")
-    argparser.add_argument(
-        '--watch-pointer-storage-id', action='append', default=[],
-        metavar="ID[,ID...]",
-        help="Comma-separated (or repeated) list of pointerStorage "
-             "entry_id values.  Print stack + full context the "
-             "moment each named id is being registered.  Requires "
-             "--track-pointer-storage.")
-    argparser.add_argument(
-        '--mprotect-at-iter', type=int, default=0, metavar="N",
-        help="(EXPERIMENTAL, **macOS BROKEN**) At iter N of "
-             "checkedFuncPtrCall, ``mprotect`` READ-ONLY the 16 KB "
-             "pages of each captured KeyedRef PyGC_Head (from "
-             "--watch-pointer-storage-id) and/or every gen2 weakref "
-             "(from --gc-list-diff).  The intent is to make any "
-             "write -- including ctypes C-level writes hidden from "
-             "Python-level hooks -- raise SIGSEGV with a Python "
-             "stack via faulthandler.  Status: BUS-errors on macOS "
-             "even on a single Python-heap page (verified with both "
-             "``mprotect`` and ``mach_vm_protect`` -- the kernel "
-             "rejects protection changes on pages allocated by "
-             "pymalloc-style ``mmap``).  May still work on Linux.")
+        '--gen2-bisect', action='store_true', default=False,
+        help="After runFunc returns, walk Python's gen2 GC list manually "
+             "via PyGC_Head pointer-chasing (avoiding gc.get_objects("
+             "generation=2) which crashes), then fork-bisect to find the "
+             "single gen2 object whose tp_traverse crashes (the smoking "
+             "gun for the shutdown-gc segfault).  Each child process "
+             "runs gc.get_referents() on a subset; the crashing subset "
+             "narrows the bad obj.  Disables gc during the bisect "
+             "harness itself so the bisect is the only walker.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -506,88 +447,6 @@ def main(argv):
         print("finished, no parse errors.")
 
     interpreter = cparser.interpreter.Interpreter()
-
-    # --track-pointer-storage: instrument every pointerStorage
-    # registration with a sequential entry_id + (key, value type,
-    # registration stack).  Lets the diagnostic identify exactly
-    # which interp values get their KeyedRef weakrefs corrupted, and
-    # supports --watch-pointer-storage-id to halt at registration.
-    # Must be done *before* register(state) -- which is the first
-    # code path that populates pointerStorage.
-    if args_ns.track_pointer_storage or args_ns.watch_pointer_storage_id:
-        import weakref as _tps_wr
-        import traceback as _tps_tb
-        _tps_watch = set()
-        for _spec in args_ns.watch_pointer_storage_id:
-            for _part in _spec.split(","):
-                _part = _part.strip()
-                if _part:
-                    _tps_watch.add(int(_part))
-        # Shared *mutable* set: the KeyedRef PyGC_Head addresses of
-        # every watched entry, captured the moment that entry is
-        # registered.  Registrations happen during runFunc (which is
-        # AFTER --watch-write set up its hook), so the watch hook
-        # must read this set dynamically -- it must not snapshot.
-        _tps_keyedref_heads = []  # legacy: list of (eid, addr, key, tname)
-        _tps_keyedref_addr_set = set()  # fast lookup for write hook
-
-        class _TrackedPointerStorage(_tps_wr.WeakValueDictionary):
-            """Drop-in replacement for ``WeakValueDictionary`` that
-            records each registration in a sequential id->info map
-            and optionally halts on specific ids."""
-            def __init__(self):
-                super().__init__()
-                # ``id(value) -> (entry_id, key_addr, type_name, stack_lines)``
-                self._reg_info = {}
-                self._reg_counter = 0
-                self._reg_watch = _tps_watch
-            def __setitem__(self, key, value):
-                self._reg_counter += 1
-                _eid = self._reg_counter
-                _tname = type(value).__name__
-                _stack_lines = None
-                _is_watched = _eid in self._reg_watch
-                if _is_watched:
-                    _stack_lines = _tps_tb.format_stack(limit=12)
-                    print("\n[track-ps] entry_id=%d registered: key=0x%x "
-                          "value=%s at id=0x%x"
-                          % (_eid, key, _tname, id(value)),
-                          file=sys.stderr, flush=True)
-                    for _ln in _stack_lines:
-                        sys.stderr.write(_ln)
-                    sys.stderr.flush()
-                self._reg_info[id(value)] = (_eid, key, _tname, _stack_lines)
-                super().__setitem__(key, value)
-                if _is_watched:
-                    # After super.__setitem__, ``self.data[key]`` is
-                    # the freshly-created ``KeyedRef`` -- the very
-                    # Python object whose ``PyGC_Head._gc_next`` we
-                    # observe getting corrupted later.  Capture its
-                    # PyGC_Head address so the write-watcher can
-                    # arm a tripwire on it.
-                    try:
-                        _kref = self.data[key]
-                        _kref_head = id(_kref) - 16
-                        _tps_keyedref_heads.append(
-                            (_eid, _kref_head, key, _tname))
-                        _tps_keyedref_addr_set.add(_kref_head)
-                        # Stamp with current checkedFuncPtrCall iter so
-                        # we can tell when registration happens vs the
-                        # known corruption iter (1343).
-                        _iter_now = getattr(
-                            interpreter.helpers.checkedFuncPtrCall,
-                            "_count", [None])
-                        _iter_val = _iter_now[0] if isinstance(_iter_now, list) else None
-                        print("[track-ps]   -> KeyedRef PyGC_Head at 0x%x "
-                              "(armed for --watch-write)  "
-                              "[at checkedFuncPtrCall iter ~%s]"
-                              % (_kref_head, _iter_val), file=sys.stderr, flush=True)
-                    except KeyError:
-                        pass
-
-        interpreter.pointerStorage = _TrackedPointerStorage()
-        print("[track-ps] installed TrackedPointerStorage (watch_ids=%s)"
-              % sorted(_tps_watch), file=sys.stderr)
 
     interpreter.register(state)
 
@@ -846,12 +705,6 @@ def main(argv):
                     print("[gc-check %d] current stack (innermost last):"
                           % n, file=sys.stderr, flush=True)
                     _gc_tb.print_stack(file=sys.stderr)
-                # If --gc-list-diff is also set, do the (safe) snapshot
-                # diff before the (potentially-crashing) gc.get_referrers
-                # call -- so we capture the corruption even if the next
-                # line segfaults.
-                if args_ns.gc_list_diff and _gc_diff_baseline is not None:
-                    _gc_list_diff_report("at %d" % n)
                 refs = _gc_mod.get_referrers(_gc_co)
                 print("[gc-check %d] ok (%d referrers)"
                       % (n, len(refs)), file=sys.stderr, flush=True)
@@ -861,469 +714,189 @@ def main(argv):
               % (_gc_interval, sorted(_gc_check_at) or "[]"),
               file=sys.stderr)
 
-    # `--gc-list-diff`: snapshot Python's real gen2 GC list before
-    # running, diff after.  See the option's help text for a full
-    # explanation of what a "PyGC_Head" is and why this is useful.
-    #
-    # Note: this walks Python's actual gc-tracked-object linked list
-    # via raw ctypes pointer reads.  It must not retain references to
-    # the objects it inspects -- doing so changes the heap state (eg.
-    # prevents otherwise-collectable objects from being GC'd) which
-    # has been observed to alter the path through the interp and hide
-    # the bug.  So we snapshot only ``(head_addr -> _gc_next_value)``
-    # and identify objects post-run by reading their PyObject_HEAD
-    # fields (refcnt, ob_type) directly.
-    _gc_diff_baseline = None
-    if args_ns.gc_list_diff:
-        import gc as _gcl_mod
-        _gcl_mod.collect()
-        _gcl_mod.collect()
-        # Snapshot gen2 by walking the linked list from a tracked
-        # anchor (a builtins type, guaranteed in gen2 by the time we
-        # get here).  At each step we read ``_gc_next`` only; we don't
-        # retain the objects (would change the heap state).
-        #
-        # Termination: cycle back to start (the normal case) OR hit an
-        # invalid pointer (NULL / unaligned).  The MAX cap is a
-        # safety net -- if we walk past it, the list is bigger than
-        # any reasonable real gen2 OR the walk crossed into another
-        # linked structure via a bad link; in either case we stop.
-        # After parsing all of cpython's C source, gen2 has ~5M
-        # objects.  Walking the full circular list is too expensive
-        # and most of those objects are irrelevant.  Filter to
-        # ``weakref.ref`` instances -- empirically the corruption
-        # observed always targets a weakref.  This narrows the
-        # snapshot to ~thousands of entries and keeps the diff
-        # signal/noise ratio high.
-        import weakref as _gcl_wr
-        _gen2 = _gcl_mod.get_objects(generation=2)
-        _gen2_size = len(_gen2)
-        # Capture (head_addr, _gc_next_value, identity-string) per
-        # weakref while the heap is still healthy.  The identity
-        # string is built from referent type + repr so we can
-        # identify post-run without dereferencing potentially-
-        # corrupt pointers.  Don't retain the weakref object itself.
-        def _gcl_u64(addr):
-            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
-        # Pre-build a set of id(v) for every value currently in our
-        # interp's pointerStorage.  Then we can tag weakrefs that
-        # refer to one of our pointerStorage entries -- these are the
-        # KeyedRef instances WeakValueDictionary creates internally.
-        _ps_value_ids = set()
-        try:
-            for _k in list(interpreter.pointerStorage):
-                _v = interpreter.pointerStorage.get(_k)
-                if _v is not None:
-                    _ps_value_ids.add(id(_v))
-                    del _v
-        except BaseException:
-            pass
-        _baseline = {}
-        _identity = {}  # head_addr -> string
-        for _o in _gen2:
-            if not isinstance(_o, _gcl_wr.ref):
-                continue
-            _head = id(_o) - 16
-            _baseline[_head] = _gcl_u64(_head)
-            try:
-                _ref = _o()
-            except BaseException:
-                _ref = None
-            if _ref is None:
-                _ident = "weakref(dead)"
-            else:
-                _tname = type(_ref).__name__
-                _in_ps = (id(_ref) in _ps_value_ids)
-                _tag = " [interp.pointerStorage value]" if _in_ps else ""
-                if isinstance(_ref, type):
-                    _ident = "weakref to type %r%s" % (_ref.__name__, _tag)
-                else:
-                    _ident = "weakref to %s instance at 0x%x%s" % (
-                        _tname, id(_ref), _tag)
-                del _ref
-            _identity[_head] = _ident
-        del _gen2, _ps_value_ids
-        print("[gc-list-diff] gen2 size at snapshot: %d, weakrefs: %d"
-              % (_gen2_size, len(_baseline)), file=sys.stderr)
-        _gc_diff_baseline = _baseline
-        _gc_diff_identity = _identity
-        _gc_diff_helpers = (_gcl_u64, interpreter)
-
-    def _gc_list_diff_report(label):
-        """Walk the snapshot, find changed _gc_next values, identify
-        the corrupted Python objects.  Resolves PyObject metadata by
-        reading raw memory -- no gc.get_objects() needed.
-        """
-        if _gc_diff_baseline is None:
-            return
-        _u64, _interp = _gc_diff_helpers
-        _changed = []
-        for _head, _before in _gc_diff_baseline.items():
-            try:
-                _after = _u64(_head)
-            except OSError:
-                _after = None
-            if _after != _before:
-                _changed.append((_head, _before, _after))
-        if not _changed:
-            print("[gc-list-diff %s] no changes detected (gen2 intact)"
-                  % label, file=sys.stderr)
-            return
-        # A change is "benign" if new _gc_next still points at a
-        # PyGC_Head we know about (one of the weakref heads we
-        # snapshotted) -- i.e., Python's gc just shuffled the order
-        # within our subgroup.  A change to an UNKNOWN address is
-        # suspicious -- our snapshot covered all weakrefs that
-        # existed pre-run, so a new value outside the set either
-        # points to a non-weakref object (legitimate cross-type
-        # neighbor) or to non-heap memory (the corruption signal).
-        _known_heads = set(_gc_diff_baseline.keys())
-        # Resolve weakref.ref type and its subclasses for ob_type
-        # compares.  ``WeakValueDictionary`` uses ``KeyedRef`` (a
-        # ``weakref.ref`` subclass), so we collect all subclass ids
-        # too -- otherwise we'd miss those entries.
-        import weakref as _wr
-        _wr_ref_types = {id(_wr.ref)}
-        for _sc in _wr.ref.__subclasses__():
-            _wr_ref_types.add(id(_sc))
-            for _ssc in _sc.__subclasses__():
-                _wr_ref_types.add(id(_ssc))
-        _ps_id = id(_interp.pointerStorage)
-        _ps_type_id = id(type(_interp.pointerStorage))
-        print("[gc-list-diff %s] %d PyGC_Head._gc_next changed:"
-              % (label, len(_changed)), file=sys.stderr)
-        for _head, _before, _after in _changed:
-            _obj = _head + 16
-            try:
-                _rc = _u64(_obj)
-                _tp = _u64(_obj + 8)
-            except OSError:
-                _rc = _tp = 0
-            _benign = (_after in _known_heads)
-            _classify = "benign-shuffle" if _benign else "UNKNOWN-target"
-            _ident = _gc_diff_identity.get(_head, "(no identity)")
-            print("[gc-list-diff %s]   PyGC_Head 0x%x  [%s]: %s"
-                  % (label, _head, _classify, _ident), file=sys.stderr)
-            print("[gc-list-diff %s]     _gc_next was 0x%x -> now 0x%x"
-                  % (label, _before, _after if _after is not None else 0),
-                  file=sys.stderr)
-            print("[gc-list-diff %s]     PyObject at 0x%x: refcnt=%d ob_type=0x%x"
-                  % (label, _obj, _rc, _tp), file=sys.stderr)
-            if _tp in _wr_ref_types:
-                # It's a weakref.  Decode the referent.
-                _ref_obj = _u64(_obj + 16)  # PyWeakReference.wr_object
-                if _ref_obj:
-                    _ref_rc = _u64(_ref_obj)
-                    _ref_tp = _u64(_ref_obj + 8)
-                    # tp_name is at offset 24 in PyTypeObject.
-                    _name_ptr = _u64(_ref_tp + 24)
-                    _name = ctypes.string_at(_name_ptr) if _name_ptr else b""
-                    print("[gc-list-diff %s]     -> weakref to instance of %r "
-                          "(refcnt=%d) at 0x%x"
-                          % (label, _name.decode("ascii", "replace"),
-                             _ref_rc, _ref_obj), file=sys.stderr)
-                    # If the referent is a type (Python real or our
-                    # interp's), also dump ITS own tp_name (the class
-                    # it represents).  Defensive: reading garbage
-                    # tp_name pointers segfaults, so guard.
-                    if _name in (b"type", b"_typeobject"):
-                        _own_name_ptr = _u64(_ref_obj + 24)
-                        # Only attempt the read if the pointer looks
-                        # plausibly like a c-string address (heap
-                        # range and aligned).
-                        _own_name = b""
-                        if (_own_name_ptr
-                                and 0x100_000_000 <= _own_name_ptr < 0x1_000_000_000):
-                            try:
-                                _own_name = ctypes.string_at(
-                                    _own_name_ptr, size=64).split(b"\x00", 1)[0]
-                            except (OSError, ValueError):
-                                _own_name = b"<unreadable>"
-                        print("[gc-list-diff %s]        referent type tp_name: %r"
-                              % (label,
-                                 _own_name.decode("ascii", "replace")),
-                              file=sys.stderr)
-                    # Is the referent inside one of our interp's
-                    # malloc'd buffers?  If yes, the weakref refers
-                    # to memory that our interp owns -- pinpoints
-                    # ctype objs we constructed via ``_malloc``.
-                    _from_mallocs = False
-                    if hasattr(_interp, "mallocs"):
-                        for _b, _bv in _interp.mallocs.items():
-                            try:
-                                _bsz = ctypes.sizeof(_bv)
-                            except (TypeError, OSError):
-                                continue
-                            if _b <= _ref_obj < _b + _bsz:
-                                _from_mallocs = True
-                                print("[gc-list-diff %s]        referent IS in "
-                                      "interp.mallocs base=0x%x size=%d offset=%d"
-                                      % (label, _b, _bsz, _ref_obj - _b),
-                                      file=sys.stderr)
-                                break
-                    if not _from_mallocs:
-                        print("[gc-list-diff %s]        referent NOT in interp.mallocs"
-                              % label, file=sys.stderr)
-                    # If we have tracked-pointerStorage metadata,
-                    # look up the registration record for this
-                    # referent.  ``_reg_info`` is keyed by
-                    # ``id(value)`` which for a Python ctype object
-                    # equals the wr_object address we just read.
-                    _reg_info = getattr(_interp.pointerStorage, "_reg_info", None)
-                    if _reg_info is not None:
-                        _info = _reg_info.get(_ref_obj)
-                        if _info is not None:
-                            _eid, _key, _tname, _stk = _info
-                            print("[gc-list-diff %s]        pointerStorage "
-                                  "entry_id=%d key=0x%x type=%s"
-                                  % (label, _eid, _key, _tname),
-                                  file=sys.stderr)
-                            if _stk:
-                                print("[gc-list-diff %s]        registration stack:"
-                                      % label, file=sys.stderr)
-                                for _ln in _stk:
-                                    sys.stderr.write(_ln)
-                        else:
-                            print("[gc-list-diff %s]        referent NOT found "
-                                  "in tracked pointerStorage._reg_info"
-                                  % label, file=sys.stderr)
-                    if _ref_obj == _ps_id:
-                        print("[gc-list-diff %s]        ** is interp.pointerStorage **"
-                              % label, file=sys.stderr)
-                    elif _ref_tp == _ps_type_id:
-                        print("[gc-list-diff %s]        (same TYPE as "
-                              "interp.pointerStorage but different INSTANCE)"
-                              % label, file=sys.stderr)
-                else:
-                    print("[gc-list-diff %s]     -> weakref with dead referent"
-                          % label, file=sys.stderr)
-
-    # --watch-write: trap any write whose target cell lands on one of
-    # the named addresses.  Targets the most common interp write path
-    # (`_ctype_ptr_set_value` from `helpers.assignPtr` -> `_storePtr`).
-    # If a match is found, print stack and re-raise -- the backtrace
-    # identifies the exact translated-C function and source line that
-    # wrote the corrupting value.
-    _watch_addrs = set()
-    for _spec in args_ns.watch_write:
-        _spec = _spec.strip()
-        if _spec:
-            _watch_addrs.add(int(_spec, 0))
-    if args_ns.watch_write_gen2_weakrefs:
-        import gc as _ww_gc
-        import weakref as _ww_wr
-        _ww_gc.collect(); _ww_gc.collect()
-        _gen2 = _ww_gc.get_objects(generation=2)
-        for _o in _gen2:
-            if isinstance(_o, _ww_wr.ref):
-                _watch_addrs.add(id(_o) - 16)
-        del _gen2
-        print("[watch-write] populated %d addresses from gen2 weakrefs"
-              % len(_watch_addrs), file=sys.stderr)
-    # If --track-pointer-storage --watch-pointer-storage-id is also
-    # active, the watch-write hook must consult the *dynamic*
-    # ``_tps_keyedref_addr_set`` -- the entries are added DURING the
-    # runFunc, not before.  Capture a reference here; the hook
-    # closure below reads it on every write.
-    try:
-        _dynamic_watch = _tps_keyedref_addr_set
-    except NameError:
-        _dynamic_watch = None
-    # Activate write-watching if either a fixed --watch-write set or
-    # a dynamic --track-pointer-storage-fed set is available.
-    if _watch_addrs or _dynamic_watch is not None:
-        import traceback as _ww_tb
-        _ctypes_addressof = ctypes.addressof
-        _ctypes_sizeof = ctypes.sizeof
-        _watch_set = frozenset(_watch_addrs)
-        # Range-overlap: the write may cover [addr, addr+sizeof(value))
-        # which can encompass a watched cell.  For the 16-byte
-        # PyGC_Head we care about, even a 1-byte write inside the
-        # 16-byte window matters.  Compute the watched 16-byte
-        # windows once and use a fast point-in-range check at each
-        # write.  (Using sorted list + bisect for O(log n) lookup.)
-        import bisect as _ww_bisect
-        _watch_starts = sorted(_watch_set)
-        _WATCH_HEAD_SIZE = 16
-
-        def _ww_overlaps(write_start, write_size):
-            # Check static --watch-write set via bisect.
-            _i = _ww_bisect.bisect_right(_watch_starts, write_start + write_size - 1)
-            if _i > 0:
-                _w = _watch_starts[_i - 1]
-                if _w + _WATCH_HEAD_SIZE > write_start:
-                    return _w
-            # Check the dynamic --track-pointer-storage-fed set.  Linear
-            # scan is fine: the set is small (number of watched
-            # entry_ids).
-            if _dynamic_watch:
-                _we = write_start + write_size
-                for _w in _dynamic_watch:
-                    if _w < _we and _w + _WATCH_HEAD_SIZE > write_start:
-                        return _w
-            return None
-
-        def _ww_report(kind, write_start, write_size, value_descr):
-            _w = _ww_overlaps(write_start, write_size)
-            if _w is None:
-                return
-            print("\n[watch-write] *** HIT *** %s overlaps watched window"
-                  " [0x%x, 0x%x): write=[0x%x, 0x%x), value=%s"
-                  % (kind, _w, _w + _WATCH_HEAD_SIZE,
-                     write_start, write_start + write_size, value_descr),
-                  file=sys.stderr, flush=True)
-            _ww_tb.print_stack(file=sys.stderr)
-
-        # Hook ``_ctype_ptr_set_value`` (writes 8 bytes at addressof(ptr)).
-        _real_set = cparser.interpreter._ctype_ptr_set_value
-        def _ww_hooked_set(ptr, addr):
-            _ww_report("_ctype_ptr_set_value",
-                       _ctypes_addressof(ptr), 8, "0x%x" % addr)
-            return _real_set(ptr, addr)
-        cparser.interpreter._ctype_ptr_set_value = _ww_hooked_set
-
-        # Hook ``Helpers.assign`` (struct copy: writes sizeof(a) bytes).
-        _real_assign = cparser.interpreter.Helpers.assign
-        def _ww_hooked_assign(self, a, b):
-            try:
-                _addr = _ctypes_addressof(a)
-                _sz = _ctypes_sizeof(a)
-            except (TypeError, ctypes.ArgumentError):
-                _addr = _sz = None
-            if _addr is not None:
-                _ww_report("Helpers.assign", _addr, _sz, repr(b)[:80])
-            return _real_assign(self, a, b)
-        cparser.interpreter.Helpers.assign = _ww_hooked_assign
-
-        print("[watch-write] watching %d cell-address window(s) of "
-              "%d bytes each" % (len(_watch_set), _WATCH_HEAD_SIZE),
-              file=sys.stderr)
-
-    # --mprotect-at-iter: at the named iter, make the page(s)
-    # containing each watched KeyedRef READ-ONLY.  Subsequent writes
-    # to those pages -- including the ctypes C-level writes our
-    # Python hooks can't see -- raise SIGSEGV; faulthandler then
-    # dumps the Python stack at the crash.
-    if args_ns.mprotect_at_iter > 0:
-        import ctypes.util as _mp_ctu
-        _mp_libc_path = _mp_ctu.find_library("c") or "libc.dylib"
-        _mp_libc = ctypes.CDLL(_mp_libc_path, use_errno=True)
-        _mp_libc.mprotect.argtypes = [
-            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-        _mp_libc.mprotect.restype = ctypes.c_int
-        _MP_PROT_READ = 1
-        _MP_PAGE_SIZE = 16384  # macOS arm64 / Linux can be 4096; 16384 covers both safely
-        _mp_count = [0]
-        _mp_armed = [False]
-        _mp_orig_call = interpreter.helpers.checkedFuncPtrCall
-
-        def _mp_wrapped(f, *args):
-            _mp_count[0] += 1
-            if _mp_count[0] == args_ns.mprotect_at_iter and not _mp_armed[0]:
-                _mp_armed[0] = True
-                _pages = set()
-                _addrs = []
-                # Source 1: --watch-pointer-storage-id captured KeyedRef
-                # addresses (may be empty if entry_ids register AFTER
-                # the corruption iter; that turned out to be the case
-                # for the known cpython.py bug, where the supposed
-                # KeyedRef entries are slot-collision misidentifications
-                # of pre-existing real Python weakrefs).
-                try:
-                    for _eid, _kh, _key, _tname in _tps_keyedref_heads:
-                        _addrs.append(("kref_id=%d" % _eid, _kh))
-                except NameError:
-                    pass
-                # Source 2: --gc-list-diff captured gen2 weakref
-                # PyGC_Head addresses BEFORE runFunc.  These are the
-                # actual victims in cpython.py's bug -- real Python
-                # weakrefs that pre-exist our pointerStorage activity.
-                try:
-                    for _h in _gc_diff_baseline:
-                        _addrs.append(("gen2_weakref", _h))
-                except NameError:
-                    pass
-                if not _addrs:
-                    print("[mprotect] WARN: no addresses to protect "
-                          "(need --watch-pointer-storage-id or "
-                          "--gc-list-diff).", file=sys.stderr)
-                else:
-                    # Pre-compute unique pages WITHOUT calling mprotect.
-                    for _tag, _addr in _addrs:
-                        _pages.add(_addr & ~(_MP_PAGE_SIZE - 1))
-                    print("[mprotect] would protect %d unique pages "
-                          "covering %d addresses; about to mprotect..."
-                          % (len(_pages), len(_addrs)),
-                          file=sys.stderr, flush=True)
-                    # Sort pages so the run-order is reproducible.
-                    _pages_sorted = sorted(_pages)
-                    # Now actually mprotect.  ANY further write to
-                    # these pages -- including writes done by the
-                    # tail of THIS function (eg. ``print``-related
-                    # heap activity that happens to allocate on a
-                    # protected page) -- will BUS-error.  So we keep
-                    # the rest of this branch minimal: no prints, no
-                    # allocations.  Page-list is logged BEFORE.
-                    _ok = 0
-                    _fail = 0
-                    for _page in _pages_sorted:
-                        _rc = _mp_libc.mprotect(
-                            _page, _MP_PAGE_SIZE, _MP_PROT_READ)
-                        if _rc != 0:
-                            _fail += 1
-                        else:
-                            _ok += 1
-                    # Stash counts on the function object so we can
-                    # log later if we survive.
-                    _mp_wrapped._ok = _ok
-                    _mp_wrapped._fail = _fail
-            return _mp_orig_call(f, *args)
-        # Expose the iter counter so other code (TrackedPointerStorage's
-        # registration logger) can report "at iter ~N" stamps.
-        _mp_wrapped._count = _mp_count
-        interpreter.helpers.checkedFuncPtrCall = _mp_wrapped
-        print("[mprotect] hook installed; will arm at iter %d "
-              "(KeyedRef pages captured by --watch-pointer-storage-id "
-              "during runFunc)" % args_ns.mprotect_at_iter,
-              file=sys.stderr)
 
     # Marker for lldb: under ``PYCPYTHON_LLDB_TRAP=1``, raise SIGTRAP
-    # right here -- *after* gc-list-diff baseline / tracked
-    # pointerStorage state is built, *before* the interp's iter loop
-    # starts.  Ideal point to attach lldb watchpoints on PyGC_Head
-    # addresses we want to catch writes to.  Combine with lldb's
+    # right here -- *before* the interp's iter loop starts.  Ideal
+    # point to attach lldb watchpoints.  Combine with lldb's
     # ``settings set target.disable-aslr true`` so the addresses
     # observed in one run carry over to the next.
     if os.environ.get("PYCPYTHON_LLDB_TRAP"):
-        # Optionally dump the captured gc-list-diff baseline addresses
-        # to a file so lldb can read them and set watchpoints on the
-        # same PyGC_Head's that will be corrupted later.
-        _lldb_addrs_path = os.environ.get(
-            "PYCPYTHON_LLDB_ADDRS_FILE", "/tmp/pycpython_lldb_addrs.txt")
-        try:
-            _base = _gc_diff_baseline
-        except NameError:
-            _base = None
-        if _base:
-            with open(_lldb_addrs_path, "w") as _f:
-                for _h in _base:
-                    _f.write("0x%x\n" % _h)
-            print("[lldb-trap] wrote %d baseline weakref addresses to %s"
-                  % (len(_base), _lldb_addrs_path),
-                  file=sys.stderr, flush=True)
         import signal as _sig_lldb
         print("[lldb-trap] PID=%d, raising SIGTRAP -- lldb should now "
               "stop here; set watchpoints and 'continue'."
               % os.getpid(), file=sys.stderr, flush=True)
         os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
+    if args_ns.gen2_bisect:
+        # Disable Python's automatic gc during runFunc -- otherwise the
+        # bug fires before runFunc returns and we never reach the
+        # bisect harness.  With gc disabled, nothing gets promoted past
+        # gen0, so post-runFunc we enumerate via gc.get_objects(0).
+        import gc as _gc_pre
+        _gc_pre.disable()
+        print("[gen2-bisect] gc.disable() before runFunc", file=sys.stderr)
+
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
+    interpreter.runFunc(*args)
+
+    if args_ns.gen2_bisect:
+        _gen2_bisect_after_runfunc()
+
+
+def _gen2_bisect_after_runfunc():
+    """Walk Python's gen2 GC list manually and fork-bisect to find the
+    object whose `tp_traverse` crashes during gc.collect.
+
+    The shutdown segfault happens inside `deduce_unreachable` walking
+    gen2 -- a single bad object's `tp_traverse` follows a stale pointer
+    into freed memory.  We can't use `gc.get_objects(generation=2)` to
+    enumerate gen2 (it crashes for the same reason).  Instead we walk
+    the doubly-linked PyGC_Head list directly via raw ctypes reads.
+
+    Then we fork(): each child calls `gc.get_referents(obj)` on a
+    subset of gen2.  ``get_referents`` invokes ``tp_traverse`` on each
+    given object without walking the gen list itself, so a crash
+    indicates the SET contains the bad obj.  Binary-search narrows
+    down which one.
+    """
+    import gc as _gc
+    # gc was disabled BEFORE runFunc -- everything stayed in gen0,
+    # nothing was promoted.  So gc.get_objects(0) returns the full
+    # set, including the corrupted object.
+    all_objs = _gc.get_objects(generation=0)
+    print("[gen2-bisect] gen0 size (gc was disabled during runFunc): %d"
+          % len(all_objs), file=sys.stderr, flush=True)
+    if not all_objs:
+        return
+    # Quick sanity: does the whole-set traverse crash?  If not, the bug
+    # is in the gen-list walk machinery, not any single object.
+    crashed = _fork_traverse_subset(all_objs, 0, len(all_objs))
+    if not crashed:
+        print("[gen2-bisect] FULL set did NOT crash in get_referents."
+              " Bug is likely in gen-list-walk machinery, not in any"
+              " single object's tp_traverse.", file=sys.stderr)
+        return
+    print("[gen2-bisect] FULL set crashes -- bisecting...",
+          file=sys.stderr, flush=True)
+    idx = _bisect_traverse(all_objs)
+    if idx is None:
+        print("[gen2-bisect] bisect failed to narrow down", file=sys.stderr)
+        return
+    bad = all_objs[idx]
+    print("[gen2-bisect] *** BAD OBJ: idx=%d addr=0x%x type=%s ***"
+          % (idx, id(bad), type(bad).__name__),
+          file=sys.stderr, flush=True)
+    _dump_pygc_head_forensics(id(bad))
+
+
+def _fork_traverse_subset(all_objs, lo, hi):
+    """Fork a child that calls gc.get_referents() on every object in
+    ``all_objs[lo:hi]``.  Return True iff the child died abnormally
+    (segfault / signal).
+
+    Uses os.fork() so the child inherits the heap state exactly.
+    """
+    import gc as _gc
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        # Child.
+        os.close(r)
+        try:
+            for i in range(lo, hi):
+                _gc.get_referents(all_objs[i])
+            os.write(w, b"OK")
+            os._exit(0)
+        except BaseException as e:
+            try:
+                os.write(w, ("EX:%s" % type(e).__name__).encode())
+            except OSError:
+                pass
+            os._exit(2)
+    # Parent.
+    os.close(w)
+    _pid, status = os.waitpid(pid, 0)
     try:
-        interpreter.runFunc(*args)
-    finally:
-        if _gc_diff_baseline is not None:
-            _gc_list_diff_report("final")
+        msg = os.read(r, 64)
+    except OSError:
+        msg = b""
+    os.close(r)
+    # Crashed = signal death (WIFSIGNALED) or non-zero exit not from
+    # a clean exception path.  Any abnormal termination counts.
+    if os.WIFSIGNALED(status):
+        return True
+    if os.WEXITSTATUS(status) == 0 and msg == b"OK":
+        return False
+    # Exception in child -- not a memory crash but still a failure
+    # mode worth reporting.
+    print("[gen2-bisect] child non-segv failure: status=%d msg=%r"
+          % (status, msg), file=sys.stderr)
+    return False
+
+
+def _bisect_traverse(all_objs):
+    """Binary-search the bad obj index by halving and fork-testing.
+    Returns the offending index in ``all_objs``, or None if narrowing
+    failed.
+    """
+    lo, hi = 0, len(all_objs)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        print("[gen2-bisect] testing left [%d:%d] (%d items)..."
+              % (lo, mid, mid - lo), file=sys.stderr, flush=True)
+        if _fork_traverse_subset(all_objs, lo, mid):
+            hi = mid
+            continue
+        print("[gen2-bisect] testing right [%d:%d] (%d items)..."
+              % (mid, hi, hi - mid), file=sys.stderr, flush=True)
+        if _fork_traverse_subset(all_objs, mid, hi):
+            lo = mid
+            continue
+        print("[gen2-bisect] neither half crashes at lo=%d hi=%d mid=%d"
+              % (lo, hi, mid), file=sys.stderr)
+        return None
+    if hi - lo == 1:
+        return lo
+    return None
+
+
+def _dump_pygc_head_forensics(obj_addr):
+    """Dump PyGC_Head + PyObject_HEAD + tp_name for forensic logging."""
+    def u64(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    head = obj_addr - 16
+    _next = u64(head)
+    _prev = u64(head + 8)
+    rc = u64(obj_addr)
+    tp = u64(obj_addr + 8)
+    name_ptr = u64(tp + 24) if tp else 0
+    name = b""
+    if 0x100_000_000 <= name_ptr < 0x10_000_000_000:
+        name = ctypes.string_at(name_ptr, 64).split(b"\x00", 1)[0]
+    print("[gen2-bisect]   PyGC_Head 0x%x: _gc_next=0x%x _gc_prev=0x%x"
+          % (head, _next, _prev), file=sys.stderr)
+    print("[gen2-bisect]   PyObject  0x%x: refcnt=%d ob_type=0x%x tp_name=%r"
+          % (obj_addr, rc, tp, name.decode("ascii", "replace")),
+          file=sys.stderr)
+    # Try repr() under a fork — repr might also crash.
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            o = ctypes.cast(obj_addr, ctypes.py_object).value
+            s = repr(o)[:200]
+            os.write(w, s.encode("utf-8", "replace"))
+        except BaseException as e:
+            os.write(w, ("EX:%s:%s" % (type(e).__name__, e)).encode())
+        os._exit(0)
+    os.close(w)
+    os.waitpid(pid, 0)
+    msg = os.read(r, 512)
+    os.close(r)
+    print("[gen2-bisect]   repr(obj) -> %s"
+          % msg.decode("utf-8", "replace"), file=sys.stderr)
 
 
 if __name__ == '__main__':
