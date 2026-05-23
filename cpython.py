@@ -829,42 +829,79 @@ def main(argv):
         global _gen2_bisect_alloc_type_log
         _gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
 
-        # Populate _func_cache via getFunc, then hook.
-        try:
-            _orig_gcnew = interpreter.getFunc("_PyObject_GC_New")
-        except (KeyError, AttributeError):
-            _orig_gcnew = None
-        if _orig_gcnew is not None:
-            def _hooked_gcnew(tp_ptr, *a):
-                obj = _orig_gcnew(tp_ptr, *a)
-                # tp_ptr is a ctypes pointer to PyTypeObject.  Read
-                # tp_basicsize at offset (sizeof(PyVarObject)) = 32
-                # bytes from struct start.  PyTypeObject layout:
-                # PyObject_VAR_HEAD (32) + tp_name (8) + tp_basicsize
-                # ... so basicsize is at offset 40.
-                try:
-                    tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
-                    if tp_addr:
-                        basicsize = ctypes.cast(
-                            tp_addr + 40, ctypes.POINTER(ctypes.c_ssize_t))[0]
-                        name_ptr = ctypes.cast(
-                            tp_addr + 24, ctypes.POINTER(ctypes.c_void_p))[0]
-                        name = b""
-                        if name_ptr:
-                            try:
-                                name = ctypes.string_at(name_ptr, 64).split(b"\x00", 1)[0]
-                            except OSError:
-                                pass
-                        obj_addr = ctypes.cast(obj, ctypes.c_void_p).value
-                        if obj_addr:
-                            _gen2_bisect_alloc_type_log[obj_addr] = (
-                                int(basicsize), name.decode("ascii", "replace"))
-                except (OSError, AttributeError, TypeError):
-                    pass
-                return obj
-            _hooked_gcnew.C_argTypes = getattr(_orig_gcnew, "C_argTypes", None)
-            _hooked_gcnew.C_resType = getattr(_orig_gcnew, "C_resType", None)
-            interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew
+        # Wrap _PyObject_GC_New using the same pattern as --instrument.
+        _orig_gcnew = interpreter.getFunc("_PyObject_GC_New")
+
+        _gcnew_call_counter = [0]
+        def _hooked_gcnew(*args):
+            _gcnew_call_counter[0] += 1
+            r = _orig_gcnew(*args)
+            # args[0] is the type pointer; r is the returned obj.
+            # Use the most defensive ctypes access, no try/except --
+            # let mistakes surface loudly.
+            tp_ptr = args[0]
+            tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
+            obj_addr = ctypes.cast(r, ctypes.c_void_p).value
+            if tp_addr and obj_addr:
+                # tp_basicsize is at offset 32 (after ob_refcnt, ob_type,
+                # ob_size = 3*8=24, then tp_name = 8, so basicsize @ 32).
+                # Actually in CPython 3.7 PyTypeObject:
+                #   ob_refcnt(8) ob_type(8) ob_size(8) tp_name(8) tp_basicsize(8)
+                # offsets 0,8,16,24,32 -- so basicsize at offset 32.
+                basicsize = ctypes.cast(
+                    tp_addr + 32,
+                    ctypes.POINTER(ctypes.c_ssize_t))[0]
+                name_ptr = ctypes.cast(
+                    tp_addr + 24,
+                    ctypes.POINTER(ctypes.c_void_p))[0]
+                name = b""
+                if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
+                    name = ctypes.string_at(
+                        name_ptr, 64).split(b"\x00", 1)[0]
+                _gen2_bisect_alloc_type_log[obj_addr] = (
+                    int(basicsize),
+                    name.decode("ascii", "replace"))
+            return r
+        _hooked_gcnew.C_argTypes = _orig_gcnew.C_argTypes
+        _hooked_gcnew.C_resType = _orig_gcnew.C_resType
+        _hooked_gcnew.C_cFunc = getattr(_orig_gcnew, "C_cFunc", None)
+        interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew
+
+        # Also hook _PyObject_GC_NewVar so we cover variable-size objs.
+        _orig_gcnewvar = interpreter.getFunc("_PyObject_GC_NewVar")
+
+        def _hooked_gcnewvar(*args):
+            r = _orig_gcnewvar(*args)
+            tp_ptr = args[0]
+            # args[1] is nitems (Py_ssize_t = c_long in our interp).
+            # Read .value defensively.
+            nitems = int(args[1].value) if hasattr(args[1], "value") else int(args[1])
+            tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
+            obj_addr = ctypes.cast(r, ctypes.c_void_p).value
+            if tp_addr and obj_addr:
+                basicsize = ctypes.cast(
+                    tp_addr + 32,
+                    ctypes.POINTER(ctypes.c_ssize_t))[0]
+                itemsize = ctypes.cast(
+                    tp_addr + 40,
+                    ctypes.POINTER(ctypes.c_ssize_t))[0]
+                name_ptr = ctypes.cast(
+                    tp_addr + 24,
+                    ctypes.POINTER(ctypes.c_void_p))[0]
+                name = b""
+                if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
+                    name = ctypes.string_at(
+                        name_ptr, 64).split(b"\x00", 1)[0]
+                total = int(basicsize) + int(itemsize) * nitems
+                _gen2_bisect_alloc_type_log[obj_addr] = (
+                    total,
+                    "%s[var,nitems=%d]"
+                    % (name.decode("ascii", "replace"), nitems))
+            return r
+        _hooked_gcnewvar.C_argTypes = _orig_gcnewvar.C_argTypes
+        _hooked_gcnewvar.C_resType = _orig_gcnewvar.C_resType
+        _hooked_gcnewvar.C_cFunc = getattr(_orig_gcnewvar, "C_cFunc", None)
+        interpreter._func_cache["_PyObject_GC_NewVar"] = _hooked_gcnewvar
 
         # Disable Python's automatic gc during runFunc -- with gc
         # disabled, nothing gets promoted past gen0, so post-runFunc
@@ -947,6 +984,8 @@ def _gen2_bisect_after_runfunc():
         for tname, cnt in sorted(size64_types.items(), key=lambda x: -x[1]):
             print("[gen2-bisect]   ctype=%s count=%d" % (tname, cnt),
                   file=sys.stderr)
+    print("[gen2-bisect] alloc-type-log entries: %d"
+          % len(_gen2_bisect_alloc_type_log), file=sys.stderr)
     addrs = _walk_gen_via_pygc_head()
     print("[gen2-bisect] gen0 size (via PyGC_Head walk): %d"
           % len(addrs), file=sys.stderr, flush=True)
@@ -1194,14 +1233,33 @@ def _gen2_bisect_after_runfunc():
                                               file=sys.stderr)
                                     # Look up the type allocated AT
                                     # this address via _PyObject_GC_New.
-                                    typeinfo = _gen2_bisect_alloc_type_log.get(_ra)
-                                    if typeinfo:
-                                        bs, tn = typeinfo
-                                        print("[gen2-bisect]     "
-                                              "_PyObject_GC_New for THIS "
-                                              "addr was type %r "
-                                              "tp_basicsize=%d"
-                                              % (tn, bs), file=sys.stderr)
+                                    # _PyObject_GC_New returns obj
+                                    # AFTER PyGC_Head, so obj_addr =
+                                    # range_base + sizeof(PyGC_Head).
+                                    # In CPython 3.7, PyGC_Head is 24
+                                    # bytes (3 pointers).  Try a few
+                                    # plausible offsets.
+                                    typeinfo = None
+                                    for _off in (0, 16, 24, 32):
+                                        ti = _gen2_bisect_alloc_type_log.get(_ra + _off)
+                                        if ti is not None:
+                                            typeinfo = ti
+                                            print("[gen2-bisect]     "
+                                                  "_PyObject_GC_New "
+                                                  "match at range_base"
+                                                  "+%d: type %r "
+                                                  "tp_basicsize=%d"
+                                                  % (_off, ti[1], ti[0]),
+                                                  file=sys.stderr)
+                                            break
+                                    if typeinfo is None:
+                                        print("[gen2-bisect]     no "
+                                              "_PyObject_GC_New record "
+                                              "for this address (or "
+                                              "any +0/+16/+24/+32 offset). "
+                                              "Buffer allocated via "
+                                              "different path.",
+                                              file=sys.stderr)
                                     # Look up the captured stack for
                                     # this range's last registration.
                                     stk = _gen2_bisect_size64_log.get(_ra)
@@ -1214,6 +1272,37 @@ def _gen2_bisect_after_runfunc():
                                             print("[gen2-bisect]       "
                                                   "%s:%d %s" % (f, ln, n),
                                                   file=sys.stderr)
+                                    # Dump the bytes spanning the
+                                    # buffer end into the broken obj's
+                                    # PyGC_Head -- the corruption site.
+                                    # Read 32 bytes starting from byte
+                                    # 48 of the buf (covers buf[48..63]
+                                    # = im_self + im_weakreflist AND
+                                    # the broken obj's _gc_next/_gc_prev
+                                    # at offset 64..80).
+                                    span_start = _ra + 48
+                                    span = ctypes.string_at(span_start, 32)
+                                    print("[gen2-bisect]     span bytes "
+                                          "[buf+48 .. buf+80) = "
+                                          "buf_tail | next_obj_head: %s"
+                                          % span.hex(),
+                                          file=sys.stderr)
+                                    # Decode as 4 uint64s.
+                                    import struct
+                                    vals = struct.unpack("<4Q", span)
+                                    print("[gen2-bisect]       buf[48..55] "
+                                          "(im_self?) = 0x%x" % vals[0],
+                                          file=sys.stderr)
+                                    print("[gen2-bisect]       buf[56..63] "
+                                          "(im_weakreflist?) = 0x%x" % vals[1],
+                                          file=sys.stderr)
+                                    print("[gen2-bisect]       buf[64..71] "
+                                          "= next_obj._gc_next = 0x%x  "
+                                          "*** EXPECTED NON-ZERO ***" % vals[2],
+                                          file=sys.stderr)
+                                    print("[gen2-bisect]       buf[72..79] "
+                                          "= next_obj._gc_prev = 0x%x"
+                                          % vals[3], file=sys.stderr)
                                     # Dump 64 bytes content of the buffer.
                                     raw = bytes(_obj)
                                     printable = "".join(

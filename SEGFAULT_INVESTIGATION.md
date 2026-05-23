@@ -400,21 +400,118 @@ The actual culprit `char[64]` is elsewhere -- needs targeted
 instrumentation of `_addPointerStorageRange` to capture the
 stack at the moment a `c_byte[64]` buffer is registered.
 
+## 2026-05-23 update #10: it's a PyMethodObject backing buffer
+
+By hooking `_PyObject_GC_New(tp)` and recording
+`(returned_obj_addr -> (tp_basicsize, tp_name))`, the broken
+buffer's type is identified as:
+
+    range_base 0x... -> wrapCTypeClass_c_byte_Array_64
+    _PyObject_GC_New match at range_base+24: type 'method'
+                       tp_basicsize=40
+
+So the buffer is the storage for a Python **`method`** object
+(PyMethodObject -- a bound method, e.g.
+`obj.some_method`).  Sizes:
+- PyMethodObject basicsize = 16 (PyObject_HEAD) + 8+8+8 = **40 bytes** ✓
+- CPython 3.7 PyGC_Head = 24 bytes
+- Total alloc = 24 + 40 = **64 bytes** ✓
+
+So the sizes are CORRECT.  The bug is not a `tp_basicsize`
+mismatch.  Some write inside the method-handling C code writes
+**past byte 63** of the 64-byte buffer, clobbering the next pymalloc
+slot's first 8 bytes (= the adjacent host obj's `_gc_next`).
+
+Buffer hex dump (typical run):
+
+    [0..7]    gc_next = 0  (interp marked this method as untracked)
+    [8..15]   gc_prev = <some addr>
+    [16..23]  gc_refs = -4 (_PyGC_REFS_UNTRACKED)
+    [24..31]  ob_refcnt = 0  (DEAD object, on freelist)
+    [32..39]  ob_type = <ptr>
+    [40..47]  im_func = <ptr>
+    [48..55]  im_self = <ptr to freelist next?>
+    [56..63]  im_weakreflist = 0
+
+This method object has been deallocated (refcnt=0, gc_refs=untracked).
+CPython 3.7 keeps a free-list of up to 256 deallocated method
+objects, using `im->im_self` as the next-link.  So the buffer is
+"alive" via interp.mallocs but the method inside is dead/free-listed.
+
+The leak pattern: when the method was deallocated,
+`_PyObject_GC_UNTRACK(im)` ran.  Likely cause -- our interp's
+expansion of `_PyObject_GC_UNTRACK` writes more than 64 bytes when
+modifying neighbor pointers in the interp's gen list.  Specifically,
+the macro updates `prev->gc_next` and `next->gc_prev` to skip the
+unlinked obj.  If `next` (the interp obj's neighbor in the interp's
+gen list) is *literally another obj at this same buffer's tail
+region*, that write hits memory past our 64-byte buf.
+
+## 2026-05-23 update #11: continuous 24-byte zero-fill at buffer boundary
+
+Spanning bytes dump at `[buf+48 .. buf+80)`:
+
+    buf[48..55] (im_self?)        = 0x0
+    buf[56..63] (im_weakreflist?) = 0x0
+    buf[64..71] = next_obj._gc_next = 0x0  *** BUG ***
+    buf[72..79] = next_obj._gc_prev = 0x15c762830
+
+So 24 consecutive bytes (`buf+48` through `buf+71`) are all zero,
+*spanning the buffer boundary at byte 64*.  This pattern is
+consistent with a single `memset(p, 0, 24)` call where `p = buf+48`.
+
+Two candidates produce a 24-byte zero-write starting at offset 48
+of a PyMethodObject:
+
+A) **`memset(&im->im_self, 0, sizeof(PyGC_Head))`** -- if some code
+   confuses PyMethodObject offsets and zeros what it thinks is the
+   PyGC_Head (size 24 = 3×ptr) starting at the wrong field offset.
+
+B) Three independent `field = NULL` assignments: `im->im_self = 0`,
+   `im->im_weakreflist = 0`, AND a write to the next obj's
+   `_gc_next = 0`.  The first two ARE NORMAL during method_dealloc
+   when freelist'd with NULL self.  The third one is the bug.
+
+But there's a more subtle option:
+
+C) The `_PyObject_GC_UNTRACK` macro does
+   `g->gc.gc_prev->gc.gc_next = g->gc.gc_next` -- if `gc_prev` is
+   wrong (e.g., points to `range_base + 56`), this writes
+   `g->gc.gc_next` (a possibly-zero value) into
+   `(range_base+56) + sizeof(...) - offset_of(gc_next)`.  Plausible
+   with off-by-N pointer arithmetic.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Identify the C-source site declaring the 64-byte buffer.**
-   Hook `_addPointerStorageRange`: when called with `size == 64`
-   AND `ctype is wrapCTypeClass_c_byte_Array_64`, log a Python
-   stack trace (via `traceback.extract_stack()`).  After runFunc,
-   look at the registered range whose end matches the broken
-   obj's head -- the stack at registration tells us which
-   interpreted C function declares this buffer.
+0. **Watch byte `range_base+64` for writes via lldb hardware
+   watchpoint.**  We have `PYCPYTHON_LLDB_TRAP=1` to break at a
+   known point; from there, set a watchpoint on the byte that gets
+   nulled, and `continue`.  The next write IS the bug -- backtrace
+   identifies the offending line.
 
-   Once identified: audit that C function's code for an
-   off-by-one access (e.g., `buf[64]` instead of `buf[63]`),
-   a strcpy/snprintf with wrong size, or a sizeof bug.
+1. **Check what's actually written at `range_base+64`.**
+   At the moment we detect the broken-link, also dump bytes
+   `[range_base+56..range_base+72)` -- shows the tail of our buf
+   PLUS the start of the next obj.  If the next obj's `_gc_next`
+   is overwritten with the address of our PyMethodObject buf's
+   PyGC_Head, that confirms the macro misdirected the write.
+
+1. **Audit interp expansion of `_PyObject_GC_UNTRACK`.**
+   The macro updates three fields atomically in C; in our interp,
+   each is a separate statement.  Specifically:
+
+       g->gc.gc_prev->gc.gc_next = g->gc.gc_next;
+       g->gc.gc_next->gc.gc_prev = g->gc.gc_prev;
+       g->gc.gc_next = NULL;
+
+   The first two statements dereference `g->gc.gc_prev` and
+   `g->gc.gc_next` -- if those pointers are wrong (stale or
+   corrupt) at the moment of macro expansion, the writes land in
+   the wrong place.  Check whether our interp's untrack path
+   leaves intermediate state visible to other code that could
+   corrupt these pointers.
 
 1. **Inspect the interp's translation of `_PyObject_GC_UnTrack`.**
    Find where this function is generated; check whether the four
