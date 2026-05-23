@@ -440,6 +440,27 @@ def main(argv):
              "address of every gen2 weakref present at startup.  Wide "
              "net for catching the first write to any of them -- "
              "useful when the corruption victim varies between runs.")
+    argparser.add_argument(
+        '--track-pointer-storage', action='store_true',
+        help="Replace ``interp.pointerStorage`` with a tracking "
+             "subclass that assigns a sequential ``entry_id`` to "
+             "every registration, recording (entry_id, key, value "
+             "type, registration stack).  Combined with "
+             "--gc-list-diff, the diagnostic reports the entry_id "
+             "and registration site of each corrupted weakref's "
+             "referent.  Because the registration order is "
+             "deterministic across runs, this lets us pinpoint the "
+             "creation site of the values whose KeyedRef weakrefs "
+             "get corrupted -- and re-run with "
+             "--watch-pointer-storage-id to halt at that exact "
+             "registration.")
+    argparser.add_argument(
+        '--watch-pointer-storage-id', action='append', default=[],
+        metavar="ID[,ID...]",
+        help="Comma-separated (or repeated) list of pointerStorage "
+             "entry_id values.  Print stack + full context the "
+             "moment each named id is being registered.  Requires "
+             "--track-pointer-storage.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -471,6 +492,81 @@ def main(argv):
         print("finished, no parse errors.")
 
     interpreter = cparser.interpreter.Interpreter()
+
+    # --track-pointer-storage: instrument every pointerStorage
+    # registration with a sequential entry_id + (key, value type,
+    # registration stack).  Lets the diagnostic identify exactly
+    # which interp values get their KeyedRef weakrefs corrupted, and
+    # supports --watch-pointer-storage-id to halt at registration.
+    # Must be done *before* register(state) -- which is the first
+    # code path that populates pointerStorage.
+    if args_ns.track_pointer_storage or args_ns.watch_pointer_storage_id:
+        import weakref as _tps_wr
+        import traceback as _tps_tb
+        _tps_watch = set()
+        for _spec in args_ns.watch_pointer_storage_id:
+            for _part in _spec.split(","):
+                _part = _part.strip()
+                if _part:
+                    _tps_watch.add(int(_part))
+        # Shared *mutable* set: the KeyedRef PyGC_Head addresses of
+        # every watched entry, captured the moment that entry is
+        # registered.  Registrations happen during runFunc (which is
+        # AFTER --watch-write set up its hook), so the watch hook
+        # must read this set dynamically -- it must not snapshot.
+        _tps_keyedref_heads = []  # legacy: list of (eid, addr, key, tname)
+        _tps_keyedref_addr_set = set()  # fast lookup for write hook
+
+        class _TrackedPointerStorage(_tps_wr.WeakValueDictionary):
+            """Drop-in replacement for ``WeakValueDictionary`` that
+            records each registration in a sequential id->info map
+            and optionally halts on specific ids."""
+            def __init__(self):
+                super().__init__()
+                # ``id(value) -> (entry_id, key_addr, type_name, stack_lines)``
+                self._reg_info = {}
+                self._reg_counter = 0
+                self._reg_watch = _tps_watch
+            def __setitem__(self, key, value):
+                self._reg_counter += 1
+                _eid = self._reg_counter
+                _tname = type(value).__name__
+                _stack_lines = None
+                _is_watched = _eid in self._reg_watch
+                if _is_watched:
+                    _stack_lines = _tps_tb.format_stack(limit=12)
+                    print("\n[track-ps] entry_id=%d registered: key=0x%x "
+                          "value=%s at id=0x%x"
+                          % (_eid, key, _tname, id(value)),
+                          file=sys.stderr, flush=True)
+                    for _ln in _stack_lines:
+                        sys.stderr.write(_ln)
+                    sys.stderr.flush()
+                self._reg_info[id(value)] = (_eid, key, _tname, _stack_lines)
+                super().__setitem__(key, value)
+                if _is_watched:
+                    # After super.__setitem__, ``self.data[key]`` is
+                    # the freshly-created ``KeyedRef`` -- the very
+                    # Python object whose ``PyGC_Head._gc_next`` we
+                    # observe getting corrupted later.  Capture its
+                    # PyGC_Head address so the write-watcher can
+                    # arm a tripwire on it.
+                    try:
+                        _kref = self.data[key]
+                        _kref_head = id(_kref) - 16
+                        _tps_keyedref_heads.append(
+                            (_eid, _kref_head, key, _tname))
+                        _tps_keyedref_addr_set.add(_kref_head)
+                        print("[track-ps]   -> KeyedRef PyGC_Head at 0x%x "
+                              "(armed for --watch-write)"
+                              % _kref_head, file=sys.stderr, flush=True)
+                    except KeyError:
+                        pass
+
+        interpreter.pointerStorage = _TrackedPointerStorage()
+        print("[track-ps] installed TrackedPointerStorage (watch_ids=%s)"
+              % sorted(_tps_watch), file=sys.stderr)
+
     interpreter.register(state)
 
     # Py_GetPrefix/ExecPrefix/Path/PythonHome/ProgramFullPath are defined in
@@ -946,6 +1042,29 @@ def main(argv):
                     if not _from_mallocs:
                         print("[gc-list-diff %s]        referent NOT in interp.mallocs"
                               % label, file=sys.stderr)
+                    # If we have tracked-pointerStorage metadata,
+                    # look up the registration record for this
+                    # referent.  ``_reg_info`` is keyed by
+                    # ``id(value)`` which for a Python ctype object
+                    # equals the wr_object address we just read.
+                    _reg_info = getattr(_interp.pointerStorage, "_reg_info", None)
+                    if _reg_info is not None:
+                        _info = _reg_info.get(_ref_obj)
+                        if _info is not None:
+                            _eid, _key, _tname, _stk = _info
+                            print("[gc-list-diff %s]        pointerStorage "
+                                  "entry_id=%d key=0x%x type=%s"
+                                  % (label, _eid, _key, _tname),
+                                  file=sys.stderr)
+                            if _stk:
+                                print("[gc-list-diff %s]        registration stack:"
+                                      % label, file=sys.stderr)
+                                for _ln in _stk:
+                                    sys.stderr.write(_ln)
+                        else:
+                            print("[gc-list-diff %s]        referent NOT found "
+                                  "in tracked pointerStorage._reg_info"
+                                  % label, file=sys.stderr)
                     if _ref_obj == _ps_id:
                         print("[gc-list-diff %s]        ** is interp.pointerStorage **"
                               % label, file=sys.stderr)
@@ -979,7 +1098,18 @@ def main(argv):
         del _gen2
         print("[watch-write] populated %d addresses from gen2 weakrefs"
               % len(_watch_addrs), file=sys.stderr)
-    if _watch_addrs:
+    # If --track-pointer-storage --watch-pointer-storage-id is also
+    # active, the watch-write hook must consult the *dynamic*
+    # ``_tps_keyedref_addr_set`` -- the entries are added DURING the
+    # runFunc, not before.  Capture a reference here; the hook
+    # closure below reads it on every write.
+    try:
+        _dynamic_watch = _tps_keyedref_addr_set
+    except NameError:
+        _dynamic_watch = None
+    # Activate write-watching if either a fixed --watch-write set or
+    # a dynamic --track-pointer-storage-fed set is available.
+    if _watch_addrs or _dynamic_watch is not None:
         import traceback as _ww_tb
         _ctypes_addressof = ctypes.addressof
         _ctypes_sizeof = ctypes.sizeof
@@ -995,13 +1125,20 @@ def main(argv):
         _WATCH_HEAD_SIZE = 16
 
         def _ww_overlaps(write_start, write_size):
-            # Find the watched-window with the largest start ``<= write_start + write_size``.
+            # Check static --watch-write set via bisect.
             _i = _ww_bisect.bisect_right(_watch_starts, write_start + write_size - 1)
-            if _i == 0:
-                return None
-            _w = _watch_starts[_i - 1]
-            if _w + _WATCH_HEAD_SIZE > write_start:
-                return _w
+            if _i > 0:
+                _w = _watch_starts[_i - 1]
+                if _w + _WATCH_HEAD_SIZE > write_start:
+                    return _w
+            # Check the dynamic --track-pointer-storage-fed set.  Linear
+            # scan is fine: the set is small (number of watched
+            # entry_ids).
+            if _dynamic_watch:
+                _we = write_start + write_size
+                for _w in _dynamic_watch:
+                    if _w < _we and _w + _WATCH_HEAD_SIZE > write_start:
+                        return _w
             return None
 
         def _ww_report(kind, write_start, write_size, value_descr):
