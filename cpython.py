@@ -472,6 +472,19 @@ def main(argv):
              "9800.  Combine with --gc-check-at for ad-hoc additional "
              "points.  May be repeated.")
     argparser.add_argument(
+        '--invariant-check-interval', type=int, default=0, metavar="N",
+        help="Every N checkedFuncPtrCall iterations, walk the host gen0 "
+             "list via PyGC_Head and check the doubly-linked invariant. "
+             "First detection of a break is the iter when corruption "
+             "happens.  N=0 (default) disables.")
+    argparser.add_argument(
+        '--invariant-check-window', type=str, default="0:0",
+        metavar="START:END",
+        help="Only run --invariant-check between these iter counts "
+             "(inclusive).  Skip the expensive gen0-walk outside this "
+             "window.  Use to focus on a narrow range once you have an "
+             "approximate iter band.  Default 0:0 = no window limit.")
+    argparser.add_argument(
         '--quiet-crash', action='store_true', default=False,
         help="On fatal signals (SIGSEGV/SIGBUS/SIGABRT), dump the "
              "Python traceback and then exit cleanly via _exit() -- "
@@ -803,6 +816,107 @@ def main(argv):
               % os.getpid(), file=sys.stderr, flush=True)
         os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
+    if args_ns.invariant_check_interval > 0:
+        _inv_interval = args_ns.invariant_check_interval
+        _inv_win_start, _inv_win_end = (
+            int(x) for x in args_ns.invariant_check_window.split(":"))
+        _inv_count = [0]
+        _inv_detected = [False]
+        _inv_orig_call = interpreter.helpers.checkedFuncPtrCall
+        HEAD_SIZE = 16
+        PTR_MASK = ~0xF
+
+        def _u64_inv(addr):
+            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
+
+        def _inv_scan(n):
+            """Walk gen0 forward, return first broken-link addr or None."""
+            anchor = []
+            head = id(anchor) - HEAD_SIZE
+            seen = {head}
+            cur = _u64_inv(head) & PTR_MASK
+            visited = 0
+            MAX = 50_000_000
+            for _ in range(MAX):
+                if cur == 0 or (cur & 0x7) or cur in seen:
+                    break
+                seen.add(cur)
+                visited += 1
+                nxt = _u64_inv(cur) & PTR_MASK
+                if nxt == 0:
+                    return (cur, visited)
+                cur = nxt
+            return (None, visited)
+
+        # Ring buffer of the last K (iter, fn_ptr_addr) tuples.  Names
+        # are resolved lazily at dump time -- the per-call hot path
+        # just stores the address.
+        _inv_recent = []
+        _INV_RECENT_MAX = 50
+
+        def _resolve_fname_lazy(fn_addr):
+            for cand_name, cand_fn in interpreter._func_cache.items():
+                cf = getattr(cand_fn, "C_cFunc", None)
+                if cf is None:
+                    continue
+                try:
+                    cf_addr = ctypes.cast(cf, ctypes.c_void_p).value
+                except (TypeError, ctypes.ArgumentError):
+                    continue
+                if cf_addr == fn_addr:
+                    return cand_name
+            return "fn@0x%x" % fn_addr
+
+        def _inv_wrapped(f, *args):
+            _inv_count[0] += 1
+            n = _inv_count[0]
+            # Cheap address grab; resolve to name only on dump.
+            try:
+                addr = ctypes.cast(f, ctypes.c_void_p).value
+            except (TypeError, ctypes.ArgumentError):
+                addr = id(f)
+            _inv_recent.append((n, addr))
+            if len(_inv_recent) > _INV_RECENT_MAX:
+                del _inv_recent[0]
+            in_window = (_inv_win_end == 0) or (_inv_win_start <= n <= _inv_win_end)
+            if (not _inv_detected[0]) and in_window and n % _inv_interval == 0:
+                broken_head, visited = _inv_scan(n)
+                if broken_head is not None:
+                    tp = _u64_inv(broken_head + HEAD_SIZE + 8)
+                    nm = b""
+                    if tp:
+                        npr = _u64_inv(tp + 24)
+                        if 0x100_000_000 <= npr < 0x10_000_000_000:
+                            nm = ctypes.string_at(
+                                npr, 64).split(b"\x00", 1)[0]
+                    print("[inv-check iter=%d] FIRST BROKEN-LINK detected: "
+                          "head=0x%x type=%r (visited=%d)"
+                          % (n, broken_head,
+                             nm.decode("ascii", "replace"), visited),
+                          file=sys.stderr, flush=True)
+                    # Dump the recent fn-ptr call names.
+                    print("[inv-check] last %d fn-ptr calls leading up "
+                          "to corruption (names lazily resolved):"
+                          % len(_inv_recent), file=sys.stderr)
+                    # Pre-build addr -> name map for unique addrs.
+                    unique_addrs = set(a for _, a in _inv_recent)
+                    name_map = {a: _resolve_fname_lazy(a) for a in unique_addrs}
+                    for ni, addr in _inv_recent:
+                        print("[inv-check]   iter=%d fn=%s" % (ni, name_map[addr]),
+                              file=sys.stderr)
+                    # Dump the Python stack at this exact moment -- the
+                    # interp operation that finalized the corruption.
+                    import traceback as _t
+                    _t.print_stack(file=sys.stderr)
+                    _inv_detected[0] = True
+                else:
+                    print("[inv-check iter=%d] clean (visited=%d)"
+                          % (n, visited), file=sys.stderr, flush=True)
+            return _inv_orig_call(f, *args)
+        interpreter.helpers.checkedFuncPtrCall = _inv_wrapped
+        print("[inv-check] hooked checkedFuncPtrCall, interval=%d"
+              % _inv_interval, file=sys.stderr)
+
     if args_ns.gen2_bisect:
         # Hook _addPointerStorageRange to log a stack for every
         # 64-byte c_byte_Array_64 registration -- after the bisect
@@ -902,6 +1016,61 @@ def main(argv):
         _hooked_gcnewvar.C_resType = _orig_gcnewvar.C_resType
         _hooked_gcnewvar.C_cFunc = getattr(_orig_gcnewvar, "C_cFunc", None)
         interpreter._func_cache["_PyObject_GC_NewVar"] = _hooked_gcnewvar
+
+        # Hook interp._abort -- runs an invariant check there to
+        # determine whether the broken-link exists BEFORE the
+        # CAbortException propagates (= bug occurred during normal
+        # runFunc) or AFTER (= bug occurred during exception unwind).
+        # The check is lightweight: walk gen0 forward via PyGC_Head
+        # and return True iff we find a node with _gc_next != 0 but
+        # next._gc_prev != this (the doubly-linked invariant break).
+        _orig_abort_for_check = interpreter._abort
+
+        def _quick_invariant_check(label):
+            HEAD_SIZE = 16
+            PTR_MASK = ~0xF
+            def u64(addr):
+                return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
+            anchor = []
+            head = id(anchor) - HEAD_SIZE
+            seen = {head}
+            cur = u64(head) & PTR_MASK
+            broken = 0
+            visited = 0
+            MAX = 50_000_000
+            for _ in range(MAX):
+                if cur == 0 or (cur & 0x7) or cur in seen:
+                    break
+                seen.add(cur)
+                visited += 1
+                nxt = u64(cur) & PTR_MASK
+                if nxt == 0:
+                    broken += 1
+                    if broken <= 3:
+                        # Log the type for diagnostic.
+                        tp = u64(cur + HEAD_SIZE + 8)
+                        nm = b""
+                        if tp:
+                            npr = u64(tp + 24)
+                            if 0x100_000_000 <= npr < 0x10_000_000_000:
+                                nm = ctypes.string_at(
+                                    npr, 64).split(b"\x00", 1)[0]
+                        print("[invariant-check %s] BROKEN head=0x%x "
+                              "type=%r (nxt is NULL)"
+                              % (label, cur,
+                                 nm.decode("ascii", "replace")),
+                              file=sys.stderr)
+                    cur = 0  # can't follow NULL
+                    break
+                cur = nxt
+            print("[invariant-check %s] visited=%d broken=%d"
+                  % (label, visited, broken), file=sys.stderr, flush=True)
+            return broken
+
+        def _hooked_abort_for_check():
+            _quick_invariant_check("at _abort entry")
+            return _orig_abort_for_check()
+        interpreter._abort = _hooked_abort_for_check
 
         # Disable Python's automatic gc during runFunc -- with gc
         # disabled, nothing gets promoted past gen0, so post-runFunc

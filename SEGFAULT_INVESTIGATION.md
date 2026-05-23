@@ -481,11 +481,86 @@ C) The `_PyObject_GC_UNTRACK` macro does
    `(range_base+56) + sizeof(...) - offset_of(gc_next)`.  Plausible
    with off-by-N pointer arithmetic.
 
+## 2026-05-24 update #12: pinpointed iter range and call stack
+
+Added `--invariant-check-interval N` and `--invariant-check-window
+START:END` flags.  Run with `--gen2-bisect --invariant-check-interval
+50 --invariant-check-window 54000:54500`:
+
+    [inv-check iter=54000] clean (visited=15061454)
+    [inv-check iter=54350] clean (visited=15141068)
+    [inv-check iter=54400] FIRST BROKEN-LINK detected: head=0x37164ec70
+                           type='dict' (visited=14913838)
+
+**Corruption happens between iter 54000 and 54400** -- a 400-iter
+window.  (The bug is timing-sensitive; the exact iter varies per
+run within this band, but never outside (54000, 55000].)
+
+The Python stack at first detection (iter=55000 in another run):
+
+    interpreter.runFunc (Py_Main)
+      pymain_main
+        pymain_init
+          _Py_InitializeCore
+            _Py_InitializeCore_impl
+              initimport (line 31)            ← _thread import fails
+                PyErr_Print
+                  PyErr_PrintEx (line 34)     ← calls sys.excepthook
+                    _PyObject_FastCallDict
+                      _PyCFunction_FastCallDict
+                        _PyMethodDef_RawFastCallDict (line 130)
+                          [checkedFuncPtrCall]
+                            sys_excepthook (line 10)
+                              PyErr_Display (line 38)
+                                print_exception_recursive (line 153)
+                                  print_exception (line 20)
+                                    PyTraceBack_Print     ← here
+
+So the corruption is during **PyTraceBack_Print** -- printing the
+ImportError traceback for missing `_thread` module.  Code path is in
+`Python/traceback.c`.  Look for any 64-byte buffer write or any C
+function that takes a `PyMethodObject*` and writes near offset 40+.
+
+## 2026-05-24 update #13: Heisenbug behaviour + diagnostics tradeoff
+
+Refining `--invariant-check-interval` below ~50 starts perturbing
+timing enough that the bug no longer fires deterministically within
+the same iter window.  This is a true Heisenbug -- the corruption
+depends on memory layout / allocation order, and adding bookkeeping
+shifts those.
+
+The reliable observed window is **(54000, 55000]** (out of total
+~55K interp iters during initimport's PyTraceBack_Print).
+
+Diagnostic added but with limited resolving power on this timing-
+sensitive bug: ring-buffer of last 50 `checkedFuncPtrCall` invocations
+with lazy name resolution from `_func_cache.C_cFunc` addresses.
+Most function pointers don't have entries in `_func_cache` (they are
+inline-dispatched), so most names resolve to `fn@0x...`.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Watch byte `range_base+64` for writes via lldb hardware
+0. **Use lldb hardware watchpoints (not Python instrumentation).**
+   lldb watchpoints don't perturb the program -- they trap on CPU
+   memory-access exceptions.  Procedure:
+   1. Set `PYCPYTHON_LLDB_TRAP=1` env var.
+   2. Run under lldb -- breaks at SIGTRAP after pre-runFunc setup.
+   3. From lldb, find a registered `c_byte_Array_64` buffer:
+      `expr -- (uintptr_t)((PyObject*)interpreter.pointerStorage)`
+      then iterate.  Or easier: scan host pymalloc arenas for
+      64-byte slots adjacent to gc-tracked objects.
+   4. Set `watchpoint set expression -- buf+64`.
+   5. `continue` -- when triggered, lldb gives the exact C+Python
+      stack of the offending write.
+
+1. **Look at `PyTraceBack_Print` source.**
+   Audit `Python/traceback.c`: any `char[]` buffers, any
+   `memcpy`/`memset` calls, any `PyObject_GetAttr`-result handling
+   that could be miscalculating offsets.  The corruption fires here.
+
+1. **Watch byte `range_base+64` for writes via lldb hardware
    watchpoint.**  We have `PYCPYTHON_LLDB_TRAP=1` to break at a
    known point; from there, set a watchpoint on the byte that gets
    nulled, and `continue`.  The next write IS the bug -- backtrace
