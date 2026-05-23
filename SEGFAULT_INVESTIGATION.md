@@ -267,23 +267,46 @@ Implications:
   `dict.keys() -> set`, `set comprehension`s, exception cycle
   tracking, `typing` module internals.
 
+## 2026-05-23 update #5: bad set is created DURING runFunc, not pre-existing
+
+Pre-runFunc snapshot: 103 host sets exist (bootstrap state).
+Post-runFunc gen0: 43,871 host sets in gen0 (~43,768 new ones).
+The leaker is NOT in the pre-snapshot -- created during runFunc.
+
+The leaker is at **idx=8 in the gen0 walk** (LIFO order from anchor),
+meaning only ~8 allocations happened between its tracking and the
+end of runFunc.  So it was tracked at the very END of runFunc --
+likely during exception unwinding when CAbortException propagated.
+
+Its memory address does NOT overlap any `interp.mallocs` buffer --
+the garbage body fields come from pymalloc's freelist residue, not
+from our interp's data.
+
+Neighbors in the gen0 list (idx 3..13): tuple, getset_descriptor x2,
+weakref.ReferenceType, list, **SET (BAD)**, py_object, Attribute,
+dict, Name, dict.  AST nodes + ctypes py_object near the leaker --
+suggests interp activity involving ctypes objects and ast was running
+when the leak happened.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Track host-set creation with `gc.callbacks`.**  Install a
-   `gc.callbacks` post-collect callback that snapshots
-   `id(s) for s in gc.get_objects(0) if isinstance(s, set)`.  After
-   runFunc, run the body-invariant sweep, find the leaker's address,
-   look up which snapshot first contained it -- that gives the rough
-   creation window.
+0. **Hook host-set allocation via gen0-walk-on-each-`checkedFuncPtrCall`.**
+   Even though gc.callbacks don't fire when gc is disabled, we can
+   manually walk gen0 via PyGC_Head at every K-th interp iter (or
+   only during the last M iters) and snapshot host-set IDs.  Compare
+   snapshots to find when the leaker's address first appears.  Walk
+   only the FIRST ~50 entries from anchor (recently-allocated) -- the
+   bad set is always at idx<10, so we don't need to scan all 15M.
 
-1. **Check if leaker address overlaps `interp.mallocs`.**
-   In the gen2-bisect forensics: compute `for base, buf in
-   interpreter.mallocs.items(): base <= bad_addr < base + sizeof(buf)`.
-   If overlap, the leaker's body data is whatever we last wrote to
-   that buffer -- explains the garbage body fields and points to
-   exactly where pymalloc and our `_malloc` collide.
+1. **Wrap exception-propagation paths in our interp.**
+   Since the leaker is created at the very end of runFunc (during
+   CAbortException unwind), instrument the path through Python's
+   exception/traceback C code.  Specifically: hook
+   `PyErr_Print`, `print_exception`, `_PyTraceBack_FromFrame`,
+   `_PyObject_GC_New` w/ refcounting -- one of these creates the
+   leaker.
 
 2. **Wrap `set_init` (not `make_new_set`) plus `_PyObject_GC_UnTrack`.**
    Pair-track: every set passing through `set_init` should also pass

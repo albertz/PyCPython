@@ -808,9 +808,52 @@ def main(argv):
         # disabled, nothing gets promoted past gen0, so post-runFunc
         # we enumerate via gc.get_objects(0).
         import gc as _gc_pre
+        # Snapshot host-set IDs BEFORE disabling gc, so post-runFunc we
+        # can tell which sets were created during runFunc itself.
+        _gc_pre.collect()
+        global _gen2_bisect_pre_set_ids
+        _gen2_bisect_pre_set_ids = frozenset(
+            id(s) for s in _gc_pre.get_objects()
+            if type(s) is set
+        )
+        print("[gen2-bisect] pre-runFunc host-set count: %d"
+              % len(_gen2_bisect_pre_set_ids), file=sys.stderr)
         _gc_pre.disable()
         print("[gen2-bisect] gc.disable() before runFunc",
               file=sys.stderr)
+        # Hook our interp's _abort so we can snapshot host-set IDs at
+        # the exact moment CAbortException is raised.  After runFunc
+        # we compare this snapshot to the final state -- any new set
+        # in the diff was created during exception unwinding.
+        _orig_abort = interpreter._abort
+        global _gen2_bisect_abort_set_ids
+        def _hooked_abort(*a, **kw):
+            global _gen2_bisect_abort_set_ids
+            # Walk gen0 via PyGC_Head, capture all host-set IDs.
+            # Don't use gc.get_objects (allocates a list, perturbs heap).
+            HEAD_SIZE = 16
+            PTR_MASK = ~0xF
+            host_set_id = id(set)
+            def _u64(addr):
+                return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
+            tmp_anchor = []
+            head = id(tmp_anchor) - HEAD_SIZE
+            seen = {head}
+            ids = set()
+            cur = _u64(head) & PTR_MASK
+            while cur and not (cur & 0x7) and cur not in seen:
+                seen.add(cur)
+                obj = cur + HEAD_SIZE
+                if _u64(obj + 8) == host_set_id:
+                    ids.add(obj)
+                cur = _u64(cur) & PTR_MASK
+            _gen2_bisect_abort_set_ids = frozenset(ids)
+            print("[gen2-bisect/abort-hook] captured %d host-set IDs "
+                  "at the moment of CAbortException"
+                  % len(_gen2_bisect_abort_set_ids),
+                  file=sys.stderr, flush=True)
+            return _orig_abort(*a, **kw)
+        interpreter._abort = _hooked_abort
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
@@ -824,6 +867,8 @@ def main(argv):
 
 
 _gen2_bisect_interp = None  # set by main() before calling the bisect
+_gen2_bisect_pre_set_ids = frozenset()  # set by main() before runFunc
+_gen2_bisect_abort_set_ids = frozenset()  # set by _hooked_abort
 
 
 def _gen2_bisect_after_runfunc():
@@ -867,22 +912,28 @@ def _gen2_bisect_after_runfunc():
     # minus 1, mask >= PySet_MINSIZE-1=7.  table is either the
     # smalltable inside the object (very common) or an external buffer.
     weird_sets = []
+    # Real PySetObject invariants (Python 3.13):
+    #   mask is power-of-2 minus 1, >= 7 (PySet_MINSIZE-1 = 7)
+    #   0 <= used <= fill <= mask
+    #   table points to either &smalltable (offset +64) or an external
+    #     buffer; the external buffer is well-defined memory
+    # For our broken set we expect: huge mask (not power-of-2 - 1),
+    # huge fill/used, table in bizarre range.
+    _POW2_MINUS_1 = {(1 << k) - 1 for k in range(3, 31)}
     for sa in set_addrs:
         rc = _u64sc(sa)
         fill = _u64sc(sa + 16)
         used = _u64sc(sa + 24)
         mask = _u64sc(sa + 32)
         table = _u64sc(sa + 40)
-        # smalltable starts at offset 64 (after fill/used/mask/table/hash/finger
-        # = 6*8 = 48 bytes -> offset 16+48=64).
         smalltable = sa + 64
-        ok = (
-            rc > 0
-            and used <= (mask + 1) if mask < (1 << 30) else False
-            and mask in (7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095,
-                         8191, 16383, 32767, 65535)
+        mask_ok = mask in _POW2_MINUS_1
+        sizes_ok = (used <= fill <= mask) if mask_ok else False
+        table_ok = (
+            table == smalltable
+            or 0x100_000_000 <= table < 0x10_000_000_000
         )
-        if not ok:
+        if not (mask_ok and sizes_ok and table_ok):
             weird_sets.append((sa, rc, fill, used, mask, table, smalltable))
     print("[gen2-bisect] sets with broken body invariants: %d"
           % len(weird_sets), file=sys.stderr)
@@ -988,6 +1039,21 @@ def _gen2_bisect_after_runfunc():
     else:
         print("[gen2-bisect]   bad set address NOT in any interp.mallocs "
               "buffer (so the garbage body isn't our interp's data)",
+              file=sys.stderr)
+    # Was this set created BEFORE runFunc (pre-existing host machinery)
+    # or DURING runFunc (created by interp activity)?
+    if bad_addr_val in _gen2_bisect_pre_set_ids:
+        print("[gen2-bisect]   bad set existed BEFORE runFunc -- it's a "
+              "pre-existing host set whose body got clobbered during runFunc",
+              file=sys.stderr)
+    elif bad_addr_val in _gen2_bisect_abort_set_ids:
+        print("[gen2-bisect]   bad set existed at moment of CAbortException "
+              "(before exception unwind) -- created during normal runFunc "
+              "execution, NOT during unwind",
+              file=sys.stderr)
+    else:
+        print("[gen2-bisect]   bad set was created DURING EXCEPTION UNWIND "
+              "(not in pre-runFunc set, not in abort-time set)",
               file=sys.stderr)
     # Is the bad set's ob_type the HOST `set` type (= same as `id(set)`)?
     # If yes: this is a HOST python set, leaked by something our interp
