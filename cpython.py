@@ -295,6 +295,71 @@ def init_faulthandler(sigusr1_chain=False):
             faulthandler.register(signal.SIGUSR1, all_threads=True, chain=sigusr1_chain)
 
 
+def install_quiet_crash_handlers():
+    """Install C-level SIGSEGV/SIGBUS/SIGABRT handlers that dump a
+    Python traceback and then call ``_exit()`` -- bypassing the
+    macOS CrashReporter dialog that normally pops up when a process
+    dies from an unhandled fatal signal.
+
+    Mechanism: macOS's ``ReportCrash`` only fires when a process is
+    terminated by an unhandled signal.  If we install our own
+    handler that calls ``_exit()``, the OS sees a clean exit and no
+    dialog appears.
+
+    We still want the Python traceback for debugging, so the handler
+    calls ``faulthandler.dump_traceback()`` first (designed to be
+    safe from signal context).
+
+    Why a ctypes-based C-level handler (not ``signal.signal()``):
+    Python-level handlers run deferred (the C-level signal handler
+    in CPython just sets a flag, the Python handler runs on the
+    next bytecode dispatch).  For a SIGSEGV in C code, the
+    instruction will re-fault on return from the signal frame, so
+    a Python handler never runs.  A C-level handler that calls
+    ``_exit()`` (async-signal-safe) does not return, breaking the
+    refault loop.
+    """
+    import ctypes
+    import ctypes.util
+    libc_path = ctypes.util.find_library("c") or "libc.dylib"
+    libc = ctypes.CDLL(libc_path, use_errno=False)
+    libc._exit.argtypes = [ctypes.c_int]
+    libc._exit.restype = None
+    libc.write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
+    libc.write.restype = ctypes.c_ssize_t
+    HANDLER_T = ctypes.CFUNCTYPE(None, ctypes.c_int)
+    libc.signal.argtypes = [ctypes.c_int, HANDLER_T]
+    libc.signal.restype = ctypes.c_void_p
+    # Pull faulthandler.dump_traceback for signal-safe Python-stack dumping.
+    import faulthandler
+    _dump = faulthandler.dump_traceback
+    _stderr_fd = 2
+    _msg_prefix = b"\n[quiet-crash] fatal signal "
+    _msg_suffix = b" -- dumping traceback then exiting silently\n"
+
+    def _handler(signum):
+        # Best-effort write of a banner -- async-signal-safe.
+        libc.write(_stderr_fd, _msg_prefix, len(_msg_prefix))
+        # Stringifying the signum involves no allocations large enough
+        # to be unsafe; the digit chars are computed inline.
+        s = str(signum).encode("ascii")
+        libc.write(_stderr_fd, s, len(s))
+        libc.write(_stderr_fd, _msg_suffix, len(_msg_suffix))
+        # faulthandler.dump_traceback is documented as safe to call
+        # from a signal handler (it's the same primitive faulthandler's
+        # own SIGSEGV handler uses internally).
+        _dump(file=sys.stderr, all_threads=True)
+        # Clean exit -- 128+signum is the conventional code.
+        libc._exit(128 + signum)
+
+    # Keep references to prevent ctypes-callback objects from being GC'd.
+    install_quiet_crash_handlers._c_handler = HANDLER_T(_handler)
+    install_quiet_crash_handlers._libc = libc
+    import signal
+    for sig in (signal.SIGSEGV, signal.SIGBUS, signal.SIGABRT):
+        libc.signal(sig, install_quiet_crash_handlers._c_handler)
+
+
 def register_sigusr1_print_backtrace():
     if os.name == "nt":
         return
@@ -407,6 +472,13 @@ def main(argv):
              "9800.  Combine with --gc-check-at for ad-hoc additional "
              "points.  May be repeated.")
     argparser.add_argument(
+        '--quiet-crash', action='store_true', default=False,
+        help="On fatal signals (SIGSEGV/SIGBUS/SIGABRT), dump the "
+             "Python traceback and then exit cleanly via _exit() -- "
+             "so the macOS CrashReporter dialog does NOT pop up.  "
+             "Useful for unattended debug runs; off by default to "
+             "preserve normal crash-reporting in production usage.")
+    argparser.add_argument(
         '--gen2-bisect', action='store_true', default=False,
         help="After runFunc returns, walk Python's gen2 GC list manually "
              "via PyGC_Head pointer-chasing (avoiding gc.get_objects("
@@ -421,6 +493,10 @@ def main(argv):
     if args_ns.report_extended_tracebacks:
         register_sigusr1_print_backtrace()
     init_faulthandler(sigusr1_chain=args_ns.report_extended_tracebacks)
+    if args_ns.quiet_crash:
+        # Install AFTER faulthandler.enable -- our handler replaces
+        # faulthandler's SIGSEGV/SIGBUS/SIGABRT slots.  Order matters.
+        install_quiet_crash_handlers()
 
     if args_ns.watchdog_timeout > 0 or args_ns.watchdog_memory > 0 or args_ns.watchdog_report_traceback_interval is not None:
         import threading
@@ -733,7 +809,8 @@ def main(argv):
         # we enumerate via gc.get_objects(0).
         import gc as _gc_pre
         _gc_pre.disable()
-        print("[gen2-bisect] gc.disable() before runFunc", file=sys.stderr)
+        print("[gen2-bisect] gc.disable() before runFunc",
+              file=sys.stderr)
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
@@ -927,9 +1004,13 @@ def _fork_traverse_subset(all_objs, lo, hi):
     except OSError:
         msg = b""
     os.close(r)
-    # Crashed = signal death (WIFSIGNALED) or non-zero exit not from
-    # a clean exception path.  Any abnormal termination counts.
+    # Crashed = signal death (WIFSIGNALED) -- OR -- exit code 139
+    # (128+SIGSEGV), which is what our --quiet-crash handler uses
+    # when it intercepts a SIGSEGV in the child and calls _exit().
+    # Also 134 (128+SIGABRT) and 138 (128+SIGBUS) for completeness.
     if os.WIFSIGNALED(status):
+        return True
+    if os.WEXITSTATUS(status) in (134, 138, 139):
         return True
     if os.WEXITSTATUS(status) == 0 and msg == b"OK":
         return False
