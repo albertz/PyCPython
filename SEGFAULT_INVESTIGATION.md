@@ -133,9 +133,82 @@ Suspects:
   manually break a `_objects` chain or `_b_base_` link, those become
   walking traps.
 
+## 2026-05-23 update: gen2-bisect run reveals a SECOND crash site
+
+Adding `--gen2-bisect` (which does `gc.disable()` before `runFunc`)
+revealed a previously-masked crash:
+
+    Fatal Python error: Segmentation fault
+      File ".../ctypes/__init__.py", line 531 in cast
+      File "<PyCParser_PyObject_ClearWeakRefs>", line 11
+      File "<PyCParser_meth_dealloc>", line 30
+      File "<PyCParser__Py_Dealloc>", line 4
+      File "<PyCParser_PyFile_WriteObject>", line 59
+      ...
+      File "<PyCParser_PyErr_Print>", line 3
+      File "<PyCParser_initimport>", line 31
+
+So while printing the `_thread`-missing ImportError traceback
+during `initimport`, the deallocation of a C method object trips
+`PyObject_ClearWeakRefs`.  This is a **weakref-list walk** crash --
+the method object's `tp_weaklistoffset`-rooted list contains a
+dangling pointer.
+
+This is consistent with the gen2 gc crash being the same bug
+class (gc walks objects whose weakref data points into freed memory).
+
+## 2026-05-23 update #2: --gen2-bisect identifies the bad object
+
+Added `--gen2-bisect` (in `cpython.py`).  Disables host gc before
+`runFunc`, walks the gen0 list via raw PyGC_Head pointer-chases after
+runFunc (which raises `CAbortException`), forks subsets to
+`gc.get_referents()` and binary-searches the offender.
+
+**Result (deterministic across runs):**
+
+- Walk finds ~15 million tracked objects in gen0.
+- Exactly **one** has `refcnt=0`: a `set` whose body fields are
+  garbage (`fill=15151544`, `mask=0x1ffffff`, `table=0x642000000`).
+- Its `_gc_prev = 0x0` (broken gc-list back-pointer).
+- It's always at idx=1 of our walk -- the entry immediately after
+  our anchor `[]` via `_gc_next`.
+
+**Sentinel theory ruled out.**  The initial "always idx=1" position
+was an artifact of the walker's filter `rc > 0` -- it skipped the
+refcnt=0 entry until we removed that filter.  Without the filter, the
+bad set appears at idx=8 (varies, NOT adjacent to anchor).  So this is
+a REAL set object, not the sentinel head.
+
+**The bug, concretely:**
+
+A Python `set` object reaches `refcnt=0` without ever being
+deallocated/untracked.  pymalloc later reuses the slot, clobbering the
+body data.  The gc-list still has a `PyGC_Head` entry pointing at this
+freed-but-not-untracked slot.  Any subsequent gc walk
+(`gc.collect`, `gc.get_objects(2)`, `tp_traverse`) dereferences this
+stale entry's body and crashes.
+
+In a normal gc-enabled run, the crash surfaces as
+`deduce_unreachable + 56` during shutdown gc.  In our `--gen2-bisect`
+mode it surfaces as `gc.get_referents()` crashing on this single
+specific set.
+
+**The hunt is now well-defined:** find the path in our interp where a
+Python `set`'s refcount gets decremented to 0 without invoking
+set_dealloc (which would have called `_PyObject_GC_UnTrack`).
+
+Candidates:
+- `cparser.sortedcontainers.SortedSet` internals (uses `set` as backing)
+- `pointerStorage = WeakValueDictionary()` -- internal weakset?
+- `pointerStorageRanges = SortedSet()` -- when entries get evicted
+- A raw `ctypes` refcount manipulation in `_storePtr` / `_free`
+
 ## Suggested next investigation steps
 
 In order of probable yield:
+
+0. **Disambiguate the bad-set finding** (sentinel head vs real bug).
+   See update #2 above.
 
 1. **Find the bad obj in gen2 by partition.**
    Subprocess-based bisect: after `runFunc` returns (or natural error),

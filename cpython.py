@@ -728,20 +728,20 @@ def main(argv):
         os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
     if args_ns.gen2_bisect:
-        # Disable Python's automatic gc during runFunc -- otherwise the
-        # bug fires before runFunc returns and we never reach the
-        # bisect harness.  With gc disabled, nothing gets promoted past
-        # gen0, so post-runFunc we enumerate via gc.get_objects(0).
+        # Disable Python's automatic gc during runFunc -- with gc
+        # disabled, nothing gets promoted past gen0, so post-runFunc
+        # we enumerate via gc.get_objects(0).
         import gc as _gc_pre
         _gc_pre.disable()
         print("[gen2-bisect] gc.disable() before runFunc", file=sys.stderr)
 
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
-    interpreter.runFunc(*args)
-
-    if args_ns.gen2_bisect:
-        _gen2_bisect_after_runfunc()
+    try:
+        interpreter.runFunc(*args)
+    finally:
+        if args_ns.gen2_bisect:
+            _gen2_bisect_after_runfunc()
 
 
 def _gen2_bisect_after_runfunc():
@@ -761,11 +761,66 @@ def _gen2_bisect_after_runfunc():
     down which one.
     """
     import gc as _gc
-    # gc was disabled BEFORE runFunc -- everything stayed in gen0,
-    # nothing was promoted.  So gc.get_objects(0) returns the full
-    # set, including the corrupted object.
-    all_objs = _gc.get_objects(generation=0)
-    print("[gen2-bisect] gen0 size (gc was disabled during runFunc): %d"
+    # We cannot use ``gc.get_objects(0)`` -- it walks gen0 via
+    # tp_traverse to build a Python list and crashes on the bad obj
+    # for the same reason gc.collect does.  Walk PyGC_Head links
+    # manually (no tp_traverse) to enumerate addresses.
+    addrs = _walk_gen_via_pygc_head()
+    print("[gen2-bisect] gen0 size (via PyGC_Head walk): %d"
+          % len(addrs), file=sys.stderr, flush=True)
+    if not addrs:
+        return
+    # Sanity: dump first/last 5 entries' types so we can see if the
+    # walker is sane (real objects, not garbage memory).
+    def _u64x(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    for label, sample in [("first", addrs[:5]), ("last", addrs[-5:])]:
+        for i, a in enumerate(sample):
+            tp = _u64x(a + 8)
+            nm = b""
+            if tp:
+                npr = _u64x(tp + 24)
+                if 0x100_000_000 <= npr < 0x10_000_000_000:
+                    nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
+            print("[gen2-bisect]   %s[%d]: addr=0x%x refcnt=%d ob_type=0x%x tp_name=%r"
+                  % (label, i, a, _u64x(a), tp,
+                     nm.decode("ascii", "replace")), file=sys.stderr)
+    # Scan for ALL objects with refcnt=0 in the gen list -- these are
+    # "dead" objects that should have been deallocated and untracked
+    # but somehow stayed in the gc list.  Each one is a candidate for
+    # the bug.
+    refcnt_zero = []
+    for a in addrs:
+        if _u64x(a) == 0:
+            refcnt_zero.append(a)
+    print("[gen2-bisect] objects with refcnt=0 still in gc-list: %d"
+          % len(refcnt_zero), file=sys.stderr)
+    # Dump up to first 20 with their type names.
+    for i, a in enumerate(refcnt_zero[:20]):
+        tp = _u64x(a + 8)
+        nm = b""
+        if tp:
+            npr = _u64x(tp + 24)
+            if 0x100_000_000 <= npr < 0x10_000_000_000:
+                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
+        # Also dump _gc_prev (often 0x0 for the broken ones).
+        _gp = _u64x(a - 16 + 8)
+        print("[gen2-bisect]   refcnt=0[%d]: addr=0x%x type=%r _gc_prev=0x%x"
+              % (i, a, nm.decode("ascii", "replace"), _gp),
+              file=sys.stderr)
+    # Reconstruct Python object refs from addresses.  ctypes
+    # ``py_object`` cast reads the PyObject* at the address (treating
+    # the address-int as a value of type ``void*`` then casting).  We
+    # need actual object handles to pass to gc.get_referents in the
+    # child.  Note: this does NOT INCREF -- the parent's heap already
+    # holds them via the gc list itself.
+    all_objs = []
+    for a in addrs:
+        try:
+            all_objs.append(ctypes.cast(a, ctypes.py_object).value)
+        except (ValueError, OSError):
+            pass
+    print("[gen2-bisect] reconstructed %d object refs from addresses"
           % len(all_objs), file=sys.stderr, flush=True)
     if not all_objs:
         return
@@ -788,6 +843,56 @@ def _gen2_bisect_after_runfunc():
           % (idx, id(bad), type(bad).__name__),
           file=sys.stderr, flush=True)
     _dump_pygc_head_forensics(id(bad))
+
+
+def _walk_gen_via_pygc_head():
+    """Walk Python's gc-tracked-object linked list via raw PyGC_Head
+    pointer reads.  Returns a list of object addresses (=id of obj).
+
+    PyGC_Head layout (Python 3.13): 16 bytes -- ``uintptr_t _gc_next,
+    _gc_prev``.  Object body starts at head + 16.  The list is
+    circular with a sentinel head whose body is not a real PyObject.
+
+    With ``gc.disable()`` in effect, every gc-tracked obj lives in
+    the same young-gen list (no promotion happens).  We anchor on a
+    locally-created list ``anchor = []`` (gc-tracked dict/list/etc.
+    work; ``type`` does NOT because builtin types are statically
+    allocated and not in the gc list).  Walk forward via ``_gc_next``
+    until we cycle.
+
+    Filtering: the gen-list contains a sentinel PyGC_Head whose
+    object body is not a real PyObject.  We skip entries whose
+    ``ob_refcnt`` looks implausible (must be > 0 and < 2^32).
+    """
+    HEAD_SIZE = 16
+    PTR_MASK = ~0xF  # _gc_prev encodes flags in low 4 bits
+    def u64(addr):
+        return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
+    anchor = []  # gc-tracked container
+    anchor_head = id(anchor) - HEAD_SIZE
+    anchor_next = u64(anchor_head) & PTR_MASK
+    anchor_prev = u64(anchor_head + 8) & PTR_MASK
+    print("[gen2-bisect] anchor PyGC_Head 0x%x: _gc_next=0x%x _gc_prev=0x%x"
+          % (anchor_head, anchor_next, anchor_prev), file=sys.stderr)
+    addrs = []
+    seen = {anchor_head}
+    cur = anchor_next  # _gc_next
+    MAX = 50_000_000
+    for _ in range(MAX):
+        if cur == 0 or (cur & 0x7):
+            break
+        if cur in seen:
+            break
+        seen.add(cur)
+        rc = u64(cur + HEAD_SIZE)
+        tp = u64(cur + HEAD_SIZE + 8)
+        # Filter unfilterable garbage but accept refcnt=0 -- a refcnt=0
+        # object still in the gc list IS what we want to find.
+        if rc < (1 << 32) and tp != 0:
+            addrs.append(cur + HEAD_SIZE)
+        nxt = u64(cur) & PTR_MASK
+        cur = nxt
+    return addrs
 
 
 def _fork_traverse_subset(all_objs, lo, hi):
@@ -862,7 +967,10 @@ def _bisect_traverse(all_objs):
 
 
 def _dump_pygc_head_forensics(obj_addr):
-    """Dump PyGC_Head + PyObject_HEAD + tp_name for forensic logging."""
+    """Dump PyGC_Head + PyObject_HEAD + tp_name + (if set) elements
+    for forensic logging.  All reads go through ctypes raw memory,
+    bypassing tp_traverse which is the crashing path.
+    """
     def u64(a):
         return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
     head = obj_addr - 16
@@ -879,24 +987,55 @@ def _dump_pygc_head_forensics(obj_addr):
     print("[gen2-bisect]   PyObject  0x%x: refcnt=%d ob_type=0x%x tp_name=%r"
           % (obj_addr, rc, tp, name.decode("ascii", "replace")),
           file=sys.stderr)
-    # Try repr() under a fork — repr might also crash.
-    r, w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(r)
-        try:
-            o = ctypes.cast(obj_addr, ctypes.py_object).value
-            s = repr(o)[:200]
-            os.write(w, s.encode("utf-8", "replace"))
-        except BaseException as e:
-            os.write(w, ("EX:%s:%s" % (type(e).__name__, e)).encode())
-        os._exit(0)
-    os.close(w)
-    os.waitpid(pid, 0)
-    msg = os.read(r, 512)
-    os.close(r)
-    print("[gen2-bisect]   repr(obj) -> %s"
-          % msg.decode("utf-8", "replace"), file=sys.stderr)
+    # If it's a set/frozenset, dump PySetObject internals: fill,
+    # used, mask, table pointer.  PySetObject layout (Python 3.13):
+    #   ob_refcnt (8), ob_type (8),             // 0..16   (PyObject_HEAD)
+    #   fill (8),       used (8),               // 16..32
+    #   mask (8),       table (8 ptr),          // 32..48
+    #   hash (8),       finger (8),             // 48..64
+    #   smalltable[8] (each entry = hash + key = 16 bytes -> 128 bytes),
+    #   weakreflist (8 ptr).
+    if name in (b"set", b"frozenset"):
+        fill = u64(obj_addr + 16)
+        used = u64(obj_addr + 24)
+        mask = u64(obj_addr + 32)
+        table = u64(obj_addr + 40)
+        weaklist = u64(obj_addr + 16 + 64 + 128)  # rough; layout may shift
+        print("[gen2-bisect]   PySet: fill=%d used=%d mask=0x%x table=0x%x"
+              % (fill, used, mask, table), file=sys.stderr)
+        # Walk table for (hash, key) entries.  Each setentry = 16
+        # bytes: hash (8), key (8 ptr).  Cap output at a few entries.
+        if table and used > 0:
+            print("[gen2-bisect]   PySet entries (up to mask+1=%d slots):"
+                  % (mask + 1), file=sys.stderr)
+            shown = 0
+            for i in range(min(mask + 1, 64)):
+                ent = table + i * 16
+                ehash = u64(ent)
+                ekey = u64(ent + 8)
+                if ekey == 0 or ekey == 1:  # NULL=empty, 1=dummy in CPython
+                    continue
+                # Read key's refcnt and ob_type defensively.
+                ek_rc = ek_tp = ek_tn = 0
+                ek_name = b""
+                if 0x100_000_000 <= ekey < 0x10_000_000_000:
+                    ek_rc = u64(ekey)
+                    ek_tp = u64(ekey + 8)
+                    if ek_tp:
+                        ek_tn = u64(ek_tp + 24)
+                        if 0x100_000_000 <= ek_tn < 0x10_000_000_000:
+                            ek_name = ctypes.string_at(
+                                ek_tn, 64).split(b"\x00", 1)[0]
+                print("[gen2-bisect]     slot[%d]: hash=0x%x key=0x%x "
+                      "key.refcnt=%d key.type=0x%x key.tp_name=%r"
+                      % (i, ehash, ekey, ek_rc, ek_tp,
+                         ek_name.decode("ascii", "replace")),
+                      file=sys.stderr)
+                shown += 1
+                if shown >= 12:
+                    print("[gen2-bisect]     ... (more slots truncated)",
+                          file=sys.stderr)
+                    break
 
 
 if __name__ == '__main__':
