@@ -203,12 +203,98 @@ Candidates:
 - `pointerStorageRanges = SortedSet()` -- when entries get evicted
 - A raw `ctypes` refcount manipulation in `_storePtr` / `_free`
 
+## 2026-05-23 update #3: neighbor dump & instrumentation results
+
+Walking the gen0 list's idx 3..13 around the bad set (idx 8):
+
+    [3]  addr=...  refcnt=2 type='tuple'                 _gc_prev=...
+    [4]  addr=...  refcnt=2 type='getset_descriptor'     _gc_prev=...
+    [5]  addr=...  refcnt=2 type='getset_descriptor'     _gc_prev=...
+    [6]  addr=...  refcnt=2 type='weakref.ReferenceType' _gc_prev=...
+    [7]  addr=...  refcnt=2 type='list'                  _gc_prev=...
+    [8]  addr=...  refcnt=2 type='set'                   _gc_prev=0x0  <-- BAD
+    [9]  addr=...  refcnt=1 type='py_object'             _gc_prev=...
+    [10] addr=...  refcnt=2 type='Attribute'             _gc_prev=...
+    [11] addr=...  refcnt=2 type='dict'                  _gc_prev=...
+    [12] addr=...  refcnt=2 type='Name'                  _gc_prev=...
+    [13] addr=...  refcnt=2 type='dict'                  _gc_prev=...
+
+Key observations:
+
+- ONLY the bad set has `_gc_prev=0x0` (broken doubly-linked invariant).
+- bad set `refcnt` varies between runs: sometimes 0, sometimes 2.
+- Neighbors are AST nodes (Attribute / Name / dict) -- suggests this
+  set was allocated during AST processing or related initialization.
+- `--instrument make_new_set,frozenset_new` reports ZERO calls during
+  the run, so sets must be created via a different code path
+  (probably `PyType_GenericAlloc` + `set_init`, or via internal C
+  helpers that bypass `make_new_set`).
+- `PyType_GenericAlloc` is called 1500+ times for many distinct types
+  -- the leaker is one of these.
+
 ## Suggested next investigation steps
 
 In order of probable yield:
 
-0. **Disambiguate the bad-set finding** (sentinel head vs real bug).
-   See update #2 above.
+## 2026-05-23 update #4: it's a HOST set, found via body-invariant sweep
+
+Two new pieces of evidence:
+
+1. `bad_set.ob_type == id(set)` -- the leaker is a **HOST Python set**,
+   not an interp-built set type.  Our interp creates types in
+   `0x12X_xxxx_xxx` range; host `set` lives at `0x101024e38` (varies
+   per run but always matches `id(set)`).
+
+2. **Body-invariant sweep**: scan all gen0 entries whose ob_type ==
+   host set; check `(used <= mask+1) and (mask in {7,15,31,...,65535})`.
+   Of 43871 host sets in gen0, exactly **ONE** fails the check -- the
+   same one the fork-bisect identifies.
+
+Implications:
+- We don't need fork-bisect anymore; the body-invariant sweep is the
+  fast detector.  The bisect harness in `--gen2-bisect` can be
+  simplified to just call this sweep.
+- The leaked set has body fields like `fill=15252840 used=15252840
+  mask=0x1ffffff table=0x576000000` -- not zero (so `tp_alloc` with
+  `calloc=1` didn't initialize it).  Either:
+  (a) `tp_alloc(set_type, ...)` is called with `calloc=0` (or our
+      interp's translated calloc doesn't actually zero memory), OR
+  (b) Pymalloc gave us a slot whose contents were preserved from a
+      prior interp-managed buffer (our `_malloc`'d c_byte data).
+      Need to check if `0x376d01fc0` overlaps with `interp.mallocs`.
+- The set is somewhere in HOST Python's machinery -- candidates
+  include: stdlib `weakref`, `gc`, `_compile_charset`,
+  `dict.keys() -> set`, `set comprehension`s, exception cycle
+  tracking, `typing` module internals.
+
+## Suggested next investigation steps
+
+In order of probable yield:
+
+0. **Track host-set creation with `gc.callbacks`.**  Install a
+   `gc.callbacks` post-collect callback that snapshots
+   `id(s) for s in gc.get_objects(0) if isinstance(s, set)`.  After
+   runFunc, run the body-invariant sweep, find the leaker's address,
+   look up which snapshot first contained it -- that gives the rough
+   creation window.
+
+1. **Check if leaker address overlaps `interp.mallocs`.**
+   In the gen2-bisect forensics: compute `for base, buf in
+   interpreter.mallocs.items(): base <= bad_addr < base + sizeof(buf)`.
+   If overlap, the leaker's body data is whatever we last wrote to
+   that buffer -- explains the garbage body fields and points to
+   exactly where pymalloc and our `_malloc` collide.
+
+2. **Wrap `set_init` (not `make_new_set`) plus `_PyObject_GC_UnTrack`.**
+   Pair-track: every set passing through `set_init` should also pass
+   through `_PyObject_GC_UnTrack` at its dealloc time.  The leaker is
+   a set whose UnTrack never fires.  Caveat: these may be C macros,
+   not functions -- check if they exist as wrappable functions in the
+   parsed AST.
+
+   Alternative: instrument lower-level `_PyObject_Malloc` /
+   `_PyObject_Free` and pair-track ALL allocations.  More expensive
+   but catches everything.
 
 1. **Find the bad obj in gen2 by partition.**
    Subprocess-based bisect: after `runFunc` returns (or natural error),

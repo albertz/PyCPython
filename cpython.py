@@ -818,7 +818,12 @@ def main(argv):
         interpreter.runFunc(*args)
     finally:
         if args_ns.gen2_bisect:
+            global _gen2_bisect_interp
+            _gen2_bisect_interp = interpreter
             _gen2_bisect_after_runfunc()
+
+
+_gen2_bisect_interp = None  # set by main() before calling the bisect
 
 
 def _gen2_bisect_after_runfunc():
@@ -847,6 +852,45 @@ def _gen2_bisect_after_runfunc():
           % len(addrs), file=sys.stderr, flush=True)
     if not addrs:
         return
+    # Filter all addresses to ones whose ob_type == host `set` type.
+    # That gives us every host set currently in gen0.  We can read
+    # ob_refcnt and (cautiously) PySet body fields to identify the
+    # leaker (broken body / refcnt=0).
+    def _u64sc(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    host_set_id = id(set)
+    set_addrs = [a for a in addrs if _u64sc(a + 8) == host_set_id]
+    print("[gen2-bisect] host-set instances in gen0: %d"
+          % len(set_addrs), file=sys.stderr, flush=True)
+    # Dump each set's refcnt and body sanity.  PySetObject body
+    # plausibility check: 0 <= used <= mask+1, mask is a power of 2
+    # minus 1, mask >= PySet_MINSIZE-1=7.  table is either the
+    # smalltable inside the object (very common) or an external buffer.
+    weird_sets = []
+    for sa in set_addrs:
+        rc = _u64sc(sa)
+        fill = _u64sc(sa + 16)
+        used = _u64sc(sa + 24)
+        mask = _u64sc(sa + 32)
+        table = _u64sc(sa + 40)
+        # smalltable starts at offset 64 (after fill/used/mask/table/hash/finger
+        # = 6*8 = 48 bytes -> offset 16+48=64).
+        smalltable = sa + 64
+        ok = (
+            rc > 0
+            and used <= (mask + 1) if mask < (1 << 30) else False
+            and mask in (7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095,
+                         8191, 16383, 32767, 65535)
+        )
+        if not ok:
+            weird_sets.append((sa, rc, fill, used, mask, table, smalltable))
+    print("[gen2-bisect] sets with broken body invariants: %d"
+          % len(weird_sets), file=sys.stderr)
+    for (sa, rc, fill, used, mask, table, smalltable) in weird_sets[:5]:
+        print("[gen2-bisect]   weird-set addr=0x%x refcnt=%d "
+              "fill=%d used=%d mask=0x%x table=0x%x smalltable=0x%x"
+              % (sa, rc, fill, used, mask, table, smalltable),
+              file=sys.stderr)
     # Sanity: dump first/last 5 entries' types so we can see if the
     # walker is sane (real objects, not garbage memory).
     def _u64x(a):
@@ -919,7 +963,79 @@ def _gen2_bisect_after_runfunc():
     print("[gen2-bisect] *** BAD OBJ: idx=%d addr=0x%x type=%s ***"
           % (idx, id(bad), type(bad).__name__),
           file=sys.stderr, flush=True)
+    # Hypothesis: leaker's body holds garbage because the slot was
+    # previously used as one of our interp's _malloc'd buffers,
+    # then freed and given back to pymalloc which reused it for a
+    # host set without zeroing.  Check the overlap.
+    bad_addr_val = id(bad)
+    overlap = None
+    interp = _gen2_bisect_interp
+    if interp is not None and hasattr(interp, "mallocs"):
+        for _base, _buf in interp.mallocs.items():
+            try:
+                _sz = ctypes.sizeof(_buf)
+            except (TypeError, OSError):
+                continue
+            if _base <= bad_addr_val < _base + _sz:
+                overlap = (_base, _sz)
+                break
+    if overlap is not None:
+        print("[gen2-bisect]   bad set address IS INSIDE interp.mallocs "
+              "buffer: base=0x%x size=%d offset=%d  *** PYMALLOC/INTERP "
+              "MEMORY COLLISION ***"
+              % (overlap[0], overlap[1], bad_addr_val - overlap[0]),
+              file=sys.stderr)
+    else:
+        print("[gen2-bisect]   bad set address NOT in any interp.mallocs "
+              "buffer (so the garbage body isn't our interp's data)",
+              file=sys.stderr)
+    # Is the bad set's ob_type the HOST `set` type (= same as `id(set)`)?
+    # If yes: this is a HOST python set, leaked by something our interp
+    # does to host objects.  If no: it's an interp-built set type,
+    # leaked by interpreted CPython source.
+    def _u64x_typecheck(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    bad_ob_type = _u64x_typecheck(id(bad) + 8)
+    host_set_id = id(set)
+    host_frozenset_id = id(frozenset)
+    if bad_ob_type == host_set_id:
+        print("[gen2-bisect]   bad obj's ob_type == HOST set type "
+              "(0x%x).  Leak is in HOST Python." % bad_ob_type,
+              file=sys.stderr)
+    elif bad_ob_type == host_frozenset_id:
+        print("[gen2-bisect]   bad obj's ob_type == HOST frozenset type "
+              "(0x%x).  Leak is in HOST Python." % bad_ob_type,
+              file=sys.stderr)
+    else:
+        print("[gen2-bisect]   bad obj's ob_type=0x%x is NOT host "
+              "set/frozenset (host set=0x%x, frozenset=0x%x). Probably "
+              "an interp-built set type."
+              % (bad_ob_type, host_set_id, host_frozenset_id),
+              file=sys.stderr)
     _dump_pygc_head_forensics(id(bad))
+    # Dump neighbors in the linked list (idx-5 .. idx+5) -- temporally
+    # adjacent allocations, may hint at what code was running when the
+    # leaked set was created.
+    print("[gen2-bisect] neighbors in gen0 list (by walk order):",
+          file=sys.stderr)
+    def _u64x2(a):
+        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
+    lo_n = max(0, idx - 5)
+    hi_n = min(len(addrs), idx + 6)
+    for j in range(lo_n, hi_n):
+        a = addrs[j]
+        tp = _u64x2(a + 8)
+        nm = b""
+        if tp:
+            npr = _u64x2(tp + 24)
+            if 0x100_000_000 <= npr < 0x10_000_000_000:
+                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
+        marker = "  <-- BAD" if j == idx else ""
+        rc = _u64x2(a)
+        gp = _u64x2(a - 16 + 8)
+        print("[gen2-bisect]   [%d] addr=0x%x refcnt=%d type=%r _gc_prev=0x%x%s"
+              % (j, a, rc, nm.decode("ascii", "replace"), gp, marker),
+              file=sys.stderr)
 
 
 def _walk_gen_via_pygc_head():
@@ -1084,8 +1200,18 @@ def _dump_pygc_head_forensics(obj_addr):
         weaklist = u64(obj_addr + 16 + 64 + 128)  # rough; layout may shift
         print("[gen2-bisect]   PySet: fill=%d used=%d mask=0x%x table=0x%x"
               % (fill, used, mask, table), file=sys.stderr)
-        # Walk table for (hash, key) entries.  Each setentry = 16
-        # bytes: hash (8), key (8 ptr).  Cap output at a few entries.
+        # Walk table for (hash, key) entries.  Sanity-check table
+        # addr and used/mask before iterating -- the body is likely
+        # corrupt (the bug), so unchecked reads here will segfault.
+        TABLE_OK = (
+            0x100_000_000 <= table < 0x10_000_000_000
+            and 0 < used < 1024 and 0 < mask < 4096
+        )
+        if not TABLE_OK:
+            print("[gen2-bisect]   PySet body fields look corrupt -- "
+                  "skipping entry walk (table/used/mask out of plausible "
+                  "range)", file=sys.stderr)
+            return
         if table and used > 0:
             print("[gen2-bisect]   PySet entries (up to mask+1=%d slots):"
                   % (mask + 1), file=sys.stderr)
