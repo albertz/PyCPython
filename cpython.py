@@ -198,7 +198,14 @@ class CPythonState(cparser.State):
                    # helpers
                    "FASTSEARCH", "ADJUST_INDICES"):
             self.macros.pop(_m, None)
+        # `formatfloat` is declared with INCOMPATIBLE TYPES across
+        # unicodeobject.c (int) and bytesobject.c (char*).  Without a
+        # rename, cparser would (correctly) error on this static
+        # collision -- merging the two would cause type-confusion.
+        # Rename bytesobject's `formatfloat` to disambiguate.
+        self.macros["formatfloat"] = cparser.Macro(rightside="formatfloat_bytesobject")
         cparser.parse(CPythonDir + "/Objects/bytesobject.c", self) # PyBytes_Type
+        self.macros.pop("formatfloat", None)
         cparser.parse(CPythonDir + "/Objects/rangeobject.c", self) # PyRange_Type
         cparser.parse(CPythonDir + "/Objects/enumobject.c", self) # PyEnum_Type
         cparser.parse(CPythonDir + "/Objects/fileobject.c", self) # PyStdPrinter_Type
