@@ -68,6 +68,11 @@ class CPythonState(cparser.State):
                 self.macros["HAVE_STDARG_PROTOTYPES"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_STD_ATOMIC"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_WCHAR_H"] = cparser.Macro(rightside="1")
+                # ``initfsencoding`` needs ``nl_langinfo(CODESET)`` to
+                # discover the filesystem encoding.  Without this, it
+                # returns NULL and ``_Py_FatalInitError`` aborts with
+                # "Unable to get the locale encoding".
+                self.macros["HAVE_LANGINFO_H"] = cparser.Macro(rightside="1")
                 self.macros["_POSIX_THREADS"] = cparser.Macro(rightside="1")
                 # _GNU_SOURCE, _POSIX_C_SOURCE or so?
                 return
