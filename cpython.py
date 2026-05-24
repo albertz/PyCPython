@@ -488,42 +488,27 @@ def main(argv):
              "9800.  Combine with --gc-check-at for ad-hoc additional "
              "points.  May be repeated.")
     argparser.add_argument(
-        '--invariant-check-interval', type=int, default=0, metavar="N",
-        help="Every N checkedFuncPtrCall iterations, walk the host gen0 "
-             "list via PyGC_Head and check the doubly-linked invariant. "
-             "First detection of a break is the iter when corruption "
-             "happens.  N=0 (default) disables.")
-    argparser.add_argument(
-        '--targeted-watch', action='store_true', default=False,
-        help="At every interp iter, check the 8 bytes immediately "
-             "AFTER each known PyMethodObject 64-byte buffer.  If any "
-             "transitions to NULL (was non-NULL on snapshot, is now "
-             "NULL), report the iter + buffer.  Fast per-iter (~200 "
-             "buffer reads).  Combine with --gen2-bisect.")
-    argparser.add_argument(
-        '--invariant-check-window', type=str, default="0:0",
-        metavar="START:END",
-        help="Only run --invariant-check between these iter counts "
-             "(inclusive).  Skip the expensive gen0-walk outside this "
-             "window.  Use to focus on a narrow range once you have an "
-             "approximate iter band.  Default 0:0 = no window limit.")
-    argparser.add_argument(
         '--quiet-crash', action='store_true', default=False,
         help="On fatal signals (SIGSEGV/SIGBUS/SIGABRT), dump the "
              "Python traceback and then exit cleanly via _exit() -- "
              "so the macOS CrashReporter dialog does NOT pop up.  "
-             "Useful for unattended debug runs; off by default to "
-             "preserve normal crash-reporting in production usage.")
+             "Useful for unattended debug runs.")
     argparser.add_argument(
-        '--gen2-bisect', action='store_true', default=False,
-        help="After runFunc returns, walk Python's gen2 GC list manually "
-             "via PyGC_Head pointer-chasing (avoiding gc.get_objects("
-             "generation=2) which crashes), then fork-bisect to find the "
-             "single gen2 object whose tp_traverse crashes (the smoking "
-             "gun for the shutdown-gc segfault).  Each child process "
-             "runs gc.get_referents() on a subset; the crashing subset "
-             "narrows the bad obj.  Disables gc during the bisect "
-             "harness itself so the bisect is the only walker.")
+        '--check-gc-invariants', action='store_true', default=False,
+        help="After runFunc, disable host gc and walk the host gen0 "
+             "list via raw PyGC_Head reads (no tp_traverse, no "
+             "allocator allocations), checking the doubly-linked "
+             "invariant `next._gc_prev == this`.  Any break is "
+             "memory corruption.  Implies temporarily disabling gc "
+             "during runFunc so all tracked objects stay in gen0.")
+    argparser.add_argument(
+        '--invariant-check-interval', type=int, default=0, metavar="N",
+        help="Every N checkedFuncPtrCall iterations, run the same "
+             "gen0 invariant walk as --check-gc-invariants.  The "
+             "first iteration where a break appears identifies WHEN "
+             "the corruption happens (combine with --gc-check-at for "
+             "tighter bisection).  N=0 (default) disables.  Implies "
+             "gc disable during runFunc.")
     args_ns, argv_rest = argparser.parse_known_args(argv[1:])
 
     if args_ns.report_extended_tracebacks:
@@ -613,7 +598,6 @@ def main(argv):
     _py_gil_state_check.C_argTypes = []
     _py_gil_state_check.C_resType = ctypes.c_int
     interpreter._func_cache["PyGILState_Check"] = _py_gil_state_check
-
 
     # Many of the C modules listed in `_PyImport_Inittab` (PC/config.c) --
     # `_thread`, `_io`, `itertools`, ... -- live in C source files we
@@ -826,7 +810,6 @@ def main(argv):
               % (_gc_interval, sorted(_gc_check_at) or "[]"),
               file=sys.stderr)
 
-
     # Marker for lldb: under ``PYCPYTHON_LLDB_TRAP=1``, raise SIGTRAP
     # right here -- *before* the interp's iter loop starts.  Ideal
     # point to attach lldb watchpoints.  Combine with lldb's
@@ -839,96 +822,32 @@ def main(argv):
               % os.getpid(), file=sys.stderr, flush=True)
         os.kill(os.getpid(), _sig_lldb.SIGTRAP)
 
+    # If either --check-gc-invariants or --invariant-check-interval is
+    # set, disable host gc during runFunc.  Otherwise gen0 would be
+    # auto-collected/promoted and the post-runFunc walk would miss
+    # most objects.  With gc disabled, every tracked obj stays in gen0
+    # for the duration of the run.
+    if args_ns.check_gc_invariants or args_ns.invariant_check_interval > 0:
+        import gc as _gc_pre
+        _gc_pre.disable()
+        print("[gc-inv] gc.disable() before runFunc", file=sys.stderr)
+
     if args_ns.invariant_check_interval > 0:
         _inv_interval = args_ns.invariant_check_interval
-        _inv_win_start, _inv_win_end = (
-            int(x) for x in args_ns.invariant_check_window.split(":"))
         _inv_count = [0]
         _inv_detected = [False]
         _inv_orig_call = interpreter.helpers.checkedFuncPtrCall
-        HEAD_SIZE = 16
-        PTR_MASK = ~0xF
-
-        def _u64_inv(addr):
-            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
-
-        def _inv_scan(n):
-            """Walk gen0 forward, return first broken-link addr or None."""
-            anchor = []
-            head = id(anchor) - HEAD_SIZE
-            seen = {head}
-            cur = _u64_inv(head) & PTR_MASK
-            visited = 0
-            MAX = 50_000_000
-            for _ in range(MAX):
-                if cur == 0 or (cur & 0x7) or cur in seen:
-                    break
-                seen.add(cur)
-                visited += 1
-                nxt = _u64_inv(cur) & PTR_MASK
-                if nxt == 0:
-                    return (cur, visited)
-                cur = nxt
-            return (None, visited)
-
-        # Ring buffer of the last K (iter, fn_ptr_addr) tuples.  Names
-        # are resolved lazily at dump time -- the per-call hot path
-        # just stores the address.
-        _inv_recent = []
-        _INV_RECENT_MAX = 50
-
-        def _resolve_fname_lazy(fn_addr):
-            for cand_name, cand_fn in interpreter._func_cache.items():
-                cf = getattr(cand_fn, "C_cFunc", None)
-                if cf is None:
-                    continue
-                try:
-                    cf_addr = ctypes.cast(cf, ctypes.c_void_p).value
-                except (TypeError, ctypes.ArgumentError):
-                    continue
-                if cf_addr == fn_addr:
-                    return cand_name
-            return "fn@0x%x" % fn_addr
 
         def _inv_wrapped(f, *args):
             _inv_count[0] += 1
             n = _inv_count[0]
-            # Cheap address grab; resolve to name only on dump.
-            try:
-                addr = ctypes.cast(f, ctypes.c_void_p).value
-            except (TypeError, ctypes.ArgumentError):
-                addr = id(f)
-            _inv_recent.append((n, addr))
-            if len(_inv_recent) > _INV_RECENT_MAX:
-                del _inv_recent[0]
-            in_window = (_inv_win_end == 0) or (_inv_win_start <= n <= _inv_win_end)
-            if (not _inv_detected[0]) and in_window and n % _inv_interval == 0:
-                broken_head, visited = _inv_scan(n)
+            if (not _inv_detected[0]) and n % _inv_interval == 0:
+                broken_head, visited = _walk_gen0_check_invariants()
                 if broken_head is not None:
-                    tp = _u64_inv(broken_head + HEAD_SIZE + 8)
-                    nm = b""
-                    if tp:
-                        npr = _u64_inv(tp + 24)
-                        if 0x100_000_000 <= npr < 0x10_000_000_000:
-                            nm = ctypes.string_at(
-                                npr, 64).split(b"\x00", 1)[0]
-                    print("[inv-check iter=%d] FIRST BROKEN-LINK detected: "
-                          "head=0x%x type=%r (visited=%d)"
-                          % (n, broken_head,
-                             nm.decode("ascii", "replace"), visited),
+                    print("[inv-check iter=%d] FIRST BROKEN-LINK: "
+                          "head=0x%x (visited=%d before break)"
+                          % (n, broken_head, visited),
                           file=sys.stderr, flush=True)
-                    # Dump the recent fn-ptr call names.
-                    print("[inv-check] last %d fn-ptr calls leading up "
-                          "to corruption (names lazily resolved):"
-                          % len(_inv_recent), file=sys.stderr)
-                    # Pre-build addr -> name map for unique addrs.
-                    unique_addrs = set(a for _, a in _inv_recent)
-                    name_map = {a: _resolve_fname_lazy(a) for a in unique_addrs}
-                    for ni, addr in _inv_recent:
-                        print("[inv-check]   iter=%d fn=%s" % (ni, name_map[addr]),
-                              file=sys.stderr)
-                    # Dump the Python stack at this exact moment -- the
-                    # interp operation that finalized the corruption.
                     import traceback as _t
                     _t.print_stack(file=sys.stderr)
                     _inv_detected[0] = True
@@ -940,1058 +859,65 @@ def main(argv):
         print("[inv-check] hooked checkedFuncPtrCall, interval=%d"
               % _inv_interval, file=sys.stderr)
 
-    if args_ns.gen2_bisect:
-        # Hook _addPointerStorageRange to log a stack for every
-        # 64-byte c_byte_Array_64 registration -- after the bisect
-        # finds the broken obj, we look up the registration matching
-        # range_end == broken_head to identify the C-source site.
-        global _gen2_bisect_size64_log
-        _gen2_bisect_size64_log = {}  # range_base -> (size, stack)
-        _orig_addrange = interpreter._addPointerStorageRange
-
-        import traceback as _t_bisect
-        def _hooked_addrange(start, size):
-            if size == 64:
-                fr = _t_bisect.extract_stack(limit=12)
-                slim = [(f.filename.rsplit("/", 1)[-1], f.lineno, f.name)
-                        for f in fr]
-                _gen2_bisect_size64_log[start] = slim
-            return _orig_addrange(start, size)
-        interpreter._addPointerStorageRange = _hooked_addrange
-
-        # Hook _PyObject_GC_New: log the (tp_basicsize, tp_name) of
-        # every newly-allocated GC obj.  We capture which TYPE
-        # corresponds to each 64-byte allocation.  Then the broken
-        # buffer's range_base tells us the type.
-        global _gen2_bisect_alloc_type_log
-        _gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
-
-        # Wrap _PyObject_GC_New using the same pattern as --instrument.
-        _orig_gcnew = interpreter.getFunc("_PyObject_GC_New")
-
-        _gcnew_call_counter = [0]
-        def _hooked_gcnew(*args):
-            _gcnew_call_counter[0] += 1
-            r = _orig_gcnew(*args)
-            # args[0] is the type pointer; r is the returned obj.
-            # Use the most defensive ctypes access, no try/except --
-            # let mistakes surface loudly.
-            tp_ptr = args[0]
-            tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
-            obj_addr = ctypes.cast(r, ctypes.c_void_p).value
-            if tp_addr and obj_addr:
-                # tp_basicsize is at offset 32 (after ob_refcnt, ob_type,
-                # ob_size = 3*8=24, then tp_name = 8, so basicsize @ 32).
-                # Actually in CPython 3.7 PyTypeObject:
-                #   ob_refcnt(8) ob_type(8) ob_size(8) tp_name(8) tp_basicsize(8)
-                # offsets 0,8,16,24,32 -- so basicsize at offset 32.
-                basicsize = ctypes.cast(
-                    tp_addr + 32,
-                    ctypes.POINTER(ctypes.c_ssize_t))[0]
-                name_ptr = ctypes.cast(
-                    tp_addr + 24,
-                    ctypes.POINTER(ctypes.c_void_p))[0]
-                name = b""
-                if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
-                    name = ctypes.string_at(
-                        name_ptr, 64).split(b"\x00", 1)[0]
-                _gen2_bisect_alloc_type_log[obj_addr] = (
-                    int(basicsize),
-                    name.decode("ascii", "replace"))
-            return r
-        _hooked_gcnew.C_argTypes = _orig_gcnew.C_argTypes
-        _hooked_gcnew.C_resType = _orig_gcnew.C_resType
-        _hooked_gcnew.C_cFunc = getattr(_orig_gcnew, "C_cFunc", None)
-        interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew
-
-        # If --targeted-watch is also enabled, hook _PyObject_GC_New
-        # to track method-type allocations specifically.  We'll scan
-        # the byte at obj_addr+40 = the first byte past basicsize=40,
-        # which IS the next pymalloc slot's first byte (= the adjacent
-        # host gc obj's _gc_next if there is one).
-        if args_ns.targeted_watch:
-            global _targeted_method_addrs, _targeted_baseline
-            _targeted_method_addrs = []  # list of obj_addr for 'method' allocs
-            _targeted_baseline = {}     # obj_addr -> initial value at obj+40
-
-            _orig_gcnew_tw = interpreter._func_cache["_PyObject_GC_New"]
-
-            def _hooked_gcnew_tw(*args):
-                r = _orig_gcnew_tw(*args)
-                tp_ptr = args[0]
-                tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
-                obj_addr = ctypes.cast(r, ctypes.c_void_p).value
-                if tp_addr and obj_addr:
-                    name_ptr = ctypes.cast(
-                        tp_addr + 24,
-                        ctypes.POINTER(ctypes.c_void_p))[0]
-                    if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
-                        nm = ctypes.string_at(
-                            name_ptr, 16).split(b"\x00", 1)[0]
-                        if nm == b"method":
-                            _targeted_method_addrs.append(obj_addr)
-                            # Read initial value at obj+40 (the byte we
-                            # care about).
-                            try:
-                                v = ctypes.cast(
-                                    obj_addr + 40,
-                                    ctypes.POINTER(ctypes.c_uint64))[0]
-                                _targeted_baseline[obj_addr] = v
-                            except OSError:
-                                pass
-                return r
-            _hooked_gcnew_tw.C_argTypes = _orig_gcnew_tw.C_argTypes
-            _hooked_gcnew_tw.C_resType = _orig_gcnew_tw.C_resType
-            _hooked_gcnew_tw.C_cFunc = getattr(_orig_gcnew_tw, "C_cFunc", None)
-            interpreter._func_cache["_PyObject_GC_New"] = _hooked_gcnew_tw
-
-            # And hook checkedFuncPtrCall to scan after each call.
-            _tw_orig_call = interpreter.helpers.checkedFuncPtrCall
-            _tw_count = [0]
-            _tw_detected = [False]
-
-            def _tw_wrapped(f, *args):
-                # Capture info about THIS call before it runs.
-                try:
-                    f_addr = ctypes.cast(f, ctypes.c_void_p).value
-                except (TypeError, ctypes.ArgumentError):
-                    f_addr = id(f)
-                # Snapshot the watched bytes BEFORE the call.
-                pre_state = {}
-                for ma in _targeted_method_addrs:
-                    base = _targeted_baseline.get(ma)
-                    if base is None or base == 0:
-                        continue
-                    try:
-                        v = ctypes.cast(
-                            ma + 40,
-                            ctypes.POINTER(ctypes.c_uint64))[0]
-                    except OSError:
-                        continue
-                    pre_state[ma] = v
-
-                r = _tw_orig_call(f, *args)
-                _tw_count[0] += 1
-                if _tw_detected[0]:
-                    return r
-                # Scan: find any byte that transitioned to 0 IN THIS CALL.
-                for ma, pre_v in pre_state.items():
-                    if pre_v == 0:
-                        continue
-                    try:
-                        post_v = ctypes.cast(
-                            ma + 40,
-                            ctypes.POINTER(ctypes.c_uint64))[0]
-                    except OSError:
-                        continue
-                    if post_v == 0:
-                        # This very call did it.
-                        print("[targeted-watch iter=%d] BUFFER OVERFLOW "
-                              "DETECTED *in this call*: method obj_addr"
-                              "=0x%x byte+40 was 0x%x BEFORE call, 0 AFTER"
-                              % (_tw_count[0], ma, pre_v),
-                              file=sys.stderr, flush=True)
-                        arg_addrs = [
-                            (ctypes.cast(a, ctypes.c_void_p).value
-                             if hasattr(a, "_b_needsfree_") else None)
-                            for a in args]
-                        print("[targeted-watch] call was: f=0x%x args=%s"
-                              % (f_addr, arg_addrs), file=sys.stderr)
-                        # Resolve each arg as a PyObject*: read ob_type
-                        # and tp_name.
-                        for i, a in enumerate(arg_addrs):
-                            if a is None or not (0x100_000_000 <= a < 0x10_000_000_000):
-                                continue
-                            try:
-                                rc = ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-                                tp = ctypes.cast(a + 8, ctypes.POINTER(ctypes.c_uint64))[0]
-                                nm_ptr = (ctypes.cast(tp + 24, ctypes.POINTER(ctypes.c_uint64))[0]
-                                          if tp else 0)
-                                nm = b""
-                                if 0x100_000_000 <= nm_ptr < 0x10_000_000_000:
-                                    nm = ctypes.string_at(
-                                        nm_ptr, 64).split(b"\x00", 1)[0]
-                                print("[targeted-watch]   arg[%d] addr=0x%x "
-                                      "refcnt=%d ob_type=0x%x tp_name=%r"
-                                      % (i, a, rc, tp,
-                                         nm.decode("ascii", "replace")),
-                                      file=sys.stderr)
-                            except OSError:
-                                pass
-                        # Also reverse-lookup f's name from _func_cache.
-                        for cand_name, cand_fn in interpreter._func_cache.items():
-                            cf = getattr(cand_fn, "C_cFunc", None)
-                            if cf is None:
-                                continue
-                            try:
-                                cf_addr = ctypes.cast(cf, ctypes.c_void_p).value
-                            except (TypeError, ctypes.ArgumentError):
-                                continue
-                            if cf_addr == f_addr:
-                                print("[targeted-watch] f resolves to: %s"
-                                      % cand_name, file=sys.stderr)
-                                break
-                        else:
-                            print("[targeted-watch] f does NOT resolve to "
-                                  "any name in _func_cache "
-                                  "(inline-dispatched func ptr)",
-                                  file=sys.stderr)
-                        import traceback as _t
-                        _t.print_stack(file=sys.stderr)
-                        _tw_detected[0] = True
-                        break
-                return r
-            interpreter.helpers.checkedFuncPtrCall = _tw_wrapped
-            print("[targeted-watch] hooked checkedFuncPtrCall",
-                  file=sys.stderr)
-
-        # Also hook _PyObject_GC_NewVar so we cover variable-size objs.
-        _orig_gcnewvar = interpreter.getFunc("_PyObject_GC_NewVar")
-
-        def _hooked_gcnewvar(*args):
-            r = _orig_gcnewvar(*args)
-            tp_ptr = args[0]
-            # args[1] is nitems (Py_ssize_t = c_long in our interp).
-            # Read .value defensively.
-            nitems = int(args[1].value) if hasattr(args[1], "value") else int(args[1])
-            tp_addr = ctypes.cast(tp_ptr, ctypes.c_void_p).value
-            obj_addr = ctypes.cast(r, ctypes.c_void_p).value
-            if tp_addr and obj_addr:
-                basicsize = ctypes.cast(
-                    tp_addr + 32,
-                    ctypes.POINTER(ctypes.c_ssize_t))[0]
-                itemsize = ctypes.cast(
-                    tp_addr + 40,
-                    ctypes.POINTER(ctypes.c_ssize_t))[0]
-                name_ptr = ctypes.cast(
-                    tp_addr + 24,
-                    ctypes.POINTER(ctypes.c_void_p))[0]
-                name = b""
-                if name_ptr and 0x100_000_000 <= name_ptr < 0x10_000_000_000:
-                    name = ctypes.string_at(
-                        name_ptr, 64).split(b"\x00", 1)[0]
-                total = int(basicsize) + int(itemsize) * nitems
-                _gen2_bisect_alloc_type_log[obj_addr] = (
-                    total,
-                    "%s[var,nitems=%d]"
-                    % (name.decode("ascii", "replace"), nitems))
-            return r
-        _hooked_gcnewvar.C_argTypes = _orig_gcnewvar.C_argTypes
-        _hooked_gcnewvar.C_resType = _orig_gcnewvar.C_resType
-        _hooked_gcnewvar.C_cFunc = getattr(_orig_gcnewvar, "C_cFunc", None)
-        interpreter._func_cache["_PyObject_GC_NewVar"] = _hooked_gcnewvar
-
-        # Hook interp._abort -- runs an invariant check there to
-        # determine whether the broken-link exists BEFORE the
-        # CAbortException propagates (= bug occurred during normal
-        # runFunc) or AFTER (= bug occurred during exception unwind).
-        # The check is lightweight: walk gen0 forward via PyGC_Head
-        # and return True iff we find a node with _gc_next != 0 but
-        # next._gc_prev != this (the doubly-linked invariant break).
-        _orig_abort_for_check = interpreter._abort
-
-        def _quick_invariant_check(label):
-            HEAD_SIZE = 16
-            PTR_MASK = ~0xF
-            def u64(addr):
-                return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
-            anchor = []
-            head = id(anchor) - HEAD_SIZE
-            seen = {head}
-            cur = u64(head) & PTR_MASK
-            broken = 0
-            visited = 0
-            MAX = 50_000_000
-            for _ in range(MAX):
-                if cur == 0 or (cur & 0x7) or cur in seen:
-                    break
-                seen.add(cur)
-                visited += 1
-                nxt = u64(cur) & PTR_MASK
-                if nxt == 0:
-                    broken += 1
-                    if broken <= 3:
-                        # Log the type for diagnostic.
-                        tp = u64(cur + HEAD_SIZE + 8)
-                        nm = b""
-                        if tp:
-                            npr = u64(tp + 24)
-                            if 0x100_000_000 <= npr < 0x10_000_000_000:
-                                nm = ctypes.string_at(
-                                    npr, 64).split(b"\x00", 1)[0]
-                        print("[invariant-check %s] BROKEN head=0x%x "
-                              "type=%r (nxt is NULL)"
-                              % (label, cur,
-                                 nm.decode("ascii", "replace")),
-                              file=sys.stderr)
-                    cur = 0  # can't follow NULL
-                    break
-                cur = nxt
-            print("[invariant-check %s] visited=%d broken=%d"
-                  % (label, visited, broken), file=sys.stderr, flush=True)
-            return broken
-
-        def _hooked_abort_for_check():
-            _quick_invariant_check("at _abort entry")
-            return _orig_abort_for_check()
-        interpreter._abort = _hooked_abort_for_check
-
-        # Disable Python's automatic gc during runFunc -- with gc
-        # disabled, nothing gets promoted past gen0, so post-runFunc
-        # we enumerate via gc.get_objects(0).
-        import gc as _gc_pre
-        # Snapshot host-set IDs BEFORE disabling gc, so post-runFunc we
-        # can tell which sets were created during runFunc itself.
-        _gc_pre.collect()
-        global _gen2_bisect_pre_set_ids
-        _gen2_bisect_pre_set_ids = frozenset(
-            id(s) for s in _gc_pre.get_objects()
-            if type(s) is set
-        )
-        print("[gen2-bisect] pre-runFunc host-set count: %d"
-              % len(_gen2_bisect_pre_set_ids), file=sys.stderr)
-        _gc_pre.disable()
-        print("[gen2-bisect] gc.disable() before runFunc",
-              file=sys.stderr)
-        # NOTE: a previous version of this code hooked interp._abort
-        # to snapshot host-set IDs at the moment of CAbortException.
-        # That perturbed timing enough to make the bug NOT reproduce
-        # (heap-sensitive corruption).  Removed -- if you need an
-        # abort-time snapshot, do it lazily / lighter-weight.
-
     args = ("Py_Main", len(argv), argv + [None])
     print("Run", args, ":")
     try:
         interpreter.runFunc(*args)
     finally:
-        if args_ns.gen2_bisect:
-            global _gen2_bisect_interp
-            _gen2_bisect_interp = interpreter
-            _gen2_bisect_after_runfunc()
+        if args_ns.check_gc_invariants:
+            broken_head, visited = _walk_gen0_check_invariants()
+            if broken_head is None:
+                print("[gc-inv] gen0 invariant check OK (visited=%d)"
+                      % visited, file=sys.stderr)
+            else:
+                print("[gc-inv] BROKEN gen0 link at head=0x%x "
+                      "(visited=%d before break) -- gc-list corrupted "
+                      "by interp activity"
+                      % (broken_head, visited), file=sys.stderr)
 
 
-_gen2_bisect_interp = None  # set by main() before calling the bisect
-_gen2_bisect_pre_set_ids = frozenset()  # set by main() before runFunc
-_gen2_bisect_size64_log = {}  # base_addr -> stack-trace
-_gen2_bisect_alloc_type_log = {}  # buf_addr -> (basicsize, tp_name)
-_gen2_bisect_abort_set_ids = frozenset()  # set by _hooked_abort
-_targeted_method_addrs = []  # list of obj_addrs for 'method' allocs
-_targeted_baseline = {}  # obj_addr -> initial *(uint64*)(obj+40)
+def _walk_gen0_check_invariants():
+    """Walk the host Python gen0 GC linked list via raw ``PyGC_Head``
+    pointer reads (no tp_traverse, no allocator calls -- safe even if
+    the gc-tracked object graph is structurally corrupt).
 
+    Checks the doubly-linked-list invariant: for every node ``cur``
+    reachable via ``_gc_next``, the successor's ``_gc_prev`` must point
+    back to ``cur``.  Returns ``(broken_head, visited)`` where
+    ``broken_head`` is the address of the first PyGC_Head whose
+    invariant is broken (or ``None`` if the list is intact), and
+    ``visited`` is the number of nodes walked before the break.
 
-def _gen2_bisect_after_runfunc():
-    """Walk Python's gen2 GC list manually and fork-bisect to find the
-    object whose `tp_traverse` crashes during gc.collect.
-
-    The shutdown segfault happens inside `deduce_unreachable` walking
-    gen2 -- a single bad object's `tp_traverse` follows a stale pointer
-    into freed memory.  We can't use `gc.get_objects(generation=2)` to
-    enumerate gen2 (it crashes for the same reason).  Instead we walk
-    the doubly-linked PyGC_Head list directly via raw ctypes reads.
-
-    Then we fork(): each child calls `gc.get_referents(obj)` on a
-    subset of gen2.  ``get_referents`` invokes ``tp_traverse`` on each
-    given object without walking the gen list itself, so a crash
-    indicates the SET contains the bad obj.  Binary-search narrows
-    down which one.
+    Anchored on a fresh ``[]`` (always gc-tracked) at the head of the
+    young generation.  Caller is responsible for disabling host gc
+    before runFunc so all tracked objects accumulate in gen0.
     """
-    import gc as _gc
-    # We cannot use ``gc.get_objects(0)`` -- it walks gen0 via
-    # tp_traverse to build a Python list and crashes on the bad obj
-    # for the same reason gc.collect does.  Walk PyGC_Head links
-    # manually (no tp_traverse) to enumerate addresses.
-    # Diagnostic: dump all unique 64-byte registrations and their
-    # ctype types -- helps identify what kinds of 64-byte buffers
-    # our interp creates.
-    interp = _gen2_bisect_interp
-    if interp is not None and hasattr(interp, "pointerStorageRanges"):
-        size64_count = 0
-        size64_types = {}
-        for _r in interp.pointerStorageRanges:
-            if isinstance(_r, tuple) and len(_r) == 2 and _r[1] == 64:
-                size64_count += 1
-                obj = interp.pointerStorage.get(_r[0])
-                if obj is not None:
-                    tname = type(obj).__name__
-                    size64_types[tname] = size64_types.get(tname, 0) + 1
-        print("[gen2-bisect] 64-byte registrations in pointerStorageRanges: %d"
-              % size64_count, file=sys.stderr)
-        for tname, cnt in sorted(size64_types.items(), key=lambda x: -x[1]):
-            print("[gen2-bisect]   ctype=%s count=%d" % (tname, cnt),
-                  file=sys.stderr)
-    print("[gen2-bisect] alloc-type-log entries: %d"
-          % len(_gen2_bisect_alloc_type_log), file=sys.stderr)
-    addrs = _walk_gen_via_pygc_head()
-    print("[gen2-bisect] gen0 size (via PyGC_Head walk): %d"
-          % len(addrs), file=sys.stderr, flush=True)
-    if not addrs:
-        return
-    # Filter all addresses to ones whose ob_type == host `set` type.
-    # That gives us every host set currently in gen0.  We can read
-    # ob_refcnt and (cautiously) PySet body fields to identify the
-    # leaker (broken body / refcnt=0).
-    def _u64sc(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    host_set_id = id(set)
-    set_addrs = [a for a in addrs if _u64sc(a + 8) == host_set_id]
-    print("[gen2-bisect] host-set instances in gen0: %d"
-          % len(set_addrs), file=sys.stderr, flush=True)
-    # Dump each set's refcnt and body sanity.  PySetObject body
-    # plausibility check: 0 <= used <= mask+1, mask is a power of 2
-    # minus 1, mask >= PySet_MINSIZE-1=7.  table is either the
-    # smalltable inside the object (very common) or an external buffer.
-    weird_sets = []
-    # Real PySetObject invariants (Python 3.13):
-    #   mask is power-of-2 minus 1, >= 7 (PySet_MINSIZE-1 = 7)
-    #   0 <= used <= fill <= mask
-    #   table points to either &smalltable (offset +64) or an external
-    #     buffer; the external buffer is well-defined memory
-    # For our broken set we expect: huge mask (not power-of-2 - 1),
-    # huge fill/used, table in bizarre range.
-    _POW2_MINUS_1 = {(1 << k) - 1 for k in range(3, 31)}
-    for sa in set_addrs:
-        rc = _u64sc(sa)
-        fill = _u64sc(sa + 16)
-        used = _u64sc(sa + 24)
-        mask = _u64sc(sa + 32)
-        table = _u64sc(sa + 40)
-        smalltable = sa + 64
-        mask_ok = mask in _POW2_MINUS_1
-        sizes_ok = (used <= fill <= mask) if mask_ok else False
-        table_ok = (
-            table == smalltable
-            or 0x100_000_000 <= table < 0x10_000_000_000
-        )
-        if not (mask_ok and sizes_ok and table_ok):
-            weird_sets.append((sa, rc, fill, used, mask, table, smalltable))
-    print("[gen2-bisect] sets with broken body invariants: %d"
-          % len(weird_sets), file=sys.stderr)
-    for (sa, rc, fill, used, mask, table, smalltable) in weird_sets[:5]:
-        print("[gen2-bisect]   weird-set addr=0x%x refcnt=%d "
-              "fill=%d used=%d mask=0x%x table=0x%x smalltable=0x%x"
-              % (sa, rc, fill, used, mask, table, smalltable),
-              file=sys.stderr)
-    # Sanity: dump first/last 5 entries' types so we can see if the
-    # walker is sane (real objects, not garbage memory).
-    def _u64x(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    for label, sample in [("first", addrs[:5]), ("last", addrs[-5:])]:
-        for i, a in enumerate(sample):
-            tp = _u64x(a + 8)
-            nm = b""
-            if tp:
-                npr = _u64x(tp + 24)
-                if 0x100_000_000 <= npr < 0x10_000_000_000:
-                    nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
-            print("[gen2-bisect]   %s[%d]: addr=0x%x refcnt=%d ob_type=0x%x tp_name=%r"
-                  % (label, i, a, _u64x(a), tp,
-                     nm.decode("ascii", "replace")), file=sys.stderr)
-    # Scan for ALL objects with refcnt=0 OR _gc_prev=0 in the gen list
-    # -- both are indicators of an object that should have been
-    # deallocated/untracked but stayed in gc-list.
-    refcnt_zero = []
-    gp_zero = []
-    for a in addrs:
-        if _u64x(a) == 0:
-            refcnt_zero.append(a)
-        if _u64x(a - 8) == 0:  # _gc_prev field
-            gp_zero.append(a)
-    print("[gen2-bisect] objects with refcnt=0 still in gc-list: %d"
-          % len(refcnt_zero), file=sys.stderr)
-    print("[gen2-bisect] objects with _gc_prev=0 still in gc-list: %d"
-          % len(gp_zero), file=sys.stderr)
-    for label, suspects in [("refcnt=0", refcnt_zero),
-                            ("_gc_prev=0", gp_zero)]:
-        for i, a in enumerate(suspects[:10]):
-            tp = _u64x(a + 8)
-            nm = b""
-            if tp:
-                npr = _u64x(tp + 24)
-                if 0x100_000_000 <= npr < 0x10_000_000_000:
-                    nm = ctypes.string_at(
-                        npr, 64).split(b"\x00", 1)[0]
-            rc = _u64x(a)
-            gp = _u64x(a - 8)
-            print("[gen2-bisect]   %s[%d]: addr=0x%x rc=%d type=%r "
-                  "_gc_prev=0x%x"
-                  % (label, i, a, rc, nm.decode("ascii", "replace"), gp),
-                  file=sys.stderr)
-    # Reconstruct Python object refs from addresses.  ctypes
-    # ``py_object`` cast reads the PyObject* at the address (treating
-    # the address-int as a value of type ``void*`` then casting).  We
-    # need actual object handles to pass to gc.get_referents in the
-    # child.  Note: this does NOT INCREF -- the parent's heap already
-    # holds them via the gc list itself.
-    all_objs = []
-    for a in addrs:
-        try:
-            all_objs.append(ctypes.cast(a, ctypes.py_object).value)
-        except (ValueError, OSError):
-            pass
-    print("[gen2-bisect] reconstructed %d object refs from addresses"
-          % len(all_objs), file=sys.stderr, flush=True)
-    if not all_objs:
-        return
-    # Probe 0: walk the linked list bidirectionally and check the
-    # doubly-linked invariant.  For each obj at head h, verify
-    # ``u64(h) == h_next`` AND ``u64(h_next + 8) == h`` (h_next's
-    # _gc_prev should point back to h).  Any break is the bug.
-    print("[gen2-bisect] checking doubly-linked invariants in gen0...",
-          file=sys.stderr, flush=True)
-    HEAD_SIZE = 16
-    PTR_MASK = ~0xF
-    def _u64v(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    bad_links = []
-    for a in addrs:
-        head = a - HEAD_SIZE
-        nxt = _u64v(head) & PTR_MASK
-        if nxt == 0 or (nxt & 0x7):
-            bad_links.append((head, "nxt invalid 0x%x" % nxt))
-            continue
-        # nxt is the NEXT object's PyGC_Head address.  nxt's _gc_prev
-        # should equal head (modulo low-bit flags).
-        nxt_prev = _u64v(nxt + 8) & PTR_MASK
-        if nxt_prev != head:
-            bad_links.append((head,
-                              "nxt(0x%x)._gc_prev=0x%x but expected 0x%x"
-                              % (nxt, nxt_prev, head)))
-    print("[gen2-bisect] doubly-linked invariant breaks: %d"
-          % len(bad_links), file=sys.stderr)
-    for head, msg in bad_links[:10]:
-        # Decode the obj at this head.
-        obj = head + HEAD_SIZE
-        rc = _u64v(obj)
-        tp = _u64v(obj + 8)
-        nm = b""
-        if tp:
-            npr = _u64v(tp + 24)
-            if 0x100_000_000 <= npr < 0x10_000_000_000:
-                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
-        # Is this a host object or interp-managed?  Host types live in
-        # the host Python binary (low addresses); interp types live in
-        # our _malloc'd memory.
-        is_host_dict = (tp == id(dict))
-        is_host_set = (tp == id(set))
-        is_host_list = (tp == id(list))
-        is_host_tuple = (tp == id(tuple))
-        host_str = ""
-        if is_host_dict: host_str = " HOST dict"
-        elif is_host_set: host_str = " HOST set"
-        elif is_host_list: host_str = " HOST list"
-        elif is_host_tuple: host_str = " HOST tuple"
-        print("[gen2-bisect]   broken-link head=0x%x obj=0x%x rc=%d "
-              "type=%r%s: %s"
-              % (head, obj, rc, nm.decode("ascii", "replace"),
-                 host_str, msg),
-              file=sys.stderr)
-        # Try to identify the dict's content: dict basic layout
-        # (CPython 3.7): ob_refcnt (8) ob_type (8) ma_used (8)
-        # ma_version_tag (8) ma_keys (8) ma_values (8).  Read ma_used.
-        if is_host_dict:
-            ma_used = _u64v(obj + 16)
-            print("[gen2-bisect]     ma_used=%d (dict size at break time)"
-                  % ma_used, file=sys.stderr)
-        # Also try to find what's in interp.mallocs or any other ref
-        # to this address.
-        interp = _gen2_bisect_interp
-        if interp is not None and hasattr(interp, "mallocs"):
-            for _base, _buf in interp.mallocs.items():
-                try:
-                    _sz = ctypes.sizeof(_buf)
-                except (TypeError, OSError):
-                    continue
-                if _base <= obj < _base + _sz:
-                    print("[gen2-bisect]     in interp.mallocs at base=0x%x "
-                          "offset=%d" % (_base, obj - _base),
-                          file=sys.stderr)
-                    break
-        # Is the broken dict's address (or its PyGC_Head) tracked by
-        # our interp's pointerStorage?  If yes, the interp held a
-        # pointer into host Python's heap -- and likely wrote through
-        # it, clobbering the dict's gc-list links.
-        if interp is not None and hasattr(interp, "pointerStorage"):
-            # pointerStorage is a WeakValueDictionary keyed by int addr.
-            # Check exact obj addr and head addr.
-            for _check_addr, _label in [(obj, "obj"), (head, "head"),
-                                         (head + 0, "head._gc_next"),
-                                         (head + 8, "head._gc_prev")]:
-                if _check_addr in interp.pointerStorage:
-                    print("[gen2-bisect]     pointerStorage HAS entry "
-                          "at 0x%x (%s) -- interp had a ctypes "
-                          "pointer here!"
-                          % (_check_addr, _label),
-                          file=sys.stderr)
-            # Find any pointerStorageRanges entry whose END is the
-            # broken obj's PyGC_Head start -- that's the
-            # buffer-overflow source.
-            if hasattr(interp, "pointerStorageRanges"):
-                for _r in interp.pointerStorageRanges:
-                    if isinstance(_r, tuple) and len(_r) == 2:
-                        _ra, _rs = _r
-                        # End-adjacent OR head inside the range.
-                        if _ra <= head < _ra + _rs + 16:
-                            print("[gen2-bisect]     pointerStorageRanges "
-                                  "covers head: range_base=0x%x size=%d "
-                                  "(head offset=%d)"
-                                  % (_ra, _rs, head - _ra),
-                                  file=sys.stderr)
-                            # Look up the live ctype object for this range.
-                            if hasattr(interp, "pointerStorage"):
-                                _obj = interp.pointerStorage.get(_ra)
-                                if _obj is not None:
-                                    print("[gen2-bisect]     range_base "
-                                          "0x%x -> ctype %r "
-                                          "(type=%s, size=%d via sizeof)"
-                                          % (_ra, _obj,
-                                             type(_obj).__name__,
-                                             ctypes.sizeof(_obj)
-                                             if hasattr(_obj, "_b_needsfree_")
-                                             else -1),
-                                          file=sys.stderr)
-                                    # Walk the _b_base_ chain to find
-                                    # the parent struct that contains
-                                    # this 64-byte field (if any).
-                                    _b = _obj
-                                    _depth = 0
-                                    while hasattr(_b, "_b_base_") and _b._b_base_ is not None and _depth < 8:
-                                        _b = _b._b_base_
-                                        _depth += 1
-                                        print("[gen2-bisect]     "
-                                              "_b_base_[%d] = %r "
-                                              "(type=%s, size=%d)"
-                                              % (_depth, _b,
-                                                 type(_b).__name__,
-                                                 ctypes.sizeof(_b)
-                                                 if hasattr(_b, "_b_needsfree_")
-                                                 else -1),
-                                              file=sys.stderr)
-                                    # Look up the type allocated AT
-                                    # this address via _PyObject_GC_New.
-                                    # _PyObject_GC_New returns obj
-                                    # AFTER PyGC_Head, so obj_addr =
-                                    # range_base + sizeof(PyGC_Head).
-                                    # In CPython 3.7, PyGC_Head is 24
-                                    # bytes (3 pointers).  Try a few
-                                    # plausible offsets.
-                                    typeinfo = None
-                                    for _off in (0, 16, 24, 32):
-                                        ti = _gen2_bisect_alloc_type_log.get(_ra + _off)
-                                        if ti is not None:
-                                            typeinfo = ti
-                                            print("[gen2-bisect]     "
-                                                  "_PyObject_GC_New "
-                                                  "match at range_base"
-                                                  "+%d: type %r "
-                                                  "tp_basicsize=%d"
-                                                  % (_off, ti[1], ti[0]),
-                                                  file=sys.stderr)
-                                            break
-                                    if typeinfo is None:
-                                        print("[gen2-bisect]     no "
-                                              "_PyObject_GC_New record "
-                                              "for this address (or "
-                                              "any +0/+16/+24/+32 offset). "
-                                              "Buffer allocated via "
-                                              "different path.",
-                                              file=sys.stderr)
-                                    # Look up the captured stack for
-                                    # this range's last registration.
-                                    stk = _gen2_bisect_size64_log.get(_ra)
-                                    if stk:
-                                        print("[gen2-bisect]     LAST "
-                                              "registration stack (top "
-                                              "of stack last):",
-                                              file=sys.stderr)
-                                        for f, ln, n in stk[-10:]:
-                                            print("[gen2-bisect]       "
-                                                  "%s:%d %s" % (f, ln, n),
-                                                  file=sys.stderr)
-                                    # Dump the bytes spanning the
-                                    # buffer end into the broken obj's
-                                    # PyGC_Head -- the corruption site.
-                                    # Read 32 bytes starting from byte
-                                    # 48 of the buf (covers buf[48..63]
-                                    # = im_self + im_weakreflist AND
-                                    # the broken obj's _gc_next/_gc_prev
-                                    # at offset 64..80).
-                                    span_start = _ra + 48
-                                    span = ctypes.string_at(span_start, 32)
-                                    print("[gen2-bisect]     span bytes "
-                                          "[buf+48 .. buf+80) = "
-                                          "buf_tail | next_obj_head: %s"
-                                          % span.hex(),
-                                          file=sys.stderr)
-                                    # Decode as 4 uint64s.
-                                    import struct
-                                    vals = struct.unpack("<4Q", span)
-                                    print("[gen2-bisect]       buf[48..55] "
-                                          "(im_self?) = 0x%x" % vals[0],
-                                          file=sys.stderr)
-                                    print("[gen2-bisect]       buf[56..63] "
-                                          "(im_weakreflist?) = 0x%x" % vals[1],
-                                          file=sys.stderr)
-                                    print("[gen2-bisect]       buf[64..71] "
-                                          "= next_obj._gc_next = 0x%x  "
-                                          "*** EXPECTED NON-ZERO ***" % vals[2],
-                                          file=sys.stderr)
-                                    print("[gen2-bisect]       buf[72..79] "
-                                          "= next_obj._gc_prev = 0x%x"
-                                          % vals[3], file=sys.stderr)
-                                    # Dump 64 bytes content of the buffer.
-                                    raw = bytes(_obj)
-                                    printable = "".join(
-                                        chr(b) if 32 <= b < 127 else "."
-                                        for b in raw)
-                                    print("[gen2-bisect]     buf bytes: %r"
-                                          % printable, file=sys.stderr)
-                                    print("[gen2-bisect]     buf hex: %s"
-                                          % raw.hex(), file=sys.stderr)
-                                else:
-                                    print("[gen2-bisect]     range_base "
-                                          "0x%x -> pointerStorage entry "
-                                          "is DEAD (weakref expired) -- "
-                                          "the overflowing buffer was "
-                                          "already deallocated"
-                                          % _ra, file=sys.stderr)
-                            break
-    # Probe 1: does an explicit gc.collect() (mirroring what host
-    # shutdown does) trigger the bug?  This walks the gen linked
-    # list, different code path than get_referents/tp_traverse.
-    print("[gen2-bisect] explicitly calling gc.collect()...",
-          file=sys.stderr, flush=True)
-    crashed_in_collect = _fork_call_gc_collect()
-    if crashed_in_collect:
-        print("[gen2-bisect] gc.collect() CRASHES -- bug IS in gen-list "
-              "walk machinery", file=sys.stderr)
-    else:
-        print("[gen2-bisect] gc.collect() did NOT crash",
-              file=sys.stderr)
-    # Probe 2: does the whole-set traverse crash?  If not, the bug
-    # is in the gen-list walk machinery, not any single object.
-    crashed = _fork_traverse_subset(all_objs, 0, len(all_objs))
-    if not crashed:
-        print("[gen2-bisect] FULL set did NOT crash in get_referents."
-              " Bug is likely in gen-list-walk machinery, not in any"
-              " single object's tp_traverse.", file=sys.stderr)
-        return
-    print("[gen2-bisect] FULL set crashes -- bisecting...",
-          file=sys.stderr, flush=True)
-    idx = _bisect_traverse(all_objs)
-    if idx is None:
-        print("[gen2-bisect] bisect failed to narrow down", file=sys.stderr)
-        return
-    bad = all_objs[idx]
-    print("[gen2-bisect] *** BAD OBJ: idx=%d addr=0x%x type=%s ***"
-          % (idx, id(bad), type(bad).__name__),
-          file=sys.stderr, flush=True)
-    # Hypothesis: leaker's body holds garbage because the slot was
-    # previously used as one of our interp's _malloc'd buffers,
-    # then freed and given back to pymalloc which reused it for a
-    # host set without zeroing.  Check the overlap.
-    bad_addr_val = id(bad)
-    overlap = None
-    interp = _gen2_bisect_interp
-    if interp is not None and hasattr(interp, "mallocs"):
-        for _base, _buf in interp.mallocs.items():
-            try:
-                _sz = ctypes.sizeof(_buf)
-            except (TypeError, OSError):
-                continue
-            if _base <= bad_addr_val < _base + _sz:
-                overlap = (_base, _sz)
-                break
-    if overlap is not None:
-        print("[gen2-bisect]   bad set address IS INSIDE interp.mallocs "
-              "buffer: base=0x%x size=%d offset=%d  *** PYMALLOC/INTERP "
-              "MEMORY COLLISION ***"
-              % (overlap[0], overlap[1], bad_addr_val - overlap[0]),
-              file=sys.stderr)
-    else:
-        print("[gen2-bisect]   bad set address NOT in any interp.mallocs "
-              "buffer (so the garbage body isn't our interp's data)",
-              file=sys.stderr)
-    # Was this set created BEFORE runFunc (pre-existing host machinery)
-    # or DURING runFunc (created by interp activity)?
-    if bad_addr_val in _gen2_bisect_pre_set_ids:
-        print("[gen2-bisect]   bad set existed BEFORE runFunc -- it's a "
-              "pre-existing host set whose body got clobbered during runFunc",
-              file=sys.stderr)
-    else:
-        print("[gen2-bisect]   bad set was created DURING runFunc -- "
-              "leak happened via interp activity",
-              file=sys.stderr)
-    # Is the bad set's ob_type the HOST `set` type (= same as `id(set)`)?
-    # If yes: this is a HOST python set, leaked by something our interp
-    # does to host objects.  If no: it's an interp-built set type,
-    # leaked by interpreted CPython source.
-    def _u64x_typecheck(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    bad_ob_type = _u64x_typecheck(id(bad) + 8)
-    host_set_id = id(set)
-    host_frozenset_id = id(frozenset)
-    if bad_ob_type == host_set_id:
-        print("[gen2-bisect]   bad obj's ob_type == HOST set type "
-              "(0x%x).  Leak is in HOST Python." % bad_ob_type,
-              file=sys.stderr)
-    elif bad_ob_type == host_frozenset_id:
-        print("[gen2-bisect]   bad obj's ob_type == HOST frozenset type "
-              "(0x%x).  Leak is in HOST Python." % bad_ob_type,
-              file=sys.stderr)
-    else:
-        print("[gen2-bisect]   bad obj's ob_type=0x%x is NOT host "
-              "set/frozenset (host set=0x%x, frozenset=0x%x). Probably "
-              "an interp-built set type."
-              % (bad_ob_type, host_set_id, host_frozenset_id),
-              file=sys.stderr)
-    _dump_pygc_head_forensics(id(bad))
-    # Dump neighbors in the linked list (idx-5 .. idx+5) -- temporally
-    # adjacent allocations, may hint at what code was running when the
-    # leaked set was created.
-    print("[gen2-bisect] neighbors in gen0 list (by walk order):",
-          file=sys.stderr)
-    def _u64x2(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    lo_n = max(0, idx - 5)
-    hi_n = min(len(addrs), idx + 6)
-    for j in range(lo_n, hi_n):
-        a = addrs[j]
-        tp = _u64x2(a + 8)
-        nm = b""
-        if tp:
-            npr = _u64x2(tp + 24)
-            if 0x100_000_000 <= npr < 0x10_000_000_000:
-                nm = ctypes.string_at(npr, 64).split(b"\x00", 1)[0]
-        marker = "  <-- BAD" if j == idx else ""
-        rc = _u64x2(a)
-        gp = _u64x2(a - 16 + 8)
-        print("[gen2-bisect]   [%d] addr=0x%x refcnt=%d type=%r _gc_prev=0x%x%s"
-              % (j, a, rc, nm.decode("ascii", "replace"), gp, marker),
-              file=sys.stderr)
+    HEAD_SIZE = 16  # CPython 3.13 PyGC_Head (2 * uintptr_t)
+    PTR_MASK = ~0xF  # low 4 bits of _gc_prev are tag flags
 
-
-def _walk_gen_via_pygc_head():
-    """Walk Python's gc-tracked-object linked list via raw PyGC_Head
-    pointer reads.  Returns a list of object addresses (=id of obj).
-
-    PyGC_Head layout (Python 3.13): 16 bytes -- ``uintptr_t _gc_next,
-    _gc_prev``.  Object body starts at head + 16.  The list is
-    circular with a sentinel head whose body is not a real PyObject.
-
-    With ``gc.disable()`` in effect, every gc-tracked obj lives in
-    the same young-gen list (no promotion happens).  We anchor on a
-    locally-created list ``anchor = []`` (gc-tracked dict/list/etc.
-    work; ``type`` does NOT because builtin types are statically
-    allocated and not in the gc list).  Walk forward via ``_gc_next``
-    until we cycle.
-
-    Filtering: the gen-list contains a sentinel PyGC_Head whose
-    object body is not a real PyObject.  We skip entries whose
-    ``ob_refcnt`` looks implausible (must be > 0 and < 2^32).
-    """
-    HEAD_SIZE = 16
-    PTR_MASK = ~0xF  # _gc_prev encodes flags in low 4 bits
     def u64(addr):
         return ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint64))[0]
-    anchor = []  # gc-tracked container
-    anchor_head = id(anchor) - HEAD_SIZE
-    anchor_next = u64(anchor_head) & PTR_MASK
-    anchor_prev = u64(anchor_head + 8) & PTR_MASK
-    print("[gen2-bisect] anchor PyGC_Head 0x%x: _gc_next=0x%x _gc_prev=0x%x"
-          % (anchor_head, anchor_next, anchor_prev), file=sys.stderr)
-    addrs = []
-    seen = {anchor_head}
-    cur = anchor_next  # _gc_next
-    MAX = 50_000_000
-    for _ in range(MAX):
-        if cur == 0 or (cur & 0x7):
-            break
-        if cur in seen:
-            break
+
+    anchor = []  # always gc-tracked
+    head = id(anchor) - HEAD_SIZE
+    seen = {head}
+    cur = u64(head) & PTR_MASK
+    visited = 0
+    MAX_NODES = 50_000_000  # safety cap
+    while visited < MAX_NODES:
+        if cur == 0 or (cur & 0x7) or cur in seen:
+            break  # NULL, unaligned, or cycle back -- end of walk
         seen.add(cur)
-        rc = u64(cur + HEAD_SIZE)
-        tp = u64(cur + HEAD_SIZE + 8)
-        # Filter unfilterable garbage but accept refcnt=0 -- a refcnt=0
-        # object still in the gc list IS what we want to find.
-        if rc < (1 << 32) and tp != 0:
-            addrs.append(cur + HEAD_SIZE)
+        visited += 1
         nxt = u64(cur) & PTR_MASK
+        if nxt == 0:
+            return (cur, visited)  # forward link broken (NULL)
+        # Verify back-pointer.
+        nxt_prev = u64(nxt + 8) & PTR_MASK
+        if nxt_prev != cur:
+            return (cur, visited)  # doubly-linked invariant broken
         cur = nxt
-    return addrs
-
-
-def _fork_call_gc_collect():
-    """Fork a child, re-enable gc, call gc.collect().  Returns True
-    if the child died from a crash (signal or _exit 134/138/139)."""
-    import gc as _gc
-    pid = os.fork()
-    if pid == 0:
-        _gc.enable()
-        _gc.collect()
-        os._exit(0)
-    _pid, status = os.waitpid(pid, 0)
-    if os.WIFSIGNALED(status):
-        return True
-    if os.WEXITSTATUS(status) in (134, 138, 139):
-        return True
-    return False
-
-
-def _fork_traverse_subset(all_objs, lo, hi):
-    """Fork a child that calls gc.get_referents() on every object in
-    ``all_objs[lo:hi]``.  Return True iff the child died abnormally
-    (segfault / signal).
-
-    Uses os.fork() so the child inherits the heap state exactly.
-    """
-    import gc as _gc
-    r, w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        # Child.
-        os.close(r)
-        try:
-            for i in range(lo, hi):
-                _gc.get_referents(all_objs[i])
-            os.write(w, b"OK")
-            os._exit(0)
-        except BaseException as e:
-            try:
-                os.write(w, ("EX:%s" % type(e).__name__).encode())
-            except OSError:
-                pass
-            os._exit(2)
-    # Parent.
-    os.close(w)
-    _pid, status = os.waitpid(pid, 0)
-    try:
-        msg = os.read(r, 64)
-    except OSError:
-        msg = b""
-    os.close(r)
-    # Crashed = signal death (WIFSIGNALED) -- OR -- exit code 139
-    # (128+SIGSEGV), which is what our --quiet-crash handler uses
-    # when it intercepts a SIGSEGV in the child and calls _exit().
-    # Also 134 (128+SIGABRT) and 138 (128+SIGBUS) for completeness.
-    if os.WIFSIGNALED(status):
-        return True
-    if os.WEXITSTATUS(status) in (134, 138, 139):
-        return True
-    if os.WEXITSTATUS(status) == 0 and msg == b"OK":
-        return False
-    # Exception in child -- not a memory crash but still a failure
-    # mode worth reporting.
-    print("[gen2-bisect] child non-segv failure: status=%d msg=%r"
-          % (status, msg), file=sys.stderr)
-    return False
-
-
-def _bisect_traverse(all_objs):
-    """Binary-search the bad obj index by halving and fork-testing.
-    Returns the offending index in ``all_objs``, or None if narrowing
-    failed.
-    """
-    lo, hi = 0, len(all_objs)
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        print("[gen2-bisect] testing left [%d:%d] (%d items)..."
-              % (lo, mid, mid - lo), file=sys.stderr, flush=True)
-        if _fork_traverse_subset(all_objs, lo, mid):
-            hi = mid
-            continue
-        print("[gen2-bisect] testing right [%d:%d] (%d items)..."
-              % (mid, hi, hi - mid), file=sys.stderr, flush=True)
-        if _fork_traverse_subset(all_objs, mid, hi):
-            lo = mid
-            continue
-        print("[gen2-bisect] neither half crashes at lo=%d hi=%d mid=%d"
-              % (lo, hi, mid), file=sys.stderr)
-        return None
-    if hi - lo == 1:
-        return lo
-    return None
-
-
-def _dump_pygc_head_forensics(obj_addr):
-    """Dump PyGC_Head + PyObject_HEAD + tp_name + (if set) elements
-    for forensic logging.  All reads go through ctypes raw memory,
-    bypassing tp_traverse which is the crashing path.
-    """
-    def u64(a):
-        return ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64))[0]
-    head = obj_addr - 16
-    _next = u64(head)
-    _prev = u64(head + 8)
-    rc = u64(obj_addr)
-    tp = u64(obj_addr + 8)
-    name_ptr = u64(tp + 24) if tp else 0
-    name = b""
-    if 0x100_000_000 <= name_ptr < 0x10_000_000_000:
-        name = ctypes.string_at(name_ptr, 64).split(b"\x00", 1)[0]
-    print("[gen2-bisect]   PyGC_Head 0x%x: _gc_next=0x%x _gc_prev=0x%x"
-          % (head, _next, _prev), file=sys.stderr)
-    print("[gen2-bisect]   PyObject  0x%x: refcnt=%d ob_type=0x%x tp_name=%r"
-          % (obj_addr, rc, tp, name.decode("ascii", "replace")),
-          file=sys.stderr)
-    # If it's a set/frozenset, dump PySetObject internals: fill,
-    # used, mask, table pointer.  PySetObject layout (Python 3.13):
-    #   ob_refcnt (8), ob_type (8),             // 0..16   (PyObject_HEAD)
-    #   fill (8),       used (8),               // 16..32
-    #   mask (8),       table (8 ptr),          // 32..48
-    #   hash (8),       finger (8),             // 48..64
-    #   smalltable[8] (each entry = hash + key = 16 bytes -> 128 bytes),
-    #   weakreflist (8 ptr).
-    if name in (b"set", b"frozenset"):
-        fill = u64(obj_addr + 16)
-        used = u64(obj_addr + 24)
-        mask = u64(obj_addr + 32)
-        table = u64(obj_addr + 40)
-        weaklist = u64(obj_addr + 16 + 64 + 128)  # rough; layout may shift
-        print("[gen2-bisect]   PySet: fill=%d used=%d mask=0x%x table=0x%x"
-              % (fill, used, mask, table), file=sys.stderr)
-        # Walk table for (hash, key) entries.  Sanity-check table
-        # addr and used/mask before iterating -- the body is likely
-        # corrupt (the bug), so unchecked reads here will segfault.
-        TABLE_OK = (
-            0x100_000_000 <= table < 0x10_000_000_000
-            and 0 < used < 1024 and 0 < mask < 4096
-        )
-        if not TABLE_OK:
-            print("[gen2-bisect]   PySet body fields look corrupt -- "
-                  "skipping entry walk (table/used/mask out of plausible "
-                  "range)", file=sys.stderr)
-            return
-        if table and used > 0:
-            print("[gen2-bisect]   PySet entries (up to mask+1=%d slots):"
-                  % (mask + 1), file=sys.stderr)
-            shown = 0
-            for i in range(min(mask + 1, 64)):
-                ent = table + i * 16
-                ehash = u64(ent)
-                ekey = u64(ent + 8)
-                if ekey == 0 or ekey == 1:  # NULL=empty, 1=dummy in CPython
-                    continue
-                # Read key's refcnt and ob_type defensively.
-                ek_rc = ek_tp = ek_tn = 0
-                ek_name = b""
-                if 0x100_000_000 <= ekey < 0x10_000_000_000:
-                    ek_rc = u64(ekey)
-                    ek_tp = u64(ekey + 8)
-                    if ek_tp:
-                        ek_tn = u64(ek_tp + 24)
-                        if 0x100_000_000 <= ek_tn < 0x10_000_000_000:
-                            ek_name = ctypes.string_at(
-                                ek_tn, 64).split(b"\x00", 1)[0]
-                print("[gen2-bisect]     slot[%d]: hash=0x%x key=0x%x "
-                      "key.refcnt=%d key.type=0x%x key.tp_name=%r"
-                      % (i, ehash, ekey, ek_rc, ek_tp,
-                         ek_name.decode("ascii", "replace")),
-                      file=sys.stderr)
-                shown += 1
-                if shown >= 12:
-                    print("[gen2-bisect]     ... (more slots truncated)",
-                          file=sys.stderr)
-                    break
+    return None, visited
 
 
 if __name__ == '__main__':
