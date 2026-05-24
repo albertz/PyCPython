@@ -60,10 +60,31 @@ Verification:
   shutdown gc).
 - After: `./cpython.py -c "print('hi')"` → exit 1 (clean
   CAbortException from missing `_thread` import; no segfault).
-- `--gen2-bisect` after fix reports:
-    `doubly-linked invariant breaks: 0`
-    `gc.collect() did NOT crash`
-    `FULL set did NOT crash in get_referents`
+- `./cpython.py --check-gc-invariants -c "print('hi')"` reports
+  ``[gc-inv] gen0 invariant check OK (visited=15433320)``.
+- Regression tests:
+  - ``cparser/tests/test_interpreter_extra.py::test_file_scope_static_collision_observable_at_runtime``
+    -- self-contained: two .c sources, each with ``static int counter``;
+    increments in one file leak into the other's reads (current
+    buggy behaviour, asserted explicitly).
+  - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_silent_merge``
+    -- parse-level: state.vars has only ONE ``shared`` entry.
+  - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_workaround_via_macros``
+    -- verifies the macro-based workaround used in ``cpython.py``.
+
+Note on diagnostic flags: the historical narrative below references
+the original investigation flags (``--gen2-bisect``,
+``--targeted-watch``, ``--invariant-check-window``).  These were
+specific to the investigation and have been removed.  What remains
+in ``cpython.py`` for future debugging:
+- ``--quiet-crash``: suppress macOS CrashReporter dialog on
+  SIGSEGV/SIGBUS/SIGABRT.
+- ``--check-gc-invariants``: post-runFunc bidirectional gen0 walk.
+- ``--invariant-check-interval N``: periodic version for bisecting
+  WHEN a break appears.
+- ``--gc-check-interval``/``-at``/``-range``: pre-existing
+  bisection probes via ``gc.get_referrers``.
+- ``--instrument FUNC``: pre-existing entry/exit logging.
 
 ---
 
