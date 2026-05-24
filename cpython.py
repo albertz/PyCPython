@@ -180,7 +180,13 @@ class CPythonState(cparser.State):
                    # bytes_methods.c, unicodeobject.c, and probably more.
                    "ADJUST_INDICES"):
             self.macros.pop(_m, None)
+        # ``tailmatch`` collides: unicodeobject.c uses (PyObject*,
+        # PyObject*, Py_ssize_t, Py_ssize_t, int), bytes_methods.c
+        # uses (const char*, Py_ssize_t, PyObject*, ...).  Rename
+        # bytes_methods's version.
+        self.macros["tailmatch"] = cparser.Macro(rightside="tailmatch_bytes")
         cparser.parse(CPythonDir + "/Objects/bytes_methods.c", self)
+        self.macros.pop("tailmatch", None)
         # bytearrayobject.c #defines STRINGLIB_* macros that asciilib.h
         # (included via unicodeobject.c above) already defined.  Drop the
         # earlier definitions so the file can re-#define them locally.
