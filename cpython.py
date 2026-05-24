@@ -194,7 +194,13 @@ class CPythonState(cparser.State):
         for _m in ("STRINGLIB_ISSPACE", "STRINGLIB_ISLINEBREAK",
                    "STRINGLIB_CHECK_EXACT"):
             self.macros.pop(_m, None)
+        # File-scope static collisions with unicodeobject.c.  Rename
+        # bytearrayobject's versions to avoid type-confusion merging.
+        self.macros["_common_reduce"] = cparser.Macro(rightside="_common_reduce_bytearray")
+        self.macros["pad"] = cparser.Macro(rightside="pad_bytearray")
         cparser.parse(CPythonDir + "/Objects/bytearrayobject.c", self) # PyByteArray_Type
+        self.macros.pop("_common_reduce", None)
+        self.macros.pop("pad", None)
         # bytesobject.c includes stringlib/stringdefs.h which redefines a
         # bunch of STRINGLIB_* macros that asciilib.h (via unicodeobject.c)
         # already set up, plus the ADJUST_INDICES helper that bytearray and
