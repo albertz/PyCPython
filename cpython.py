@@ -112,6 +112,76 @@ class CPythonState(cparser.State):
         del self.macros["EMPTY"]  # will be redefined later
         cparser.parse(CPythonDir + "/Python/getopt.c", self) # _PyOS_GetOpt
         cparser.parse(CPythonDir + "/Python/pythonrun.c", self) # Py_Initialize
+        cparser.parse(CPythonDir + "/Python/pyarena.c", self) # PyArena_New, struct _arena
+        cparser.parse(CPythonDir + "/Parser/bitset.c", self)
+        cparser.parse(CPythonDir + "/Parser/grammar1.c", self)
+        cparser.parse(CPythonDir + "/Parser/node.c", self) # PyNode_New, etc.
+        cparser.parse(CPythonDir + "/Parser/listnode.c", self)
+        cparser.parse(CPythonDir + "/Parser/acceler.c", self)
+        cparser.parse(CPythonDir + "/Parser/tokenizer.c", self) # PyTokenizer_*
+        cparser.parse(CPythonDir + "/Parser/parser.c", self) # PyParser_New, PyParser_AddToken
+        cparser.parse(CPythonDir + "/Parser/parsetok.c", self) # PyParser_ParseStringObject
+        cparser.parse(CPythonDir + "/Python/graminit.c", self) # _PyParser_Grammar
+        # ``graminit.h`` (transitively included via ``parsetok.c``) defines
+        # very generic grammar-symbol names like ``test``, ``expr``,
+        # ``atom``, ``term``, ``power``, etc. as integer constants.
+        # cparser keeps a single global macro namespace, so these would
+        # poison every subsequently-parsed file using any of those names
+        # as a local variable (e.g. ``bytearray_repr`` has
+        # ``char *test, *start;``).  Pop them here -- parser
+        # C code that needs them has already been parsed.  We have to
+        # do this AGAIN later because ast.c re-includes graminit.h.
+        _grammar_macros_to_pop = (
+            "single_input", "file_input", "eval_input", "decorator",
+            "decorators", "decorated", "async_funcdef", "funcdef",
+            "parameters", "typedargslist", "tfpdef", "varargslist",
+            "vfpdef", "stmt", "simple_stmt", "small_stmt", "expr_stmt",
+            "annassign", "testlist_star_expr", "augassign", "del_stmt",
+            "pass_stmt", "flow_stmt", "break_stmt", "continue_stmt",
+            "return_stmt", "yield_stmt", "raise_stmt", "import_stmt",
+            "import_name", "import_from", "import_as_name",
+            "dotted_as_name", "import_as_names", "dotted_as_names",
+            "dotted_name", "global_stmt", "nonlocal_stmt", "assert_stmt",
+            "compound_stmt", "async_stmt", "if_stmt", "while_stmt",
+            "for_stmt", "try_stmt", "with_stmt", "with_item",
+            "except_clause", "suite", "test", "test_nocond", "lambdef",
+            "lambdef_nocond", "or_test", "and_test", "not_test",
+            "comparison", "comp_op", "star_expr", "expr", "xor_expr",
+            "and_expr", "shift_expr", "arith_expr", "term", "factor",
+            "power", "atom_expr", "atom", "testlist_comp", "trailer",
+            "subscriptlist", "subscript", "sliceop", "exprlist",
+            "testlist", "dictorsetmaker", "classdef", "arglist",
+            "argument", "comp_iter", "sync_comp_for", "comp_for",
+            "comp_if", "encoding_decl", "yield_expr", "yield_arg",
+        )
+        for _m in _grammar_macros_to_pop:
+            self.macros.pop(_m, None)
+        # Parse the AST + compile chain.  ast.c re-includes graminit.h
+        # (no include guard -- we made it non-dedup'd in
+        # readLocalInclude) so it sees the grammar-symbol macros
+        # freshly defined and can use ``case suite:`` switch labels.
+        cparser.parse(CPythonDir + "/Python/asdl.c", self) # _Py_asdl_seq_new
+        cparser.parse(CPythonDir + "/Python/Python-ast.c", self) # _PyAST_*
+        cparser.parse(CPythonDir + "/Python/ast.c", self) # PyAST_FromNodeObject
+        cparser.parse(CPythonDir + "/Python/future.c", self) # PyFuture_FromASTObject
+        cparser.parse(CPythonDir + "/Python/peephole.c", self) # PyCode_Optimize
+        # ast_opt.c is intentionally NOT parsed; ``_PyAST_Optimize`` is
+        # replaced with a Python stub (see further down).
+        # ast.c put those macros back.  Pop AGAIN before symtable.c /
+        # compile.c -- compile.c uses ``VISIT(C, expr, V)`` to
+        # token-paste ``compiler_visit_expr``; if ``expr`` is still a
+        # macro = 315, it becomes ``compiler_visit_315`` (parse error).
+        for _m in _grammar_macros_to_pop:
+            self.macros.pop(_m, None)
+        self.macros.pop("OFF", None)  # symtable.c re-defines OFF
+        # Python-reserved-word / dunder C identifiers (``lambda``,
+        # ``__doc__``, ``__class__``, ``__annotations__`` in
+        # symtable.c / compile.c) are now handled automatically by
+        # cparser's ``py_safe_identifier`` rename + ``GlobalsWrapper.
+        # __getattribute__`` override -- no source-level renaming
+        # needed here.
+        cparser.parse(CPythonDir + "/Python/symtable.c", self) # _PySymtable_Build
+        cparser.parse(CPythonDir + "/Python/compile.c", self) # PyAST_CompileObject
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
         cparser.parse(CPythonDir + "/Python/errors.c", self) # PyErr_Clear
         cparser.parse(CPythonDir + "/Python/getargs.c", self) # PyArg_ParseTuple, _PyArg_UnpackStack, etc.
