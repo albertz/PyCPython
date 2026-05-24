@@ -23,6 +23,63 @@ Also works: ``-c "print('a'); print('b')"`` → "a\nb\n";
 
 ``-c "print(3)"`` → "3" and ``-c "print(1+2)"`` → "3" also work.
 
+## Round 7 — `INT_MIN` / `LONG_MIN` / `LLONG_MIN` macros
+
+The OverflowError observed in Round 6 turned out to be a real
+cparser-side bug:
+
+```c
+#define INT_MIN  -2147483648    /* what we had */
+```
+
+cparser's literal-typing rule (post-`SIZE_MAX` fix) types
+``2147483648`` as ``uint32_t`` because it doesn't fit in
+signed ``int32``.  Unary-minus on an unsigned wraps modulo
+``2**32``, so the macro silently expanded to ``+2147483648U``.
+Every ``x < INT_MIN`` check (e.g. inside ``_PyLong_AsInt``)
+then fired for normal small ``x`` -- including ``x = 0`` --
+producing a bogus ``OverflowError`` in
+``_install_external_importers``.
+
+### Fix (`cparser/globalincludewrappers.py`)
+Match real ``<limits.h>``:
+
+```python
+state.macros["INT_MIN"]   = Macro(rightside="(-INT_MAX - 1)")
+state.macros["LONG_MIN"]  = Macro(rightside="(-LONG_MAX - 1L)")
+state.macros["LLONG_MIN"] = Macro(rightside="(-LLONG_MAX - 1LL)")
+```
+
+The value stays in signed range throughout.
+
+### Verification
+New cparser test:
+``tests/test_interpreter_extra.py::test_int_min_comparison_no_false_overflow``
+-- ``x < INT_MIN`` returns 0 for ``x = 0``, ``x = INT_MIN``,
+and ``x = INT_MAX``.
+
+### Side note on `initexternalimport`
+With the ``INT_MIN`` fix, ``_PyLong_AsInt(0)`` no longer
+raises -- so when we call the real ``initexternalimport`` from
+``pymain_init_python_main``, the path goes *much* further into
+``_install_external_importers`` and translates a huge amount
+of importlib bytecode on demand (multiple minutes per run).
+``MarkupIterator_next`` is no longer infinite-looping; the
+remaining cost is translation overhead.  Until we have
+translation caching across runs, we keep skipping
+``initexternalimport`` -- ``-c "..."`` programs that only use
+builtins don't need the filesystem importers anyway.
+
+## Round 6 — removed `initexternalimport` Python stub (partial)
+
+(Re-instated, see Round 7.)  Original concern was the
+``MarkupIterator_next`` postfix-`++` infinite loop that
+occurred when ``PyErr_Print`` formatted the
+``_install_external_importers`` failure traceback.  The
+accumulated fixes from earlier rounds removed the loop; the
+new blocker (translation cost of the deeper import path) is
+a perf issue, not a correctness one.
+
 ## Round 5 — removed `PyModule_ExecDef` Python override
 
 The override existed because cparser couldn't translate the

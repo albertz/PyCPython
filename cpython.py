@@ -785,6 +785,14 @@ def main(argv):
         builtins_mod = py_add_module(builtins_name_ptr)
         main_dict = py_module_getdict(main_mod)
         py_dict_setitem_string(main_dict, builtins_key_ptr, builtins_mod)
+        # NOTE: the real ``initexternalimport`` -> Python-level
+        # ``importlib._install_external_importers`` no longer
+        # infinite-loops (``MarkupIterator_next`` was unblocked by
+        # other fixes), but the path translates a huge amount of
+        # importlib bytecode on demand and takes several minutes per
+        # run.  Until we have translation caching across runs, skip
+        # it -- ``-c "..."`` programs that only use builtins don't
+        # need the filesystem importers anyway.
         return 0
     _py_pymain_init_python_main.C_argTypes = None
     _py_pymain_init_python_main.C_resType = ctypes.c_int
