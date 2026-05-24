@@ -719,30 +719,6 @@ def main(argv):
     _py_gil_state_check.C_resType = ctypes.c_int
     interpreter._func_cache["PyGILState_Check"] = _py_gil_state_check
 
-    # ``initexternalimport`` calls
-    # ``importlib._install_external_importers`` which loads
-    # ``_frozen_importlib_external`` (a frozen module).  In our
-    # interp this fails for various reasons (likely some C function
-    # in the import chain isn't implemented), and the subsequent
-    # ``PyErr_Print`` recurses through ``MarkupIterator_next`` (which
-    # itself has translation issues).  For ``-c "..."`` programs, we
-    # don't actually need filesystem-based imports.  Skip
-    # ``_install_external_importers`` and return success.
-    _PyInitError_t = interpreter.getCType(state.typedefs['_PyInitError'])
-
-    def _py_initexternalimport(interp_ptr):
-        """initexternalimport: stub that always returns success.
-
-        Skips ``importlib._install_external_importers``.  This
-        means filesystem-based imports won't work, but interp can
-        still execute ``-c`` programs that don't use external
-        modules.
-        """
-        return _PyInitError_t()  # all-zero = _Py_INIT_OK
-    _py_initexternalimport.C_argTypes = None  # any signature
-    _py_initexternalimport.C_resType = state.typedefs['_PyInitError']
-    interpreter._func_cache["initexternalimport"] = _py_initexternalimport
-
     # ``pymain_init_sys_path`` fails with
     # "pymain_update_sys_path: can't get sys.path" -- since we skipped
     # initexternalimport, ``sys.path`` was never populated.  Stub it
