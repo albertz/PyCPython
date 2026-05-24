@@ -227,7 +227,16 @@ class CPythonState(cparser.State):
         # collision -- merging the two would cause type-confusion.
         # Rename bytesobject's `formatfloat` to disambiguate.
         self.macros["formatfloat"] = cparser.Macro(rightside="formatfloat_bytesobject")
+        # bytesobject.c also has its own ``do_strip``, ``do_argstrip``,
+        # ``pad`` colliding with unicodeobject.c versions of the same
+        # name but different signatures.
+        self.macros["do_strip"] = cparser.Macro(rightside="do_strip_bytes")
+        self.macros["do_argstrip"] = cparser.Macro(rightside="do_argstrip_bytes")
+        self.macros["pad"] = cparser.Macro(rightside="pad_bytes")
         cparser.parse(CPythonDir + "/Objects/bytesobject.c", self) # PyBytes_Type
+        self.macros.pop("do_strip", None)
+        self.macros.pop("do_argstrip", None)
+        self.macros.pop("pad", None)
         self.macros.pop("formatfloat", None)
         cparser.parse(CPythonDir + "/Objects/rangeobject.c", self) # PyRange_Type
         cparser.parse(CPythonDir + "/Objects/enumobject.c", self) # PyEnum_Type
