@@ -319,6 +319,11 @@ class CPythonState(cparser.State):
         self.macros["fatal_error"] = cparser.Macro(rightside="fatal_error_faulthandler")
         cparser.parse(CPythonDir + "/Modules/faulthandler.c", self) # _PyFaulthandler_Fini
         self.macros.pop("fatal_error")
+        # Modules imported by ``importlib._bootstrap._setup`` at
+        # startup -- without these, initimport fails fatally.
+        cparser.parse(CPythonDir + "/Modules/_threadmodule.c", self) # PyInit__thread
+        cparser.parse(CPythonDir + "/Modules/_weakref.c", self) # PyInit__weakref
+        cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
 
 
 def init_faulthandler(sigusr1_chain=False):
