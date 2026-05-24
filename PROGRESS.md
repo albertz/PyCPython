@@ -23,6 +23,55 @@ Also works: ``-c "print('a'); print('b')"`` → "a\nb\n";
 
 ``-c "print(3)"`` → "3" and ``-c "print(1+2)"`` → "3" also work.
 
+## Round 5 — removed `PyModule_ExecDef` Python override
+
+The override existed because cparser couldn't translate the
+cast-then-call pattern in `Objects/moduleobject.c`:
+
+```c
+ret = ((int (*)(PyObject *))cur_slot->value)(module);
+```
+
+Root cause: C's grammar requires unbounded lookahead to tell
+``int (`` apart as the start of a function call vs. a function-
+pointer type-name ``int (*) (args)``.  Our pre-3 statement parser
+commits to the call interpretation while consuming tokens.  The
+``*`` between ``( )`` is then a prefix-op with no operand and
+falls out, leaving the intermediate shape
+
+```
+CFuncCall(
+    base = CFuncCall(base = ReturnType, args = []),   # T()
+    args = [CStatement(P1), CStatement(P2), ...],     # (args)
+)
+```
+
+### Fix (`cparser/cparser.py`)
+Parser normalisation at statement-finalize time -- the buggy
+shape never escapes the parser:
+
+- New ``_is_funcptr_typename_misparse(node)`` detector.
+- New ``_funcptr_typename_misparse_to_decl(node)`` ->
+  ``CFuncPointerDecl`` converter.
+- ``CStatement.finalize`` calls the converter on
+  ``self._leftexpr`` when the shape matches.  By the time
+  ``subStatement.finalize(...)`` returns inside
+  ``_cpre3_parse_brackets``, ``subStatement._leftexpr`` is a
+  proper ``CFuncPointerDecl`` (or remained a regular value
+  if it really was a function call).
+- Added ``CFuncPointerDecl`` to ``isType`` (a function-pointer
+  type-name *is* a type, used as cast target).
+
+### Verification
+- New cparser test
+  ``tests/test_funcptrdecl.py::test_cast_to_function_pointer_then_call``
+  -- builds a real ``int(*)(int)`` callback on the host, passes
+  its address as ``void *``, interpreted ``call_via_cast`` casts
+  it back to a function pointer and invokes it.
+- All 417 cparser tests pass.
+- ``cpython.py`` works without the Python override; the real
+  C `PyModule_ExecDef` translates and runs.
+
 ## Round 4 — `pymain_init_python_main` removal (partial)
 
 Attempted to remove the `pymain_init_python_main` stub.  Got
