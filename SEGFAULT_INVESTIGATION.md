@@ -1,98 +1,157 @@
 # Segfault investigation notes
 
-## STATUS: ✅ FIXED + REPRODUCER TEST + COLLISION DETECTOR (2026-05-24)
+## Introduction
 
-The fix lives in three places now:
+PyCPython is a Python interpreter written *in Python*: cparser parses
+CPython's own C source files; the interpreter walks the resulting AST
+and executes it using host-Python ctypes for memory and call
+dispatch.  All parsed translation units (`.c` files) live in a single
+shared `cparser.State`.
 
-1. **`cpython.py`** -- the targeted 2-line workaround setting
-   ``state.macros["free_list"]`` and ``state.macros["numfree"]``
-   to per-file mangled names before parsing
-   ``Objects/classobject.c`` (matching the existing pattern for
-   ``methodobject.c``, ``boolobject.c``, ``floatobject.c``,
-   ``dictobject.c``, ``listobject.c``).
+For a while, `./cpython.py -c "print('hello')"` would
+*eventually segfault*, regardless of the program being interpreted.
+The crash always happened in host Python's GC machinery -- usually
+during shutdown:
 
-2. **`cparser/tests/test_file_scope_statics.py`** -- 3 minimal
-   tests demonstrating the bug class:
-   - ``test_file_scope_static_collision_demonstrates_bug``:
-     reproduces the silent merge (documents current cparser
-     limitation).
-   - ``test_file_scope_static_collision_workaround_via_macros``:
-     verifies the supported workaround.
-   - ``test_file_scope_static_collision_with_size_mismatch_corrupts_memory``:
-     reproduces the *specific* dangerous case (different-sized
-     statics colliding).
+    Fatal Python error: Segmentation fault
+    Current thread ... :
+      Garbage-collecting
+      <no Python frame>
 
-3. **`cparser/cparser.py`** -- defensive **collision detector**
-   in ``_addToParent``.  When two file-scope ``static`` decls with
-   different types collide across translation units, prints a
-   one-time warning per name with a suggested macro rename.  Opt-in
-   via ``CPARSER_WARN_STATIC_COLLISIONS=1`` env var (off by default
-   to keep ``cpython.py`` output clean).  Catches future regressions
-   of the same bug class.
+The crash was non-deterministic in *exact* timing (heap-layout
+sensitive) but consistently fired inside `deduce_unreachable` while
+walking gen2.  It was clearly memory corruption, but the *source* of
+the corruption was elusive: the interpreter touches host memory in
+many ways and the gen-list breakage only surfaced long after the
+write that caused it.
 
-## Original root-cause summary
+This document captures the investigation (which involved building
+substantial diagnostic infrastructure -- bidirectional gc-list
+walkers, fork-bisect, type-allocation tracking) and the eventual
+root cause: **a file-scope-static name collision in cparser**
+between `Objects/classobject.c` and `Objects/methodobject.c`.
 
+## Status
 
+Bug ✅ **FIXED**.  Confirmed via:
 
-The bug was a **file-scope static-variable name collision** between
-`classobject.c` (`static PyMethodObject *free_list`) and
-`methodobject.c` (`static PyCFunctionObject *free_list`).  Our
-cparser doesn't distinguish file-scope statics, so both decls
-collapsed into ONE global variable, of whatever type was
-parsed last.
-
-Result: `method_dealloc` pushed dead PyMethodObjects (40-byte
-body) onto the shared free_list; `PyCFunction_NewEx` then popped
-that slot, interpreted it as a PyCFunctionObject (48-byte body),
-and wrote 8 bytes past the original slot, corrupting the next
-pymalloc allocation's `_gc_next` field.  The corrupted gc-list
-link triggered a segfault during host Python's shutdown gc walk.
-
-**Fix** (one-liner, cpython.py): when parsing classobject.c, set
-`free_list` (and `numfree`) macros to `free_list__classobj` (and
-`numfree__classobj`), matching the existing pattern used for
-methodobject.c (which gets `__methodobj` suffix).  Now the two
-variables are distinct in the parser's global namespace and don't
-collide.
-
-Verification:
-- Before: `./cpython.py -c "print('hi')"` → exit 139 (SIGSEGV in
-  shutdown gc).
-- After: `./cpython.py -c "print('hi')"` → exit 1 (clean
-  CAbortException from missing `_thread` import; no segfault).
+- `./cpython.py -c "print('hi')"` now exits cleanly (no SIGSEGV);
 - `./cpython.py --check-gc-invariants -c "print('hi')"` reports
-  ``[gc-inv] gen0 invariant check OK (visited=15433320)``.
-- Regression tests:
-  - ``cparser/tests/test_interpreter_extra.py::test_file_scope_static_collision_observable_at_runtime``
-    -- self-contained: two .c sources, each with ``static int counter``;
-    increments in one file leak into the other's reads (current
-    buggy behaviour, asserted explicitly).
-  - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_silent_merge``
-    -- parse-level: state.vars has only ONE ``shared`` entry.
-  - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_workaround_via_macros``
-    -- verifies the macro-based workaround used in ``cpython.py``.
+  the gen0 doubly-linked invariant is intact;
+- Three regression tests (one parse-level, one workaround-level,
+  one self-contained crash reproducer in a subprocess) pin the
+  behaviour.
 
-Note on diagnostic flags: the historical narrative below references
-the original investigation flags (``--gen2-bisect``,
-``--targeted-watch``, ``--invariant-check-window``).  These were
-specific to the investigation and have been removed.  What remains
-in ``cpython.py`` for future debugging:
-- ``--quiet-crash``: suppress macOS CrashReporter dialog on
-  SIGSEGV/SIGBUS/SIGABRT.
-- ``--check-gc-invariants``: post-runFunc bidirectional gen0 walk.
-- ``--invariant-check-interval N``: periodic version for bisecting
-  WHEN a break appears.
-- ``--gc-check-interval``/``-at``/``-range``: pre-existing
-  bisection probes via ``gc.get_referrers``.
-- ``--instrument FUNC``: pre-existing entry/exit logging.
+## Conclusion -- root cause, fix, regression coverage
 
----
+**Root cause.**  Both `Objects/classobject.c` and
+`Objects/methodobject.c` declare ``static free_list`` (and
+``static numfree``) at *file scope* but of different types:
+``PyMethodObject *`` (40 + 24 = 64-byte slot) in classobject.c,
+``PyCFunctionObject *`` (48 + 24 = 72-byte slot, but pymalloc-fit
+in the same 64-byte slot class) in methodobject.c.  Per ISO C
+these are *separate* variables (internal linkage), but cparser
+merges all parsed translation units into one ``state.vars`` and
+silently overwrites the older entry.  After parsing,
+``method_dealloc`` pushed dead 40-byte PyMethodObjects onto the
+SHARED ``free_list``.  ``PyCFunction_NewEx`` then popped a slot
+believing it had 48 bytes of body, wrote past byte 40, and
+overwrote the first 8 bytes of the adjacent pymalloc slot --
+which happened to be the ``PyGC_Head._gc_next`` of an unrelated
+live host object.  The corrupted gc-list link then segfaulted
+host Python's shutdown gc walk.
 
-The remainder of this document is the investigation log that led
-to identifying the bug.  Kept for reference; not needed for the
-fix itself.
+**Fix (three layers).**
 
-## Original notes for a future-you. Highly condensed.
+1. **`cpython.py`** -- per-file macro rename for `classobject.c`
+   matching the existing pattern for `methodobject.c`:
+
+       self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
+       self.macros["numfree"]   = cparser.Macro(rightside="numfree__methodobj")
+       cparser.parse(".../methodobject.c", self)
+       self.macros["free_list"] = cparser.Macro(rightside="free_list__classobj")
+       self.macros["numfree"]   = cparser.Macro(rightside="numfree__classobj")
+       cparser.parse(".../classobject.c", self)
+
+   A similar rename for `formatfloat` (int vs char* between
+   unicodeobject.c and bytesobject.c) covers the only other
+   genuinely dangerous collision in CPython 3.7 source.
+
+2. **`cparser/cparser.py`** -- a defensive **collision detector**
+   in ``_addToParent``.  When two file-scope ``static`` decls with
+   *type-incompatible* signatures collide across translation
+   units, cparser raises an error (added to `state._errors`):
+
+       *** WARNING: TYPE-CONFUSION MEMORY CORRUPTION RISK ***
+         Two file-scope ``static`` declarations of <name> have
+         INCOMPATIBLE TYPES across translation units:
+           old: <file_a>  type=<...>
+           new: <file_b>  type=<...>
+         Per ISO C, file-scope ``static`` has internal linkage --
+         these MUST be separate variables.  ...
+         Fix: rename one side via a preprocessor macro before
+         parsing it, e.g.
+           state.macros[<name>] = cparser.Macro(rightside=<...>)
+           cparser.parse(<the other file>, state)
+
+   Same-element-type collisions (eg. ``static char doc[100]`` vs
+   ``static char doc[80]``, common for per-file doc strings) are
+   accepted silently as benign -- the data is read-only and no
+   size-mismatch corruption is possible.
+
+3. **Regression tests** in the cparser submodule (no dependency
+   on `cpython.py`, all self-contained):
+   - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_is_detected_as_parse_error``
+     -- asserts cparser emits the error on
+     ``static T *shared`` collision with different `T`.
+   - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_collision_workaround_via_macros``
+     -- verifies the macro-rename workaround silences the error
+     and produces two separate variables.
+   - ``cparser/tests/test_parse_stmnt.py::test_file_scope_static_same_type_collision_is_accepted``
+     -- verifies the array-doc-string false-positive is not
+     flagged.
+   - ``cparser/tests/test_interpreter_extra.py::test_file_scope_static_collision_would_crash_without_detection``
+     -- a *subprocess* test: parses two .c files with
+     `static int *p` vs `static int **p`, explicitly clears
+     `state._errors` to bypass cparser's protection, runs the
+     interpreted code, and asserts the subprocess exits via a
+     fatal signal (SIGSEGV / SIGBUS / SIGABRT).  Demonstrates
+     that the bug class WOULD crash at runtime without the
+     detection.
+
+**Diagnostic tools left in `cpython.py`** for future debugging
+(specific to this investigation but reusable):
+
+- ``--quiet-crash``: install C-level SIGSEGV/SIGBUS/SIGABRT
+  handlers that dump the Python traceback then ``_exit()``, so
+  the macOS CrashReporter dialog doesn't pop up during
+  unattended debug runs.
+- ``--check-gc-invariants``: after `runFunc`, disable host gc
+  and walk the gen0 list bidirectionally via raw PyGC_Head reads
+  (no tp_traverse) checking ``next._gc_prev == this``.  Any
+  break is memory corruption.
+- ``--invariant-check-interval N``: periodic version for
+  bisecting WHEN during `runFunc` a break first appears.
+
+Pre-existing tools also useful:
+
+- ``--gc-check-interval``/``-at``/``-range``: probe
+  `gc.get_referrers` at specific iteration counts.
+- ``--instrument FUNC[,FUNC...]``: wrap named (translated) C
+  functions with entry/exit logging to stderr.
+- ``--no-better-exchook``: use stdlib `traceback.print_exc`
+  instead of `better_exchook` for uncaught exceptions (better_exchook
+  walks the GC heap, so a broken graph segfaults the reporter
+  itself).
+- ``PYCPYTHON_LLDB_TRAP=1`` env var: raise `SIGTRAP` right before
+  `runFunc` so lldb can attach and set watchpoints with stable
+  addresses (combine with `target.disable-aslr true`).
+
+## How the investigation went (historical log)
+
+The remainder of this document is the investigation log -- the
+dead-ends, false leads, and step-by-step narrowing that led to
+identifying the bug.  Kept for reference, not needed for the fix.
 
 ## Symptom
 
