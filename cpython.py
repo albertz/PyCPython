@@ -83,7 +83,12 @@ class CPythonState(cparser.State):
         # multiple times with different macro definitions (STRINGLIB=ucs1lib_ etc.)
         # and must NOT be deduplicated by filename.
         is_template_header = fullfn and os.path.join(CPythonDir, "Objects", "stringlib") in fullfn
-        if not is_template_header:
+        # ``graminit.h`` has no include guard and is intended to be
+        # re-included by ast.c / compile.c / parsetok.c each with the
+        # grammar-symbol macros (``expr``, ``atom``, ...) freshly
+        # defined for that translation unit.  Don't dedupe it.
+        is_graminit = fullfn and fullfn.endswith("/graminit.h")
+        if not is_template_header and not is_graminit:
             if fullfn and fullfn in self.included_files: return "", fullfn
             if fullfn: self.included_files.add(fullfn)
         return super(CPythonState, self).readLocalInclude(filename)
