@@ -246,17 +246,21 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
         cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
         cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
-        # We need these macro hacks because methodobject.c and classobject.c
-        # both declare ``static free_list`` and ``static numfree`` at file
-        # scope -- of DIFFERENT types (PyCFunctionObject* vs PyMethodObject*).
-        # Our cparser doesn't distinguish file-scope statics; without renaming,
-        # both end up as the SAME global var, causing
-        # ``method_dealloc`` to push PyMethodObjects onto the list that
-        # ``PyCFunction_NewEx`` then pops -- it interprets a 40-byte PyMethod
-        # slot as a 48-byte PyCFunction and writes 8 bytes past the slot,
-        # corrupting the next pymalloc allocation's PyGC_Head._gc_next.
-        # Each file gets a UNIQUE mangled name so the variables stay
-        # separate.  Same trick as for bool/float/dict above.
+        # `classobject.c` and `methodobject.c` both declare ``static
+        # free_list`` and ``static numfree`` at file scope -- of
+        # DIFFERENT types (PyMethodObject* vs PyCFunctionObject*).
+        # Our cparser doesn't distinguish file-scope statics (known
+        # limitation -- see ``cparser/tests/test_file_scope_statics.py``
+        # for a minimal reproducer).  Without explicit per-file
+        # renaming via macros, both end up as the SAME global var,
+        # which causes ``method_dealloc`` to push PyMethodObjects
+        # onto the list that ``PyCFunction_NewEx`` then pops -- it
+        # interprets a 40-byte PyMethod slot as a 48-byte PyCFunction
+        # and writes 8 bytes past the slot, corrupting the next
+        # pymalloc allocation's PyGC_Head._gc_next.  The corrupted
+        # gc-list link then triggers a segfault during host Python's
+        # shutdown gc walk.  Same trick already applied for
+        # bool/float/dict/tuple/list above and below.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
         self.macros.pop("OFF", None)  # funcobject.c defines OFF; methodobject.c redefines it

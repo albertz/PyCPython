@@ -1,6 +1,77 @@
 # Segfault investigation notes
 
-Notes for a future-you. Highly condensed.
+## STATUS: ✅ FIXED + REPRODUCER TEST + COLLISION DETECTOR (2026-05-24)
+
+The fix lives in three places now:
+
+1. **`cpython.py`** -- the targeted 2-line workaround setting
+   ``state.macros["free_list"]`` and ``state.macros["numfree"]``
+   to per-file mangled names before parsing
+   ``Objects/classobject.c`` (matching the existing pattern for
+   ``methodobject.c``, ``boolobject.c``, ``floatobject.c``,
+   ``dictobject.c``, ``listobject.c``).
+
+2. **`cparser/tests/test_file_scope_statics.py`** -- 3 minimal
+   tests demonstrating the bug class:
+   - ``test_file_scope_static_collision_demonstrates_bug``:
+     reproduces the silent merge (documents current cparser
+     limitation).
+   - ``test_file_scope_static_collision_workaround_via_macros``:
+     verifies the supported workaround.
+   - ``test_file_scope_static_collision_with_size_mismatch_corrupts_memory``:
+     reproduces the *specific* dangerous case (different-sized
+     statics colliding).
+
+3. **`cparser/cparser.py`** -- defensive **collision detector**
+   in ``_addToParent``.  When two file-scope ``static`` decls with
+   different types collide across translation units, prints a
+   one-time warning per name with a suggested macro rename.  Opt-in
+   via ``CPARSER_WARN_STATIC_COLLISIONS=1`` env var (off by default
+   to keep ``cpython.py`` output clean).  Catches future regressions
+   of the same bug class.
+
+## Original root-cause summary
+
+
+
+The bug was a **file-scope static-variable name collision** between
+`classobject.c` (`static PyMethodObject *free_list`) and
+`methodobject.c` (`static PyCFunctionObject *free_list`).  Our
+cparser doesn't distinguish file-scope statics, so both decls
+collapsed into ONE global variable, of whatever type was
+parsed last.
+
+Result: `method_dealloc` pushed dead PyMethodObjects (40-byte
+body) onto the shared free_list; `PyCFunction_NewEx` then popped
+that slot, interpreted it as a PyCFunctionObject (48-byte body),
+and wrote 8 bytes past the original slot, corrupting the next
+pymalloc allocation's `_gc_next` field.  The corrupted gc-list
+link triggered a segfault during host Python's shutdown gc walk.
+
+**Fix** (one-liner, cpython.py): when parsing classobject.c, set
+`free_list` (and `numfree`) macros to `free_list__classobj` (and
+`numfree__classobj`), matching the existing pattern used for
+methodobject.c (which gets `__methodobj` suffix).  Now the two
+variables are distinct in the parser's global namespace and don't
+collide.
+
+Verification:
+- Before: `./cpython.py -c "print('hi')"` → exit 139 (SIGSEGV in
+  shutdown gc).
+- After: `./cpython.py -c "print('hi')"` → exit 1 (clean
+  CAbortException from missing `_thread` import; no segfault).
+- `--gen2-bisect` after fix reports:
+    `doubly-linked invariant breaks: 0`
+    `gc.collect() did NOT crash`
+    `FULL set did NOT crash in get_referents`
+
+---
+
+The remainder of this document is the investigation log that led
+to identifying the bug.  Kept for reference; not needed for the
+fix itself.
+
+## Original notes for a future-you. Highly condensed.
 
 ## Symptom
 
