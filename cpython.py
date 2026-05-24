@@ -376,7 +376,13 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
         self.macros["numfree"] = cparser.Macro(rightside="numfree__classobj")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__classobj")
+        # ``method_get_doc`` and ``method_repr`` collide between
+        # classobject.c and descrobject.c (different first-arg types).
+        self.macros["method_get_doc"] = cparser.Macro(rightside="method_get_doc__classobj")
+        self.macros["method_repr"] = cparser.Macro(rightside="method_repr__classobj")
         cparser.parse(CPythonDir + "/Objects/classobject.c", self) # PyMethod_Type
+        self.macros.pop("method_get_doc", None)
+        self.macros.pop("method_repr", None)
         # We need these macro hacks because methodobject.c used the same vars.
         self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
         self.macros["free_list"] = cparser.Macro(rightside="free_list__list")
