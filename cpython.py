@@ -152,6 +152,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/getcompiler.c", self) # Py_GetCompiler
         self.macros.pop("__VERSION__", None)
         cparser.parse(CPythonDir + "/Python/mysnprintf.c", self) # PyOS_snprintf, PyOS_vsnprintf
+        cparser.parse(CPythonDir + "/Python/mystrtoul.c", self) # PyOS_strtol, PyOS_strtoul
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
