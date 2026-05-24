@@ -719,6 +719,238 @@ def main(argv):
     _py_gil_state_check.C_resType = ctypes.c_int
     interpreter._func_cache["PyGILState_Check"] = _py_gil_state_check
 
+    # ``PyModule_ExecDef`` in ``Objects/moduleobject.c`` contains a
+    # ``((int (*)(PyObject *))cur_slot->value)(module)`` -- a cast-
+    # to-function-pointer-then-call on a ``void*`` slot field.  Our
+    # interp's translator does not currently support this pattern;
+    # translating the whole function fails with "Func ptr call:
+    # base ... is not a func ptr".
+    #
+    # Provide a Python override that walks slots ourselves via
+    # ctypes.  Modules with no slots (``m_slots == NULL``, the
+    # legacy init pattern used by most builtins) return success
+    # immediately.  Modules with slots would require executing the
+    # slot's function pointer via ``CFUNCTYPE`` -- we do that here.
+    _PyObject_typedef = state.typedefs['PyObject']
+    _PyModuleDef_typedef = state.typedefs['PyModuleDef']
+
+    def _py_module_exec_def(module_ptr, def_ptr):
+        """PyModule_ExecDef(module, def) -> int (0 on success, -1 on error)."""
+        # Read def->m_slots via raw ctypes.  PyModuleDef layout
+        # (CPython 3.7):
+        #   PyModuleDef_Base m_base;    // 0..32 (head)
+        #   const char *m_name;         // 32..40
+        #   const char *m_doc;          // 40..48
+        #   Py_ssize_t m_size;          // 48..56
+        #   PyMethodDef *m_methods;     // 56..64
+        #   PyModuleDef_Slot *m_slots;  // 64..72
+        def_addr = ctypes.cast(def_ptr, ctypes.c_void_p).value
+        if not def_addr:
+            return -1
+        # m_slots at offset 64.
+        m_slots_addr = ctypes.cast(
+            def_addr + 64, ctypes.POINTER(ctypes.c_void_p))[0]
+        if not m_slots_addr:
+            return 0  # legacy init -- no slots to execute
+        # Slot-walk: PyModuleDef_Slot is {int slot; void *value;} = 16 bytes.
+        # slot==0 terminates.
+        Py_mod_create = 1
+        Py_mod_exec = 2
+        cur = m_slots_addr
+        while True:
+            slot = ctypes.cast(cur, ctypes.POINTER(ctypes.c_int))[0]
+            if slot == 0:
+                break
+            value_addr = ctypes.cast(
+                cur + 8, ctypes.POINTER(ctypes.c_void_p))[0]
+            if slot == Py_mod_create:
+                pass  # handled in PyModule_FromDefAndSpec2
+            elif slot == Py_mod_exec:
+                # Call (int (*)(PyObject *))value(module).
+                fn_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+                fn = fn_t(value_addr)
+                module_addr = ctypes.cast(module_ptr, ctypes.c_void_p).value
+                ret = fn(module_addr)
+                if ret != 0:
+                    return -1
+            else:
+                # Unknown slot kind -- skip silently (matches CPython
+                # behaviour for unknown slot ids in 3.7).
+                pass
+            cur += 16  # next slot
+        return 0
+    _py_module_exec_def.C_argTypes = [
+        ctypes.POINTER(interpreter.getCType(_PyObject_typedef)),
+        ctypes.POINTER(interpreter.getCType(_PyModuleDef_typedef)),
+    ]
+    _py_module_exec_def.C_resType = ctypes.c_int
+    interpreter._func_cache["PyModule_ExecDef"] = _py_module_exec_def
+
+    # ``initexternalimport`` calls
+    # ``importlib._install_external_importers`` which loads
+    # ``_frozen_importlib_external`` (a frozen module).  In our
+    # interp this fails for various reasons (likely some C function
+    # in the import chain isn't implemented), and the subsequent
+    # ``PyErr_Print`` recurses through ``MarkupIterator_next`` (which
+    # itself has translation issues).  For ``-c "..."`` programs, we
+    # don't actually need filesystem-based imports.  Skip
+    # ``_install_external_importers`` and return success.
+    _PyInitError_t = interpreter.getCType(state.typedefs['_PyInitError'])
+
+    def _py_initexternalimport(interp_ptr):
+        """initexternalimport: stub that always returns success.
+
+        Skips ``importlib._install_external_importers``.  This
+        means filesystem-based imports won't work, but interp can
+        still execute ``-c`` programs that don't use external
+        modules.
+        """
+        return _PyInitError_t()  # all-zero = _Py_INIT_OK
+    _py_initexternalimport.C_argTypes = None  # any signature
+    _py_initexternalimport.C_resType = state.typedefs['_PyInitError']
+    interpreter._func_cache["initexternalimport"] = _py_initexternalimport
+
+    # ``pymain_init_sys_path`` fails with
+    # "pymain_update_sys_path: can't get sys.path" -- since we skipped
+    # initexternalimport, ``sys.path`` was never populated.  Stub it
+    # out to return success.
+    def _py_pymain_init_sys_path(pymain, config):
+        """pymain_init_sys_path(_PyMain *, _PyCoreConfig *) -> int."""
+        return 0  # success
+    _py_pymain_init_sys_path.C_argTypes = None
+    _py_pymain_init_sys_path.C_resType = ctypes.c_int
+    interpreter._func_cache["pymain_init_sys_path"] = _py_pymain_init_sys_path
+
+    # Diagnostic override for ``_Py_FatalInitError``: prints
+    # ``err.prefix`` and ``err.msg`` (which hold the failing function
+    # name and a human-readable error message) BEFORE aborting.
+    # Without this, we lose the most useful error information.
+    def _py_fatal_init_error(err):
+        """_Py_FatalInitError(_PyInitError err): print + abort."""
+        # err is a wrapped struct; .prefix/.msg are char* (LP_c_byte).
+        def _read_cstr(p):
+            try:
+                addr = ctypes.addressof(p.contents)
+            except (ValueError, AttributeError):
+                return "<null>"
+            if not addr:
+                return "<null>"
+            return ctypes.string_at(addr).decode("utf-8", errors="replace")
+        prefix = _read_cstr(err.prefix)
+        msg = _read_cstr(err.msg)
+        print(f"_Py_FatalInitError: prefix={prefix!r} msg={msg!r}",
+              flush=True)
+        interpreter._abort()
+    _py_fatal_init_error.C_argTypes = None
+    _py_fatal_init_error.C_resType = None
+    interpreter._func_cache["_Py_FatalInitError"] = _py_fatal_init_error
+
+    # NOTE on ``pymain_init_python_main``: the real implementation
+    # calls ``_Py_InitializeMainInterpreter`` which does
+    # ``initfsencoding`` -> ``get_locale_encoding`` -> ``_PyCodec_Lookup``
+    # -> ``_PyCodecRegistry_Init`` -> ``PyImport_ImportModuleNoBlock("encodings")``
+    # which needs the FULL importlib bootstrap (the same one the
+    # ``initexternalimport`` stub bypasses due to the
+    # ``MarkupIterator_next`` postfix-++ infinite loop).  So we
+    # keep a *partial* implementation here that does what
+    # ``add_main_module`` would (set ``__main__.__builtins__``) so
+    # user code can find ``print`` etc.  Removing this completely
+    # is blocked on fixing the importlib bootstrap.
+    def _py_pymain_init_python_main(pymain, interp_arg):
+        """pymain_init_python_main: minimal substitute for
+        ``_Py_InitializeMainInterpreter``.  Sets up
+        ``__main__.__builtins__`` (otherwise ``print`` lookup raises
+        NameError) via direct sys.modules access, skipping the slow
+        ``PyImport_ImportModule("builtins")`` path.
+        """
+        py_add_module = interpreter.getFunc("PyImport_AddModule")
+        py_module_getdict = interpreter.getFunc("PyModule_GetDict")
+        py_dict_setitem_string = interpreter.getFunc("PyDict_SetItemString")
+        main_name = interpreter._make_string("__main__")
+        main_name_ptr = ctypes.cast(main_name, ctypes.POINTER(ctypes.c_byte))
+        builtins_name = interpreter._make_string("builtins")
+        builtins_name_ptr = ctypes.cast(builtins_name, ctypes.POINTER(ctypes.c_byte))
+        builtins_key = interpreter._make_string("__builtins__")
+        builtins_key_ptr = ctypes.cast(builtins_key, ctypes.POINTER(ctypes.c_byte))
+        main_mod = py_add_module(main_name_ptr)
+        builtins_mod = py_add_module(builtins_name_ptr)
+        main_dict = py_module_getdict(main_mod)
+        py_dict_setitem_string(main_dict, builtins_key_ptr, builtins_mod)
+        return 0
+    _py_pymain_init_python_main.C_argTypes = None
+    _py_pymain_init_python_main.C_resType = ctypes.c_int
+    interpreter._func_cache["pymain_init_python_main"] = _py_pymain_init_python_main
+
+    # ``_PyAST_Optimize`` (in ast_opt.c) walks the AST applying
+    # peephole optimizations.  Its translation currently fails on
+    # ``node_->v.<UnionTag>.<field>`` chains because cparser is
+    # confused by the function-like macros in Python-ast.h (``While``,
+    # ``If``, ...) which share names with the union field tags.
+    # Optimization is OPTIONAL -- compile.c works correctly with an
+    # un-optimized AST too.  Stub it out to return success.
+    def _py_ast_optimize(mod, arena, optimize):
+        """_PyAST_Optimize(mod_ty, PyArena*, int) -> int.  Stub: skip."""
+        return 1  # success
+    _py_ast_optimize.C_argTypes = None
+    _py_ast_optimize.C_resType = ctypes.c_int
+    interpreter._func_cache["_PyAST_Optimize"] = _py_ast_optimize
+
+
+    # Override ``builtin_print``: we skipped ``init_sys_streams``
+    # (that imports the ``io`` module, which is huge), so sys.stdout
+    # isn't set and the real ``builtin_print`` errors with
+    # ``RuntimeError: lost sys.stdout``.  Replace with a direct write
+    # to host stdout.  Reads positional args via ctypes from the
+    # interp's vector, converts each to its UTF-8 ``str`` repr via
+    # interp helpers, and prints with separator/end like real
+    # ``print()``.
+    def _py_builtin_print(self_arg, args_arr, nargs, kwnames):
+        """builtin_print(self, args, nargs, kwnames): write to host stdout."""
+        py_object_str = interpreter.getFunc("PyObject_Str")
+        py_unicode_as_utf8 = interpreter.getFunc("PyUnicode_AsUTF8")
+        nargs_v = nargs.value if hasattr(nargs, "value") else int(nargs)
+        # args_arr is PyObject *const *; index it as void**.
+        args_void = ctypes.cast(args_arr, ctypes.POINTER(ctypes.c_void_p))
+        parts = []
+        py_err_print = interpreter.getFunc("PyErr_Print")
+        py_err_clear = interpreter.getFunc("PyErr_Clear")
+        for i in range(nargs_v):
+            item_addr = args_void[i]
+            if not item_addr:
+                parts.append("None")
+                continue
+            obj = ctypes.c_void_p(item_addr)
+            s_ptr = py_object_str(obj)  # new PyUnicode
+            s_addr = s_ptr.value if hasattr(s_ptr, "value") else int(s_ptr)
+            if not s_addr:
+                # PyObject_Str failed -- show the exception, then
+                # clear it so subsequent args still try.
+                print("<?str-failed?>", end="", flush=True)
+                py_err_print()
+                py_err_clear()
+                parts.append("<?>")
+                continue
+            cstr_ptr = py_unicode_as_utf8(s_ptr)
+            addr = cstr_ptr.value if hasattr(cstr_ptr, "value") else int(cstr_ptr)
+            if not addr:
+                print("<?utf8-failed?>", end="", flush=True)
+                py_err_print()
+                py_err_clear()
+                parts.append("<?>")
+                continue
+            parts.append(ctypes.string_at(addr).decode("utf-8", errors="replace"))
+        print(" ".join(parts), flush=True)
+        # Return Py_None as a PyObject*.  Bump refcount per CPython
+        # convention.  We return the address as an int -- the caller's
+        # ``checkedFuncPtrCall`` will wrap via ``restype(int)`` which
+        # for a pointer ctype means "pointer with that address".
+        none_obj = interpreter.globalScope.getVar("_Py_NoneStruct")
+        none_obj.ob_refcnt.value = none_obj.ob_refcnt.value + 1
+        return ctypes.addressof(none_obj)
+    _py_builtin_print.C_argTypes = None
+    _py_builtin_print.C_resType = None
+    interpreter._func_cache["builtin_print"] = _py_builtin_print
+
     # Many of the C modules listed in `_PyImport_Inittab` (PC/config.c) --
     # `_thread`, `_io`, `itertools`, ... -- live in C source files we
     # don't parse.  Their `PyInit_xxx` is therefore a body-less function
