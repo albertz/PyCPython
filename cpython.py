@@ -668,45 +668,42 @@ def main(argv):
 
     interpreter.register(state)
 
-    # Py_GetPrefix/ExecPrefix/Path/PythonHome/ProgramFullPath are defined in
-    # pathconfig.c, which is intentionally not parsed.  Their C implementation
-    # calls _PyPathConfig_Init() (from Modules/getpath.c, also not parsed),
-    # which walks the real filesystem to discover where CPython is installed.
-    # That filesystem-discovery logic is platform-specific, requires many
-    # unwrapped syscalls, and would return the *wrong* paths anyway — we want
-    # the host Python's prefix/path so the interpreted CPython can find its
-    # stdlib.  We therefore supply these values directly from the host runtime.
-
-    def _make_wchar_const(s):
-        """Create a wchar_t* constant string suitable for returning from Py_Get* functions."""
-        buf = interpreter._make_wchar_string(s)
-        return ctypes.cast(buf, ctypes.c_void_p).value or 0
-
-    for _fn, _s in [
-        ("Py_GetProgramFullPath", argv[0]),
-        ("Py_GetPrefix", sys.prefix),
-        ("Py_GetExecPrefix", sys.exec_prefix),
-        ("Py_GetPath", ":".join(sys.path)),
-        ("Py_GetPythonHome", ""),
-    ]:
-        def _make_path_func(s=_s):
-            return _make_wchar_const(s)
-        _make_path_func.C_argTypes = None
-        _make_path_func.C_resType = ctypes.c_void_p
-        interpreter._func_cache[_fn] = _make_path_func
-
-    # _PyPathConfig_Calculate is defined in Modules/getpath.c (not parsed).
-    # It fills a _PyPathConfig struct from the filesystem.  We provide a stub
-    # that returns success (_PyInitError with msg=NULL) and leaves the config
-    # fields at zero — the public Py_Get* functions above supply the real values.
-    _PyInitError_ctype = interpreter.getCType(state.typedefs['_PyInitError'])
-
-    def _path_config_calculate_stub(*args):
-        return _PyInitError_ctype()  # all-zero = success (msg=NULL)
-
-    _path_config_calculate_stub.C_argTypes = None
-    _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
-    interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
+    # ``pathconfig.c``'s ``Py_GetPrefix`` / ``Py_GetPath`` / etc. all
+    # call ``pathconfig_global_init`` which short-circuits if
+    # ``_Py_path_config.module_search_path`` is already non-NULL.
+    # Populate the struct directly so the real ``Py_Get*``
+    # implementations work as-is.  This also bypasses
+    # ``_PyPathConfig_Calculate`` (defined in Modules/getpath.c, not
+    # parsed), which is only called when the struct is empty.
+    #
+    # We point at the bundled CPython submodule's ``Lib`` rather than
+    # the host interpreter's ``sys.path``: the source tree we parsed
+    # is the same CPython version we want to run, and its stdlib lives
+    # right next to it.  Host paths would risk version skew (e.g.
+    # parsing CPython 3.7 here while the host is 3.13).
+    #
+    # The C code calls ``PyMem_RawFree`` on these pointers from
+    # ``_PyPathConfig_Clear`` (during ``Py_SetPath`` and shutdown);
+    # allocate via ``_PyMem_RawWcsdup`` so the free is well-defined.
+    _PyMem_RawWcsdup = interpreter.getFunc("_PyMem_RawWcsdup")
+    _path_cfg = interpreter.globalsWrapper._Py_path_config
+    _PathPtrT = type(_path_cfg)._fields_[0][1]  # wrapped LP_c_wchar
+    def _set_path_field(field_name, value):
+        wbuf = interpreter._make_wchar_string(value)
+        # ``_PyMem_RawWcsdup`` takes ``const wchar_t *`` and returns
+        # owned PyMem_Raw-allocated memory.
+        dup = _PyMem_RawWcsdup(ctypes.cast(wbuf, _PathPtrT))
+        setattr(_path_cfg, field_name, ctypes.cast(dup, _PathPtrT))
+    _cpython_dir = CPythonDir
+    _set_path_field("program_full_path", argv[0])
+    _set_path_field("prefix", _cpython_dir)
+    _set_path_field("exec_prefix", _cpython_dir)
+    _set_path_field(
+        "module_search_path",
+        ":".join([_cpython_dir + "/Lib",
+                  _cpython_dir + "/Lib/site-packages"]))
+    _set_path_field("program_name", argv[0])
+    _set_path_field("home", _cpython_dir)
 
     # ``pymain_init_sys_path`` calls ``pymain_update_sys_path`` which
     # ``PySys_GetObject("path")``-fails with "can't get sys.path"
