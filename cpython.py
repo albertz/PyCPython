@@ -721,30 +721,6 @@ def main(argv):
     _py_pymain_init_sys_path.C_resType = ctypes.c_int
     interpreter._func_cache["pymain_init_sys_path"] = _py_pymain_init_sys_path
 
-    # Diagnostic override for ``_Py_FatalInitError``: prints
-    # ``err.prefix`` and ``err.msg`` (which hold the failing function
-    # name and a human-readable error message) BEFORE aborting.
-    # Without this, we lose the most useful error information.
-    def _py_fatal_init_error(err):
-        """_Py_FatalInitError(_PyInitError err): print + abort."""
-        # err is a wrapped struct; .prefix/.msg are char* (LP_c_byte).
-        def _read_cstr(p):
-            try:
-                addr = ctypes.addressof(p.contents)
-            except (ValueError, AttributeError):
-                return "<null>"
-            if not addr:
-                return "<null>"
-            return ctypes.string_at(addr).decode("utf-8", errors="replace")
-        prefix = _read_cstr(err.prefix)
-        msg = _read_cstr(err.msg)
-        print(f"_Py_FatalInitError: prefix={prefix!r} msg={msg!r}",
-              flush=True)
-        interpreter._abort()
-    _py_fatal_init_error.C_argTypes = None
-    _py_fatal_init_error.C_resType = None
-    interpreter._func_cache["_Py_FatalInitError"] = _py_fatal_init_error
-
     # NOTE on ``pymain_init_python_main``: the real implementation
     # calls ``_Py_InitializeMainInterpreter`` which does
     # ``initfsencoding`` -> ``get_locale_encoding`` -> ``_PyCodec_Lookup``
