@@ -718,6 +718,100 @@ def main(argv):
     _py_pymain_init_sys_path.C_resType = ctypes.c_int
     interpreter._func_cache["pymain_init_sys_path"] = _py_pymain_init_sys_path
 
+    # Build minimal ``sys.stdout`` / ``sys.stderr`` stubs so the real
+    # ``builtin_print`` works.  CPython's normal path sets these via
+    # ``init_sys_streams`` (in pylifecycle.c) which imports the ``io``
+    # module (huge, also depends on importlib).  We skip that and
+    # instead install a ``PyModule`` with ``write`` and ``flush``
+    # methods backed by ctypes callbacks that hit host
+    # ``sys.stdout`` / ``sys.stderr``.  The real ``builtin_print``
+    # then does ``PyFile_WriteObject`` -> ``write(s)`` on these.
+    PyCFunction_NewEx = interpreter.getFunc("PyCFunction_NewEx")
+    PyModule_New = interpreter.getFunc("PyModule_New")
+    PyObject_SetAttrString = interpreter.getFunc("PyObject_SetAttrString")
+    PySys_SetObject = interpreter.getFunc("PySys_SetObject")
+    PyUnicode_AsUTF8 = interpreter.getFunc("PyUnicode_AsUTF8")
+    PyMethodDef_t = interpreter.getCType(state.structs['PyMethodDef'])
+    METH_O = 0x0008
+    METH_NOARGS = 0x0004
+    _none_obj = interpreter.globalScope.getVar("_Py_NoneStruct")
+    _none_addr = ctypes.addressof(_none_obj)
+
+    def _ret_none():
+        # ``Py_RETURN_NONE`` convention: bump refcount and return Py_None.
+        _none_obj.ob_refcnt.value = _none_obj.ob_refcnt.value + 1
+        return _none_addr
+
+    # ctypes signature for ``PyCFunction``:
+    # ``PyObject *(*)(PyObject *self, PyObject *arg)``.
+    _PYCFUNC_T = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+
+    # Keep ctypes callbacks and PyMethodDef arrays alive for the
+    # lifetime of the interpreter -- the C side stores raw pointers.
+    interpreter._stream_keepalive = []
+
+    def _make_stream_module(name, host_stream):
+        def _do_write(arg_addr):
+            if not arg_addr:
+                return
+            s_addr_ptr = PyUnicode_AsUTF8(ctypes.c_void_p(arg_addr))
+            s_addr = s_addr_ptr.value if hasattr(s_addr_ptr, "value") else int(s_addr_ptr)
+            if not s_addr:
+                interpreter.getFunc("PyErr_Clear")()
+                return
+            host_stream.write(ctypes.string_at(s_addr).decode("utf-8", errors="replace"))
+
+        @_PYCFUNC_T
+        def _write_cb(self_addr, arg_addr):
+            _do_write(arg_addr)
+            return _ret_none()
+
+        @_PYCFUNC_T
+        def _flush_cb(self_addr, arg_addr):
+            host_stream.flush()
+            return _ret_none()
+
+        # PyMethodDef sentinel-terminated array: write, flush, NULL.
+        methods = (PyMethodDef_t * 3)()
+        name_w = interpreter._make_string("write")
+        name_f = interpreter._make_string("flush")
+        BytePtrT = type(methods[0].ml_name)
+        DocPtrT = type(methods[0].ml_doc)
+        MethSlotT = type(methods[0].ml_meth)
+        methods[0].ml_name = ctypes.cast(name_w, BytePtrT)
+        methods[0].ml_meth = ctypes.cast(_write_cb, MethSlotT)
+        methods[0].ml_flags.value = METH_O
+        methods[0].ml_doc = ctypes.cast(0, DocPtrT)
+        methods[1].ml_name = ctypes.cast(name_f, BytePtrT)
+        methods[1].ml_meth = ctypes.cast(_flush_cb, MethSlotT)
+        methods[1].ml_flags.value = METH_NOARGS
+        methods[1].ml_doc = ctypes.cast(0, DocPtrT)
+        # methods[2] zero-initialized = sentinel.
+
+        # Create module object, attach write/flush methods.
+        mod_name_buf = interpreter._make_string(name)
+        mod = PyModule_New(ctypes.cast(mod_name_buf, BytePtrT))
+        for i, mname_buf in [(0, name_w), (1, name_f)]:
+            fn_obj = PyCFunction_NewEx(
+                ctypes.cast(ctypes.addressof(methods[i]),
+                            ctypes.POINTER(PyMethodDef_t)),
+                ctypes.c_void_p(0),
+                ctypes.c_void_p(0))
+            PyObject_SetAttrString(mod, ctypes.cast(mname_buf, BytePtrT), fn_obj)
+
+        # Keep refs alive.
+        interpreter._stream_keepalive.extend(
+            [_write_cb, _flush_cb, methods, name_w, name_f, mod_name_buf])
+        return mod
+
+    def _install_sys_streams():
+        BytePtrT = type(PyMethodDef_t().ml_name)
+        for name, host_stream in [("stdout", sys.stdout), ("stderr", sys.stderr)]:
+            mod = _make_stream_module("<pycpython-%s>" % name, host_stream)
+            key_buf = interpreter._make_string(name)
+            PySys_SetObject(ctypes.cast(key_buf, BytePtrT), mod)
+            interpreter._stream_keepalive.append(key_buf)
+
     # NOTE on ``pymain_init_python_main``: the real implementation
     # calls ``_Py_InitializeMainInterpreter`` which does
     # ``initfsencoding`` -> ``get_locale_encoding`` -> ``_PyCodec_Lookup``
@@ -734,7 +828,9 @@ def main(argv):
         ``_Py_InitializeMainInterpreter``.  Sets up
         ``__main__.__builtins__`` (otherwise ``print`` lookup raises
         NameError) via direct sys.modules access, skipping the slow
-        ``PyImport_ImportModule("builtins")`` path.
+        ``PyImport_ImportModule("builtins")`` path.  Also installs the
+        ``sys.stdout``/``sys.stderr`` stubs that ``init_sys_streams``
+        would normally set up.
         """
         py_add_module = interpreter.getFunc("PyImport_AddModule")
         py_module_getdict = interpreter.getFunc("PyModule_GetDict")
@@ -749,6 +845,7 @@ def main(argv):
         builtins_mod = py_add_module(builtins_name_ptr)
         main_dict = py_module_getdict(main_mod)
         py_dict_setitem_string(main_dict, builtins_key_ptr, builtins_mod)
+        _install_sys_streams()
         # NOTE: the real ``initexternalimport`` -> Python-level
         # ``importlib._install_external_importers`` no longer
         # infinite-loops (``MarkupIterator_next`` was unblocked by
@@ -761,61 +858,6 @@ def main(argv):
     _py_pymain_init_python_main.C_argTypes = None
     _py_pymain_init_python_main.C_resType = ctypes.c_int
     interpreter._func_cache["pymain_init_python_main"] = _py_pymain_init_python_main
-
-    # Override ``builtin_print``: we skipped ``init_sys_streams``
-    # (that imports the ``io`` module, which is huge), so sys.stdout
-    # isn't set and the real ``builtin_print`` errors with
-    # ``RuntimeError: lost sys.stdout``.  Replace with a direct write
-    # to host stdout.  Reads positional args via ctypes from the
-    # interp's vector, converts each to its UTF-8 ``str`` repr via
-    # interp helpers, and prints with separator/end like real
-    # ``print()``.
-    def _py_builtin_print(self_arg, args_arr, nargs, kwnames):
-        """builtin_print(self, args, nargs, kwnames): write to host stdout."""
-        py_object_str = interpreter.getFunc("PyObject_Str")
-        py_unicode_as_utf8 = interpreter.getFunc("PyUnicode_AsUTF8")
-        nargs_v = nargs.value if hasattr(nargs, "value") else int(nargs)
-        # args_arr is PyObject *const *; index it as void**.
-        args_void = ctypes.cast(args_arr, ctypes.POINTER(ctypes.c_void_p))
-        parts = []
-        py_err_print = interpreter.getFunc("PyErr_Print")
-        py_err_clear = interpreter.getFunc("PyErr_Clear")
-        for i in range(nargs_v):
-            item_addr = args_void[i]
-            if not item_addr:
-                parts.append("None")
-                continue
-            obj = ctypes.c_void_p(item_addr)
-            s_ptr = py_object_str(obj)  # new PyUnicode
-            s_addr = s_ptr.value if hasattr(s_ptr, "value") else int(s_ptr)
-            if not s_addr:
-                # PyObject_Str failed -- show the exception, then
-                # clear it so subsequent args still try.
-                print("<?str-failed?>", end="", flush=True)
-                py_err_print()
-                py_err_clear()
-                parts.append("<?>")
-                continue
-            cstr_ptr = py_unicode_as_utf8(s_ptr)
-            addr = cstr_ptr.value if hasattr(cstr_ptr, "value") else int(cstr_ptr)
-            if not addr:
-                print("<?utf8-failed?>", end="", flush=True)
-                py_err_print()
-                py_err_clear()
-                parts.append("<?>")
-                continue
-            parts.append(ctypes.string_at(addr).decode("utf-8", errors="replace"))
-        print(" ".join(parts), flush=True)
-        # Return Py_None as a PyObject*.  Bump refcount per CPython
-        # convention.  We return the address as an int -- the caller's
-        # ``checkedFuncPtrCall`` will wrap via ``restype(int)`` which
-        # for a pointer ctype means "pointer with that address".
-        none_obj = interpreter.globalScope.getVar("_Py_NoneStruct")
-        none_obj.ob_refcnt.value = none_obj.ob_refcnt.value + 1
-        return ctypes.addressof(none_obj)
-    _py_builtin_print.C_argTypes = None
-    _py_builtin_print.C_resType = None
-    interpreter._func_cache["builtin_print"] = _py_builtin_print
 
     # Many of the C modules listed in `_PyImport_Inittab` (PC/config.c) --
     # `_thread`, `_io`, `itertools`, ... -- live in C source files we
