@@ -39,12 +39,13 @@ Look for `_func_cache[...]`:
   as the place where `sys.stdout`/`sys.stderr` stubs are installed
   (see commit history)** — those need a home if this override goes.
 - **`_make_pyinit_stub`** loop — fills in `PyInit_<modname>` for
-  modules whose C source isn't parsed (`itertools`, `_io`, etc.).
-  Strictly correct (turns silent-NULL into proper `ImportError`); to
-  actually remove, the corresponding C source must be added to the
-  parse list in `CPythonState.parse_cpython`. Many of these modules
-  pull in `Python-ast.h`-style macro/grammar hazards or other parser
-  edge cases — expect to fix `cparser` bugs along the way.
+  modules whose C source isn't parsed (`itertools`, `_struct`, etc.;
+  `_io` is now parsed). Strictly correct (turns silent-NULL into
+  proper `ImportError`); to actually remove for a given module,
+  the corresponding C source must be added to the parse list in
+  `CPythonState.parse_cpython`. Many of these modules pull in
+  `Python-ast.h`-style macro/grammar hazards or other parser edge
+  cases — expect to fix `cparser` bugs along the way.
 - `--instrument` wrapper (line ~977) — debug instrumentation, not an
   override. Leave alone.
 
