@@ -165,14 +165,15 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/ast.c", self) # PyAST_FromNodeObject
         cparser.parse(CPythonDir + "/Python/future.c", self) # PyFuture_FromASTObject
         cparser.parse(CPythonDir + "/Python/peephole.c", self) # PyCode_Optimize
-        # ast_opt.c is intentionally NOT parsed; ``_PyAST_Optimize`` is
-        # replaced with a Python stub (see further down).
-        # ast.c put those macros back.  Pop AGAIN before symtable.c /
-        # compile.c -- compile.c uses ``VISIT(C, expr, V)`` to
-        # token-paste ``compiler_visit_expr``; if ``expr`` is still a
-        # macro = 315, it becomes ``compiler_visit_315`` (parse error).
+        # ast.c put those macros back.  Pop AGAIN before ast_opt.c /
+        # symtable.c / compile.c.  ast_opt.c uses ``node_->v.While.test``
+        # where ``test`` is otherwise expanded to ``305``.  compile.c
+        # uses ``VISIT(C, expr, V)`` to token-paste
+        # ``compiler_visit_expr``; if ``expr`` is still macro = 315,
+        # the result is ``compiler_visit_315`` (parse error).
         for _m in _grammar_macros_to_pop:
             self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Python/ast_opt.c", self) # _PyAST_Optimize
         self.macros.pop("OFF", None)  # symtable.c re-defines OFF
         # Python-reserved-word / dunder C identifiers (``lambda``,
         # ``__doc__``, ``__class__``, ``__annotations__`` in
@@ -707,10 +708,12 @@ def main(argv):
     _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
     interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
 
-    # ``pymain_init_sys_path`` fails with
-    # "pymain_update_sys_path: can't get sys.path" -- since we skipped
-    # initexternalimport, ``sys.path`` was never populated.  Stub it
-    # out to return success.
+    # ``pymain_init_sys_path`` calls ``pymain_update_sys_path`` which
+    # ``PySys_GetObject("path")``-fails with "can't get sys.path"
+    # because we skip ``initexternalimport`` (the importlib bootstrap
+    # currently runs into a postfix-++ infinite loop in
+    # ``MarkupIterator_next``).  Until that's fixed, stub
+    # ``pymain_init_sys_path`` to silently succeed.
     def _py_pymain_init_sys_path(pymain, config):
         """pymain_init_sys_path(_PyMain *, _PyCoreConfig *) -> int."""
         return 0  # success
@@ -785,21 +788,6 @@ def main(argv):
     _py_pymain_init_python_main.C_argTypes = None
     _py_pymain_init_python_main.C_resType = ctypes.c_int
     interpreter._func_cache["pymain_init_python_main"] = _py_pymain_init_python_main
-
-    # ``_PyAST_Optimize`` (in ast_opt.c) walks the AST applying
-    # peephole optimizations.  Its translation currently fails on
-    # ``node_->v.<UnionTag>.<field>`` chains because cparser is
-    # confused by the function-like macros in Python-ast.h (``While``,
-    # ``If``, ...) which share names with the union field tags.
-    # Optimization is OPTIONAL -- compile.c works correctly with an
-    # un-optimized AST too.  Stub it out to return success.
-    def _py_ast_optimize(mod, arena, optimize):
-        """_PyAST_Optimize(mod_ty, PyArena*, int) -> int.  Stub: skip."""
-        return 1  # success
-    _py_ast_optimize.C_argTypes = None
-    _py_ast_optimize.C_resType = ctypes.c_int
-    interpreter._func_cache["_PyAST_Optimize"] = _py_ast_optimize
-
 
     # Override ``builtin_print``: we skipped ``init_sys_streams``
     # (that imports the ``io`` module, which is huge), so sys.stdout
