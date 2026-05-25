@@ -79,6 +79,13 @@ class CPythonState(cparser.State):
                 # returns NULL and ``_Py_FatalInitError`` aborts with
                 # "Unable to get the locale encoding".
                 self.macros["HAVE_LANGINFO_H"] = cparser.Macro(rightside="1")
+                # posixmodule.c gates its dirent / utime / sys-wait
+                # blocks on these.  We provide stubs for the underlying
+                # headers in cparser.globalincludewrappers so the
+                # parsed code finds the identifiers.
+                self.macros["HAVE_DIRENT_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_UTIME_H"] = cparser.Macro(rightside="1")
+                self.macros["HAVE_SYS_WAIT_H"] = cparser.Macro(rightside="1")
                 self.macros["_POSIX_THREADS"] = cparser.Macro(rightside="1")
                 # _GNU_SOURCE, _POSIX_C_SOURCE or so?
                 return
