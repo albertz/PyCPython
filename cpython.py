@@ -113,6 +113,54 @@ class CPythonState(cparser.State):
             return self.readLocalInclude(fullfn)
         return super(CPythonState, self).readGlobalInclude(filename)
 
+    # Modules to register in ``_PyImport_Inittab`` beyond the
+    # always-built-in ones declared by ``Modules/config.c.in`` itself
+    # (marshal, _imp, _ast, builtins, sys, gc, _warnings, _string).
+    # Real CPython picks this list from ``Modules/Setup`` via the
+    # ``makesetup`` script; we hard-code it.  Windows-only entries
+    # (winreg, _winapi, msvcrt, _locale, nt) are intentionally
+    # excluded and ``nt`` is replaced by ``posix``.
+    _EXTRA_INITTAB_MODULES = [
+        "_abc", "array", "audioop", "binascii", "cmath", "errno",
+        "faulthandler", "math", "posix", "_operator", "_signal",
+        "_md5", "_sha1", "_sha256", "_sha512", "_sha3", "_blake2",
+        "time", "_thread", "_tracemalloc", "_codecs", "_weakref",
+        "_random", "_bisect", "_heapq", "_lsprof", "itertools",
+        "_collections", "_symtable", "mmap", "_csv", "_sre",
+        "parser", "_struct", "_datetime", "_functools", "_json",
+        "xxsubtype", "zipimport",
+        "_multibytecodec", "_codecs_cn", "_codecs_hk",
+        "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
+        "_io", "_pickle", "atexit", "_stat", "_opcode",
+        "_contextvars",
+    ]
+
+    def _parse_makesetup_inittab(self):
+        """Replicate what CPython's ``Modules/makesetup`` shell script
+        does at build time: read ``Modules/config.c.in``, splice the
+        per-build module list into the ``ADDMODULE MARKER`` slots,
+        parse the result.
+
+        Marker 1 hosts the ``extern PyObject* PyInit_xxx(void);``
+        declarations; marker 2 hosts the ``{"xxx", PyInit_xxx},``
+        entries inside ``_PyImport_Inittab[]``.
+        """
+        with open(CPythonDir + "/Modules/config.c.in") as f:
+            src = f.read()
+        extern_decls = "\n".join(
+            "extern PyObject* PyInit_%s(void);" % mod
+            for mod in self._EXTRA_INITTAB_MODULES)
+        inittab_entries = "\n".join(
+            '    {"%s", PyInit_%s},' % (mod, mod)
+            for mod in self._EXTRA_INITTAB_MODULES)
+        marker1 = "/* -- ADDMODULE MARKER 1 -- */"
+        marker2 = "/* -- ADDMODULE MARKER 2 -- */"
+        assert marker1 in src and marker2 in src, \
+            "config.c.in template missing expected ADDMODULE markers"
+        src = src.replace(marker1, marker1 + "\n" + extern_decls, 1)
+        src = src.replace(marker2, marker2 + "\n" + inittab_entries, 1)
+        cparser.parse_code(src, self)
+
     def parse_cpython(self):
         # We keep all in the same state, i.e. the same static space.
         # This also means that we don't reset macro definitions. This speeds up header includes.
@@ -201,7 +249,13 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/getargs.c", self) # PyArg_ParseTuple, _PyArg_UnpackStack, etc.
         cparser.parse(CPythonDir + "/Python/structmember.c", self) # PyMember_GetOne, PyMember_SetOne
         self.macros.pop("FLAG_SIZE_T", None)
-        cparser.parse(CPythonDir + "/PC/config.c", self) # _PyImport_Inittab
+        # Linux-flavored inittab.
+        # CPython builds run the ``Modules/makesetup`` shell script over
+        # ``Modules/config.c.in`` + ``Modules/Setup`` to produce
+        # ``Modules/config.c`` with the per-build module list spliced
+        # at the ``ADDMODULE MARKER`` comments.  We don't build, so
+        # replicate that splice on the fly here.
+        self._parse_makesetup_inittab() # _PyImport_Inittab
         cparser.parse(CPythonDir + "/Python/import.c", self) # _PyImport_Fini2
         cparser.parse(CPythonDir + "/Python/thread.c", self) # PyThread_allocate_lock
         cparser.parse(CPythonDir + "/Python/bootstrap_hash.c", self) # _Py_ReadHashSeed
