@@ -423,6 +423,23 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Modules/_threadmodule.c", self) # PyInit__thread
         cparser.parse(CPythonDir + "/Modules/_weakref.c", self) # PyInit__weakref
         cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
+        # ``posix`` (Modules/posixmodule.c) -- importlib's
+        # _bootstrap_external._setup() walks [posix, nt] looking for the
+        # OS module and aborts initexternalimport with "importlib
+        # requires posix or nt" when neither is in the inittab.  Parse
+        # posixmodule.c so PyInit_posix has a real body.
+        #
+        # File-scope-static collisions with previously-parsed files
+        # (same name in our single-translation-unit symbol space --
+        # see notes on bool/float/dict/tuple/list/methodobj/classobj).
+        # posixmodule.c declares ``static newfunc structseq_new`` as a
+        # function-pointer VARIABLE that caches StatResultType.tp_new;
+        # structseq.c has a same-named *function*.  Without a rename,
+        # ``_struct_sequence_template.tp_new`` resolves to the
+        # posixmodule.c variable and ``makeFuncPtr`` asserts.
+        self.macros["structseq_new"] = cparser.Macro(rightside="structseq_new_posix")
+        cparser.parse(CPythonDir + "/Modules/posixmodule.c", self) # PyInit_posix
+        self.macros.pop("structseq_new", None)
         # ``_io`` (Modules/_io/*.c) -- needed so PyInit__io has a real body
         # instead of the ImportError-raising stub installed by
         # ``_make_pyinit_stub`` in main().  Each file is parsed against
