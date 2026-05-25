@@ -707,18 +707,6 @@ def main(argv):
     _path_config_calculate_stub.C_resType = state.typedefs['_PyInitError']
     interpreter._func_cache['_PyPathConfig_Calculate'] = _path_config_calculate_stub
 
-    # PyCPython is single-threaded; we always "hold the GIL".  The
-    # real PyGILState_Check walks `_PyRuntime.gilstate.autoTSSkey` and
-    # `tstate`, which are unreliable in our interpreted setup (calls
-    # into TSS helpers we don't model).  Many places `assert(PyGILState_Check())`
-    # at function entry (e.g. `_Py_write` in fileutils.c) -- a wrong
-    # return of 0 there aborts.  Stub it to always return 1.
-    def _py_gil_state_check():
-        return 1
-    _py_gil_state_check.C_argTypes = []
-    _py_gil_state_check.C_resType = ctypes.c_int
-    interpreter._func_cache["PyGILState_Check"] = _py_gil_state_check
-
     # ``pymain_init_sys_path`` fails with
     # "pymain_update_sys_path: can't get sys.path" -- since we skipped
     # initexternalimport, ``sys.path`` was never populated.  Stub it
