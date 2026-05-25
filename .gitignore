@@ -1,3 +1,4 @@
 *.pyc
+.history*
 /.idea
 /.claude/settings.json
