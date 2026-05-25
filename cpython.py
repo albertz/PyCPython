@@ -767,6 +767,25 @@ def main(argv):
     _py_pymain_init_sys_path.C_resType = ctypes.c_int
     interpreter._func_cache["pymain_init_sys_path"] = _py_pymain_init_sys_path
 
+    # ``PyGILState_Check`` asserts via the host TSS that the current
+    # thread holds the GIL.  Our interpreter doesn't actually run a
+    # real GIL state machine (we're driving translated C from Python),
+    # so the check returns 0 even though logically the "GIL" is held
+    # for the duration of every ``runFunc``.  CPython itself
+    # documents an escape: setting ``_PyRuntime.gilstate.check_enabled
+    # = 0`` makes the function always return 1 (sub-interpreters use
+    # this).  Rather than depend on the order of ``_PyRuntime_Initialize``
+    # vs. consumers of the check, just override the function.  Without
+    # this, ``_Py_write`` and several ``fileutils.c`` helpers
+    # ``assert(PyGILState_Check())`` and ``CAbortException`` is raised
+    # mid-init -- visible only on paths that bypass our higher-level
+    # ``pymain_init_python_main`` override.
+    def _py_PyGILState_Check():
+        return 1
+    _py_PyGILState_Check.C_argTypes = []
+    _py_PyGILState_Check.C_resType = ctypes.c_int
+    interpreter._func_cache["PyGILState_Check"] = _py_PyGILState_Check
+
     # Build minimal ``sys.stdout`` / ``sys.stderr`` stubs so the real
     # ``builtin_print`` works.  CPython's normal path sets these via
     # ``init_sys_streams`` (in pylifecycle.c) which imports the ``io``
