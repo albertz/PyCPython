@@ -6,6 +6,8 @@ entry point is `cpython.py`; running `cpython.py -c "..."` parses CPython,
 translates relevant C functions to Python AST on demand, and executes
 them to evaluate the given Python snippet.
 
+Also see [`PROGRESS.md`](PROGRESS.md) and [`README.md`](README.md).
+
 ## Current focus
 
 Removing Python-level overrides/stubs in `cpython.py` one by one and
