@@ -416,6 +416,49 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Modules/_threadmodule.c", self) # PyInit__thread
         cparser.parse(CPythonDir + "/Modules/_weakref.c", self) # PyInit__weakref
         cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
+        # ``_io`` (Modules/_io/*.c) -- needed so PyInit__io has a real body
+        # instead of the ImportError-raising stub installed by
+        # ``_make_pyinit_stub`` in main().  Each file is parsed against
+        # the same shared State (the project's single-translation-unit
+        # design), so a few file-scope-static / macro collisions need
+        # explicit handling here.
+        #
+        # ``CHECK_CLOSED`` / ``CHECK_INITIALIZED`` are re-#defined
+        # identically in several files; pop between files so cparser
+        # doesn't flag a duplicate macro definition.
+        _io_macros_to_pop = ("CHECK_CLOSED", "CHECK_INITIALIZED")
+        # File-scope statics with the same name but different types
+        # across _io files would silently merge into one global -- the
+        # same pattern bool/float/dict/tuple/list/methodobj/classobj
+        # already deal with above.  Rename via macros.
+        cparser.parse(CPythonDir + "/Modules/_io/iobase.c", self) # PyIOBase_Type
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        # ``get_closed`` / ``get_mode`` collide with iobase.c versions
+        # (already parsed).
+        self.macros["get_closed"] = cparser.Macro(rightside="get_closed_fileio")
+        self.macros["get_mode"] = cparser.Macro(rightside="get_mode_fileio")
+        cparser.parse(CPythonDir + "/Modules/_io/fileio.c", self) # PyFileIO_Type
+        self.macros.pop("get_closed", None)
+        self.macros.pop("get_mode", None)
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Modules/_io/bytesio.c", self) # PyBytesIO_Type
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        # ``resize_buffer`` collides with bytesio.c version.
+        self.macros["resize_buffer"] = cparser.Macro(rightside="resize_buffer_stringio")
+        cparser.parse(CPythonDir + "/Modules/_io/stringio.c", self) # PyStringIO_Type
+        self.macros.pop("resize_buffer", None)
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Modules/_io/bufferedio.c", self) # PyBufferedReader_Type etc.
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Modules/_io/textio.c", self) # PyTextIOWrapper_Type
+        for _m in _io_macros_to_pop:
+            self.macros.pop(_m, None)
+        cparser.parse(CPythonDir + "/Modules/_io/_iomodule.c", self) # PyInit__io
 
 
 def init_faulthandler(sigusr1_chain=False):
