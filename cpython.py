@@ -53,6 +53,12 @@ class CPythonState(cparser.State):
                 self.macros["SIZEOF_WCHAR_T"] = sizeofMacro(ctypes.c_wchar)
                 self.macros["SIZEOF_PID_T"] = self.macros["SIZEOF_INT"]
                 self.macros["SIZEOF_TIME_T"] = self.macros["SIZEOF_LONG"]
+                # ``off_t`` is typedef'd as ``long`` in our sys/types.h
+                # shim (cparser/globalincludewrappers.handle_sys_types_h),
+                # so SIZEOF_OFF_T == SIZEOF_LONG.  _iomodule.h needs
+                # this to choose between PyLong_AsLong / PyLong_AsLongLong
+                # / PyLong_AsSsize_t for Py_off_t conversions.
+                self.macros["SIZEOF_OFF_T"] = self.macros["SIZEOF_LONG"]
                 self.macros["SIZEOF__BOOL"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_ERRNO_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_FCNTL_H"] = cparser.Macro(rightside="1")
