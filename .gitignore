@@ -2,5 +2,6 @@
 .history*
 /.idea
 /.claude/settings.json
+/.claude/*.sh
 /.venv
 /_diag.log
