@@ -243,6 +243,14 @@ class CPythonState(cparser.State):
         # __getattribute__`` override -- no source-level renaming
         # needed here.
         cparser.parse(CPythonDir + "/Python/symtable.c", self) # _PySymtable_Build
+        # compile.c re-#defines DEFAULT_BLOCK_SIZE (originally from
+        # pyarena.c), VISIT and VISIT_SEQ (both originally from
+        # symtable.c).  In real C each #define would have local scope
+        # to its translation unit; our single-state parser keeps them
+        # alive across files, so pop them here to let compile.c
+        # redefine cleanly.
+        for _m in ("DEFAULT_BLOCK_SIZE", "VISIT", "VISIT_SEQ"):
+            self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Python/compile.c", self) # PyAST_CompileObject
         cparser.parse(CPythonDir + "/Python/pystate.c", self) # PyInterpreterState_New
         cparser.parse(CPythonDir + "/Python/errors.c", self) # PyErr_Clear
@@ -316,6 +324,8 @@ class CPythonState(cparser.State):
         # (tp_alloc = PyType_GenericAlloc etc.).  Without it, add_methods()
         # calls PyStaticMethod_New() which finds tp_alloc == NULL and returns
         # NULL, making PyType_Ready fail with no Python-level error message.
+        # funcobject.c re-#defines OFF (originally from symtable.c).
+        self.macros.pop("OFF", None)
         cparser.parse(CPythonDir + "/Objects/funcobject.c", self) # PyStaticMethod_New, PyFunction_Type
         cparser.parse(CPythonDir + "/Objects/longobject.c", self) # PyLong_FromVoidPtr, PyLong_FromLong etc.
         # bytes_methods.c provides the _Py_<method>__doc__ docstring
