@@ -279,11 +279,8 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/pyhash.c", self) # _Py_HashPointer, _Py_HashDouble, etc.
         cparser.parse(CPythonDir + "/Python/pyctype.c", self) # _Py_ctype_table, _Py_ctype_tolower, _Py_ctype_toupper
         cparser.parse(CPythonDir + "/Objects/object.c", self) # _Py_ReadyTypes etc
-        self.macros["free_list"] = cparser.Macro(rightside="free_list_bool")
         cparser.parse(CPythonDir + "/Objects/boolobject.c", self) # PyBool_Type
-        self.macros["free_list"] = cparser.Macro(rightside="free_list_float")
         cparser.parse(CPythonDir + "/Objects/floatobject.c", self) # PyFloat_Type
-        self.macros.pop("free_list")
         cparser.parse(CPythonDir + "/Objects/unicodeobject.c", self) # PyUnicode_InternFromString etc.
         cparser.parse(CPythonDir + "/Objects/typeobject.c", self) # PyType_Ready
         cparser.parse(CPythonDir + "/Objects/moduleobject.c", self) # _PyModule_CreateInitialized, PyModule_New, etc.
@@ -442,56 +439,16 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Objects/complexobject.c", self) # PyComplex_Type
         cparser.parse(CPythonDir + "/Objects/memoryobject.c", self) # _PyManagedBuffer_Type, PyMemoryView_Type
         cparser.parse(CPythonDir + "/Objects/call.c", self) # PyObject_Call, PyCFunction_Call
-        self.macros["free_list"] = cparser.Macro(rightside="free_list_tuple")
-        self.macros["numfree"] = cparser.Macro(rightside="numfree_tuple")
         cparser.parse(CPythonDir + "/Objects/tupleobject.c", self) # PyTuple_New
-        # We need these macro hacks because dictobject.c will use the same vars.
-        self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__dict")
-        self.macros["numfree"] = cparser.Macro(rightside="numfree__dict")
-        self.macros["free_list"] = cparser.Macro(rightside="free_list__dict")
         cparser.parse(CPythonDir + "/Objects/dictobject.c", self)  # PyDict_New
-        # We need this macro hack because stringobject.c will use the same var.
-        self.macros["sizeof__doc__"] = cparser.Macro(rightside="sizeof__doc__str")
         if os.path.exists(CPythonDir + "/Objects/stringobject.c"):
             cparser.parse(CPythonDir + "/Objects/stringobject.c", self)  # PyString_FromString
         cparser.parse(CPythonDir + "/Objects/obmalloc.c", self) # PyObject_Free
         cparser.parse(CPythonDir + "/Modules/gcmodule.c", self) # _PyObject_GC_NewVar
         cparser.parse(CPythonDir + "/Objects/descrobject.c", self) # PyDescr_NewWrapper
-        # `classobject.c` and `methodobject.c` both declare ``static
-        # free_list`` and ``static numfree`` at file scope -- of
-        # DIFFERENT types (PyMethodObject* vs PyCFunctionObject*).
-        # Our cparser doesn't distinguish file-scope statics (known
-        # limitation -- see ``cparser/tests/test_file_scope_statics.py``
-        # for a minimal reproducer).  Without explicit per-file
-        # renaming via macros, both end up as the SAME global var,
-        # which causes ``method_dealloc`` to push PyMethodObjects
-        # onto the list that ``PyCFunction_NewEx`` then pops -- it
-        # interprets a 40-byte PyMethod slot as a 48-byte PyCFunction
-        # and writes 8 bytes past the slot, corrupting the next
-        # pymalloc allocation's PyGC_Head._gc_next.  The corrupted
-        # gc-list link then triggers a segfault during host Python's
-        # shutdown gc walk.  Same trick already applied for
-        # bool/float/dict/tuple/list above and below.
-        self.macros["numfree"] = cparser.Macro(rightside="numfree__methodobj")
-        self.macros["free_list"] = cparser.Macro(rightside="free_list__methodobj")
         self.macros.pop("OFF", None)  # funcobject.c defines OFF; methodobject.c redefines it
         cparser.parse(CPythonDir + "/Objects/methodobject.c", self) # PyCFunction_NewEx
-        self.macros["numfree"] = cparser.Macro(rightside="numfree__classobj")
-        self.macros["free_list"] = cparser.Macro(rightside="free_list__classobj")
-        # ``method_get_doc`` and ``method_repr`` collide between
-        # classobject.c and descrobject.c (different first-arg types).
-        self.macros["method_get_doc"] = cparser.Macro(rightside="method_get_doc__classobj")
-        self.macros["method_repr"] = cparser.Macro(rightside="method_repr__classobj")
         cparser.parse(CPythonDir + "/Objects/classobject.c", self) # PyMethod_Type
-        self.macros.pop("method_get_doc", None)
-        self.macros.pop("method_repr", None)
-        # We need these macro hacks because methodobject.c used the same vars.
-        self.macros["numfree"] = cparser.Macro(rightside="numfree__list")
-        self.macros["free_list"] = cparser.Macro(rightside="free_list__list")
-        self.macros["sizeof_doc"] = cparser.Macro(rightside="sizeof_doc__list")
-        self.macros["length_hint_doc"] = cparser.Macro(rightside="length_hint_doc__list")
-        self.macros["index_doc"] = cparser.Macro(rightside="index_doc__list")
-        self.macros["count_doc"] = cparser.Macro(rightside="count__list")
         self.macros.pop("OFF", None)   # reused later
         cparser.parse(CPythonDir + "/Objects/listobject.c", self) # PyList_New
         cparser.parse(CPythonDir + "/Objects/abstract.c", self) # PySequence_List
@@ -502,10 +459,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/traceback.c", self) # _Py_DumpTracebackThreads
         self.macros.pop("PUTS", None)  # traceback.c and faulthandler.c both define PUTS identically
         self.macros.pop("OFF", None)   # traceback.c and faulthandler.c both define OFF differently
-        # Rename static struct fatal_error to fatal_error_faulthandler.
-        self.macros["fatal_error"] = cparser.Macro(rightside="fatal_error_faulthandler")
         cparser.parse(CPythonDir + "/Modules/faulthandler.c", self) # _PyFaulthandler_Fini
-        self.macros.pop("fatal_error")
         # Modules imported by ``importlib._bootstrap._setup`` at
         # startup -- without these, initimport fails fatally.
         cparser.parse(CPythonDir + "/Modules/_threadmodule.c", self) # PyInit__thread
@@ -538,12 +492,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Modules/_operator.c", self) # PyInit__operator
         cparser.parse(CPythonDir + "/Modules/mathmodule.c", self) # PyInit_math
         cparser.parse(CPythonDir + "/Modules/_codecsmodule.c", self) # PyInit__codecs
-        # _csv.c has a file-scope ``static get_string(PyObject *)`` that
-        # collides with exceptions.c's ``static get_string(PyObject *,
-        # const char *)`` (incompatible types).  Rename the _csv side.
-        self.macros["get_string"] = cparser.Macro(rightside="get_string_csv")
         cparser.parse(CPythonDir + "/Modules/_csv.c", self) # PyInit__csv
-        self.macros.pop("get_string", None)
         # _json.c re-defines Py_BUILD_CORE_BUILTIN.
         self.macros.pop("Py_BUILD_CORE_BUILTIN", None)
         cparser.parse(CPythonDir + "/Modules/_json.c", self) # PyInit__json
@@ -568,70 +517,24 @@ class CPythonState(cparser.State):
         # OS module and aborts initexternalimport with "importlib
         # requires posix or nt" when neither is in the inittab.  Parse
         # posixmodule.c so PyInit_posix has a real body.
-        #
-        # File-scope-static collisions with previously-parsed files
-        # (same name in our single-translation-unit symbol space --
-        # see notes on bool/float/dict/tuple/list/methodobj/classobj).
-        # posixmodule.c declares ``static newfunc structseq_new`` as a
-        # function-pointer VARIABLE that caches StatResultType.tp_new;
-        # structseq.c has a same-named *function*.  Without a rename,
-        # ``_struct_sequence_template.tp_new`` resolves to the
-        # posixmodule.c variable and ``makeFuncPtr`` asserts.
-        self.macros["structseq_new"] = cparser.Macro(rightside="structseq_new_posix")
-        # ``initialized`` collision:
-        #   posixmodule.c:1933 has ``static int initialized;`` at FILE
-        #   scope, used as a guard around the per-type
-        #   ``PyStructSequence_InitType2`` calls in PyInit_posix.
-        #   pylifecycle.c:90 has ``static int initialized = 0;`` at
-        #   FUNCTION scope (inside ``_PyRuntime_Initialize``), which sets
-        #   itself to 1 after the runtime is initialized.
-        # C distinguishes these by scope; our cparser merges all
-        # same-named statics into one ``state.vars`` entry, so the
-        # pylifecycle write to 1 (during startup) clobbers
-        # posixmodule.c's value, and ``PyInit_posix`` then skips the
-        # entire ``if (!initialized) { ... StatResultType InitType2 ...
-        # }`` block.  The downstream symptom is ``StatResultType.tp_dict
-        # == NULL`` -> NULL-deref the next time ``_pystat_fromstructstat``
-        # runs (e.g. importlib calling ``os.stat`` during encoding
-        # import).  Rename posixmodule.c's variant.
-        self.macros["initialized"] = cparser.Macro(rightside="initialized_posix")
         cparser.parse(CPythonDir + "/Modules/posixmodule.c", self) # PyInit_posix
-        self.macros.pop("initialized", None)
-        self.macros.pop("structseq_new", None)
         # ``_io`` (Modules/_io/*.c) -- needed so PyInit__io has a real body
         # instead of the ImportError-raising stub installed by
-        # ``_make_pyinit_stub`` in main().  Each file is parsed against
-        # the same shared State (the project's single-translation-unit
-        # design), so a few file-scope-static / macro collisions need
-        # explicit handling here.
-        #
+        # ``_make_pyinit_stub`` in main().
         # ``CHECK_CLOSED`` / ``CHECK_INITIALIZED`` are re-#defined
         # identically in several files; pop between files so cparser
         # doesn't flag a duplicate macro definition.
         _io_macros_to_pop = ("CHECK_CLOSED", "CHECK_INITIALIZED")
-        # File-scope statics with the same name but different types
-        # across _io files would silently merge into one global -- the
-        # same pattern bool/float/dict/tuple/list/methodobj/classobj
-        # already deal with above.  Rename via macros.
         cparser.parse(CPythonDir + "/Modules/_io/iobase.c", self) # PyIOBase_Type
         for _m in _io_macros_to_pop:
             self.macros.pop(_m, None)
-        # ``get_closed`` / ``get_mode`` collide with iobase.c versions
-        # (already parsed).
-        self.macros["get_closed"] = cparser.Macro(rightside="get_closed_fileio")
-        self.macros["get_mode"] = cparser.Macro(rightside="get_mode_fileio")
         cparser.parse(CPythonDir + "/Modules/_io/fileio.c", self) # PyFileIO_Type
-        self.macros.pop("get_closed", None)
-        self.macros.pop("get_mode", None)
         for _m in _io_macros_to_pop:
             self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Modules/_io/bytesio.c", self) # PyBytesIO_Type
         for _m in _io_macros_to_pop:
             self.macros.pop(_m, None)
-        # ``resize_buffer`` collides with bytesio.c version.
-        self.macros["resize_buffer"] = cparser.Macro(rightside="resize_buffer_stringio")
         cparser.parse(CPythonDir + "/Modules/_io/stringio.c", self) # PyStringIO_Type
-        self.macros.pop("resize_buffer", None)
         for _m in _io_macros_to_pop:
             self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Modules/_io/bufferedio.c", self) # PyBufferedReader_Type etc.
