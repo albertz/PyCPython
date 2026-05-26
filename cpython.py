@@ -431,6 +431,13 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/hamt.c", self) # _PyHamt_Init, PyHamt_Type
         cparser.parse(CPythonDir + "/Python/context.c", self) # _PyContext_Init, PyContext_Type
         cparser.parse(CPythonDir + "/Python/frozen.c", self) # _PyImport_FrozenModules, PyImport_FrozenModules
+        # hashtable.c must be parsed BEFORE marshal.c -- marshal's
+        # ``w_init_refs`` calls ``_Py_hashtable_new``, and a missing
+        # body makes it return None which marshal treats as NULL ->
+        # PyErr_NoMemory.  This broke ``import encodings`` during the
+        # importlib bootstrap (encodings -> codecs -> get_code ->
+        # _code_to_timestamp_pyc -> marshal.dumps -> w_init_refs).
+        cparser.parse(CPythonDir + "/Modules/hashtable.c", self) # _Py_hashtable_new, _Py_hashtable_hash_ptr, _Py_hashtable_compare_direct
         cparser.parse(CPythonDir + "/Python/marshal.c", self) # PyMarshal_ReadObjectFromString
         cparser.parse(CPythonDir + "/Objects/complexobject.c", self) # PyComplex_Type
         cparser.parse(CPythonDir + "/Objects/memoryobject.c", self) # _PyManagedBuffer_Type, PyMemoryView_Type
