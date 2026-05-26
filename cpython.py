@@ -291,6 +291,23 @@ class CPythonState(cparser.State):
         self.macros.pop("__VERSION__", None)
         cparser.parse(CPythonDir + "/Python/mysnprintf.c", self) # PyOS_snprintf, PyOS_vsnprintf
         cparser.parse(CPythonDir + "/Python/mystrtoul.c", self) # PyOS_strtol, PyOS_strtoul
+        # formatter_unicode.c provides ``_PyUnicode_FormatAdvancedWriter``
+        # / ``_PyLong_FormatAdvancedWriter`` / ``_PyFloat_FormatAdvancedWriter``
+        # / ``_PyComplex_FormatAdvancedWriter`` -- without these,
+        # ``render_field`` in unicode_format.h dispatches to a body-less
+        # stub that silently returns 0 (success) without writing
+        # anything.  Symptom: ``'{!r}'.format(x)`` produces just the
+        # literal prefix; e.g. importlib's ``_ERR_MSG.format(name)``
+        # becomes ``"No module named "`` with the ``{!r}`` part missing.
+        # File-scope static collisions: ``get_integer`` clashes with
+        # the same name in ``stringlib/unicode_format.h`` (different
+        # signature), and ``format_obj`` clashes with the same name in
+        # bytesobject.c.  Rename both via macros for this file.
+        self.macros["get_integer"] = cparser.Macro(rightside="get_integer_formatter")
+        self.macros["format_obj"] = cparser.Macro(rightside="format_obj_formatter")
+        cparser.parse(CPythonDir + "/Python/formatter_unicode.c", self) # _Py*_FormatAdvancedWriter
+        self.macros.pop("get_integer", None)
+        self.macros.pop("format_obj", None)
         cparser.parse(CPythonDir + "/Python/sysmodule.c", self) # PySys_ResetWarnOptions
         cparser.parse(CPythonDir + "/Objects/weakrefobject.c", self) # PyWeakref_NewRef
         # funcobject.c must be parsed BEFORE bytearrayobject.c (and others
@@ -492,7 +509,25 @@ class CPythonState(cparser.State):
         # ``_struct_sequence_template.tp_new`` resolves to the
         # posixmodule.c variable and ``makeFuncPtr`` asserts.
         self.macros["structseq_new"] = cparser.Macro(rightside="structseq_new_posix")
+        # ``initialized`` collision:
+        #   posixmodule.c:1933 has ``static int initialized;`` at FILE
+        #   scope, used as a guard around the per-type
+        #   ``PyStructSequence_InitType2`` calls in PyInit_posix.
+        #   pylifecycle.c:90 has ``static int initialized = 0;`` at
+        #   FUNCTION scope (inside ``_PyRuntime_Initialize``), which sets
+        #   itself to 1 after the runtime is initialized.
+        # C distinguishes these by scope; our cparser merges all
+        # same-named statics into one ``state.vars`` entry, so the
+        # pylifecycle write to 1 (during startup) clobbers
+        # posixmodule.c's value, and ``PyInit_posix`` then skips the
+        # entire ``if (!initialized) { ... StatResultType InitType2 ...
+        # }`` block.  The downstream symptom is ``StatResultType.tp_dict
+        # == NULL`` -> NULL-deref the next time ``_pystat_fromstructstat``
+        # runs (e.g. importlib calling ``os.stat`` during encoding
+        # import).  Rename posixmodule.c's variant.
+        self.macros["initialized"] = cparser.Macro(rightside="initialized_posix")
         cparser.parse(CPythonDir + "/Modules/posixmodule.c", self) # PyInit_posix
+        self.macros.pop("initialized", None)
         self.macros.pop("structseq_new", None)
         # ``_io`` (Modules/_io/*.c) -- needed so PyInit__io has a real body
         # instead of the ImportError-raising stub installed by
