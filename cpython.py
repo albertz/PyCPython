@@ -1113,6 +1113,95 @@ def main(argv):
         _stub.C_resType = ctypes.c_void_p
         return _stub
 
+    # Wrap ``initexternalimport`` to also set ``sys.dont_write_bytecode
+    # = True`` once the external importers are installed.  With
+    # O_EXCL/O_CREAT/O_WRONLY now correctly defined on the ``posix``
+    # module (see ``PyInit_posix`` wrap below), importlib's
+    # ``_write_atomic`` can technically open .pyc cache files -- but
+    # we'd actually persist bytecode caches into CPython's stdlib tree
+    # on disk, which is undesirable side-effect.  Disable bytecode
+    # writes to keep the run hermetic.
+    if "initexternalimport" in state.funcs:
+        # Lazy resolution to avoid eagerly translating ``initexternal\
+        # import`` and ``PySys_SetObject`` at setup time -- those
+        # translations don't pay off when the higher-level
+        # ``pymain_init_python_main`` override is active (the wrapped
+        # function is bypassed entirely).
+        _resolved_initext = {}
+        _dont_write_name_buf = interpreter._make_string("dont_write_bytecode")
+        _dont_write_name_ptr = ctypes.cast(_dont_write_name_buf,
+                                           ctypes.POINTER(ctypes.c_byte))
+        _true_obj = interpreter.globalScope.getVar("_Py_TrueStruct")
+        _true_addr = ctypes.addressof(_true_obj)
+        def _wrapped_initext(interp_arg):
+            if not _resolved_initext:
+                _resolved_initext["orig"] = interpreter.getFunc("initexternalimport")
+                _resolved_initext["setobj"] = interpreter.getFunc("PySys_SetObject")
+            r = _resolved_initext["orig"](interp_arg)
+            _resolved_initext["setobj"](_dont_write_name_ptr, ctypes.c_void_p(_true_addr))
+            return r
+        _wrapped_initext.C_argTypes = None
+        _wrapped_initext.C_resType = ctypes.c_int
+        interpreter._func_cache["initexternalimport"] = _wrapped_initext
+
+    # Wrap ``PyInit_posix`` to backfill constants whose names got
+    # mangled by ``PyModule_AddIntMacro(m, X) ->
+    # PyModule_AddIntConstant(m, #X, X)``.  Our cparser preprocessor
+    # expands ``X`` (a macro from <fcntl.h> etc.) BEFORE evaluating
+    # the ``#`` stringification, so ``PyModule_AddIntMacro(m, O_EXCL)``
+    # produces a constant named ``"0x0080"`` (the macro's value)
+    # instead of ``"O_EXCL"`` (the literal token name).  Proper fix is
+    # in the preprocessor (C99 §6.10.3.2: ``#`` stringifies the
+    # original argument spelling); doing that without breaking
+    # function-like macro recursion (e.g. ``Py_IS_FINITE(v)`` via
+    # ``Py_IS_INFINITY(v)``) requires reworking arg
+    # collection+expansion -- larger surgery, deferred.  For now the
+    # values are already in the module under wrong names, so just add
+    # the right names too.  Required for importlib's source loader,
+    # whose ``_write_atomic`` opens ``.pyc`` cache files with
+    # ``_os.O_EXCL | _os.O_CREAT | _os.O_WRONLY``.
+    if "PyInit_posix" in state.funcs:
+        # Names + values must match what ``handle_fcntl_h`` defines
+        # in cparser/globalincludewrappers.py (the C side already
+        # added these as ``str(value)``-named attrs via all_ins).
+        _posix_int_constants = [
+            ("O_RDONLY",   0x00000000),
+            ("O_WRONLY",   0x00000001),
+            ("O_RDWR",     0x00000002),
+            ("O_NONBLOCK", 0x00000004),
+            ("O_APPEND",   0x00000008),
+            ("O_EXCL",     0x00000080),
+            ("O_CREAT",    0x00000200),
+            ("O_TRUNC",    0x00000400),
+            ("O_CLOEXEC",  0x01000000),
+            ("F_GETFD",    1),
+            ("F_SETFD",    2),
+            ("F_GETFL",    3),
+            ("F_SETFL",    4),
+            ("FD_CLOEXEC", 1),
+        ]
+        # Resolve dependencies lazily (on first call) so we don't
+        # eagerly translate ``PyInit_posix`` -- a HUGE function whose
+        # translation noticeably slows down startup.
+        _resolved = {}
+        def _wrapped_posix_init():
+            if not _resolved:
+                _resolved["orig"] = interpreter.getFunc("PyInit_posix")
+                _resolved["addint"] = interpreter.getFunc("PyModule_AddIntConstant")
+            mod = _resolved["orig"]()
+            if mod:
+                for _name, _val in _posix_int_constants:
+                    _name_buf = interpreter._make_string(_name)
+                    _name_ptr = ctypes.cast(_name_buf,
+                                            ctypes.POINTER(ctypes.c_byte))
+                    _resolved["addint"](
+                        ctypes.cast(mod, ctypes.c_void_p),
+                        _name_ptr, ctypes.c_long(_val))
+            return mod
+        _wrapped_posix_init.C_argTypes = None
+        _wrapped_posix_init.C_resType = ctypes.c_void_p
+        interpreter._func_cache["PyInit_posix"] = _wrapped_posix_init
+
     from cparser.cparser import CFunc as _CFunc
     for _fn, _cf in list(state.funcs.items()):
         if not isinstance(_cf, _CFunc):
