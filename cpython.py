@@ -537,6 +537,34 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Modules/_struct.c", self) # PyInit__struct
         cparser.parse(CPythonDir + "/Modules/_operator.c", self) # PyInit__operator
         cparser.parse(CPythonDir + "/Modules/mathmodule.c", self) # PyInit_math
+        cparser.parse(CPythonDir + "/Modules/_codecsmodule.c", self) # PyInit__codecs
+        # _csv.c has a file-scope ``static get_string(PyObject *)`` that
+        # collides with exceptions.c's ``static get_string(PyObject *,
+        # const char *)`` (incompatible types).  Rename the _csv side.
+        self.macros["get_string"] = cparser.Macro(rightside="get_string_csv")
+        cparser.parse(CPythonDir + "/Modules/_csv.c", self) # PyInit__csv
+        self.macros.pop("get_string", None)
+        # _json.c re-defines Py_BUILD_CORE_BUILTIN.
+        self.macros.pop("Py_BUILD_CORE_BUILTIN", None)
+        cparser.parse(CPythonDir + "/Modules/_json.c", self) # PyInit__json
+        # NOTE: itertoolsmodule.c uses ``PyObject *(values[LINKCELLS]);``
+        # (parenthesized array declarator) which our cparser doesn't
+        # yet handle.  TODO: parse.
+        cparser.parse(CPythonDir + "/Modules/sha1module.c", self) # PyInit__sha1
+        cparser.parse(CPythonDir + "/Modules/md5module.c", self) # PyInit__md5
+        # _randommodule.c defines `N` (Mersenne Twister state size);
+        # cmathmodule.c redefines `N` as a series-length constant.
+        self.macros.pop("N", None)
+        cparser.parse(CPythonDir + "/Modules/cmathmodule.c", self) # PyInit_cmath
+        cparser.parse(CPythonDir + "/Modules/sha256module.c", self) # PyInit__sha256
+        # NOTE: sha512module.c shares many static helper names
+        # (SHAobject, SHAcopy, SHA_init, longReverse, ...) with
+        # sha256module.c, all incompatible types.  Each needs an
+        # individual macro rename.  Skip for now -- TODO.
+        # NOTE: arraymodule.c and binascii.c trigger a memory-explosion
+        # (~13 GB) in our parser -- runaway allocation likely from
+        # some construct that puts cparser into a degenerate state.
+        # TODO: investigate.
         cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
         # ``posix`` (Modules/posixmodule.c) -- importlib's
         # _bootstrap_external._setup() walks [posix, nt] looking for the
