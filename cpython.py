@@ -561,10 +561,7 @@ class CPythonState(cparser.State):
         # (SHAobject, SHAcopy, SHA_init, longReverse, ...) with
         # sha256module.c, all incompatible types.  Each needs an
         # individual macro rename.  Skip for now -- TODO.
-        # NOTE: arraymodule.c and binascii.c trigger a memory-explosion
-        # (~13 GB) in our parser -- runaway allocation likely from
-        # some construct that puts cparser into a degenerate state.
-        # TODO: investigate.
+        cparser.parse(CPythonDir + "/Modules/arraymodule.c", self) # PyInit_array
         cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
         # ``posix`` (Modules/posixmodule.c) -- importlib's
         # _bootstrap_external._setup() walks [posix, nt] looking for the
