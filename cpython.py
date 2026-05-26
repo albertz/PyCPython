@@ -884,19 +884,6 @@ def main(argv):
     _set_path_field("program_name", argv[0])
     _set_path_field("home", _cpython_dir)
 
-    # ``pymain_init_sys_path`` calls ``pymain_update_sys_path`` which
-    # ``PySys_GetObject("path")``-fails with "can't get sys.path"
-    # because we skip ``initexternalimport`` (the importlib bootstrap
-    # currently runs into a postfix-++ infinite loop in
-    # ``MarkupIterator_next``).  Until that's fixed, stub
-    # ``pymain_init_sys_path`` to silently succeed.
-    def _py_pymain_init_sys_path(pymain, config):
-        """pymain_init_sys_path(_PyMain *, _PyCoreConfig *) -> int."""
-        return 0  # success
-    _py_pymain_init_sys_path.C_argTypes = None
-    _py_pymain_init_sys_path.C_resType = ctypes.c_int
-    interpreter._func_cache["pymain_init_sys_path"] = _py_pymain_init_sys_path
-
     # ``PyGILState_Check`` asserts via the host TSS that the current
     # thread holds the GIL.  Our interpreter doesn't actually run a
     # real GIL state machine (we're driving translated C from Python),
@@ -1061,6 +1048,16 @@ def main(argv):
         main_dict = py_module_getdict(main_mod)
         py_dict_setitem_string(main_dict, builtins_key_ptr, builtins_mod)
         _install_sys_streams()
+        # Provide an empty ``sys.path`` so the REAL ``pymain_init_sys_path``
+        # (called immediately after this override in ``pymain_init``) can
+        # do its ``PyList_Insert(sys.path, 0, argv0)``.  Without this we
+        # had to additionally stub ``pymain_init_sys_path``.
+        _PySys_SetObject = interpreter.getFunc("PySys_SetObject")
+        _PyList_New = interpreter.getFunc("PyList_New")
+        _path_name = interpreter._make_string("path")
+        _path_name_ptr = ctypes.cast(_path_name, ctypes.POINTER(ctypes.c_byte))
+        _empty_list = _PyList_New(ctypes.c_long(0))
+        _PySys_SetObject(_path_name_ptr, ctypes.cast(_empty_list, ctypes.c_void_p))
         # NOTE: the real ``initexternalimport`` -> Python-level
         # ``importlib._install_external_importers`` no longer
         # infinite-loops (``MarkupIterator_next`` was unblocked by
