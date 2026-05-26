@@ -510,6 +510,33 @@ class CPythonState(cparser.State):
         # startup -- without these, initimport fails fatally.
         cparser.parse(CPythonDir + "/Modules/_threadmodule.c", self) # PyInit__thread
         cparser.parse(CPythonDir + "/Modules/_weakref.c", self) # PyInit__weakref
+        cparser.parse(CPythonDir + "/Modules/_stat.c", self) # PyInit__stat
+        cparser.parse(CPythonDir + "/Modules/_opcode.c", self) # PyInit__opcode
+        cparser.parse(CPythonDir + "/Modules/_contextvarsmodule.c", self) # PyInit__contextvars
+        cparser.parse(CPythonDir + "/Modules/_bisectmodule.c", self) # PyInit__bisect
+        cparser.parse(CPythonDir + "/Modules/atexitmodule.c", self) # PyInit_atexit
+        cparser.parse(CPythonDir + "/Modules/_heapqmodule.c", self) # PyInit__heapq
+        cparser.parse(CPythonDir + "/Modules/_randommodule.c", self) # PyInit__random
+        cparser.parse(CPythonDir + "/Modules/errnomodule.c", self) # PyInit_errno
+        cparser.parse(CPythonDir + "/Modules/xxsubtype.c", self) # PyInit_xxsubtype
+        cparser.parse(CPythonDir + "/Modules/_abc.c", self) # PyInit__abc
+        cparser.parse(CPythonDir + "/Modules/_functoolsmodule.c", self) # PyInit__functools
+        # _collectionsmodule.c defines ``typedef struct BLOCK {...}
+        # block;`` for the deque's internal node, but ``block`` is
+        # already a typedef in pyarena.c (the arena's memory block --
+        # with field ``ab_size``).  Without a rename, the deque
+        # version overwrites the arena one, then pyarena.c's later
+        # translation tries ``b->ab_size`` on the deque block and
+        # AttributeErrors.  Rename the deque side.
+        self.macros["block"] = cparser.Macro(rightside="block_deque")
+        cparser.parse(CPythonDir + "/Modules/_collectionsmodule.c", self) # PyInit__collections
+        self.macros.pop("block", None)
+        # _functools.c re-#defines OFF (already defined elsewhere); pop
+        # so _struct.c can redefine cleanly with its own value.
+        self.macros.pop("OFF", None)
+        cparser.parse(CPythonDir + "/Modules/_struct.c", self) # PyInit__struct
+        cparser.parse(CPythonDir + "/Modules/_operator.c", self) # PyInit__operator
+        cparser.parse(CPythonDir + "/Modules/mathmodule.c", self) # PyInit_math
         cparser.parse(CPythonDir + "/Python/_warnings.c", self) # _PyWarnings_Init
         # ``posix`` (Modules/posixmodule.c) -- importlib's
         # _bootstrap_external._setup() walks [posix, nt] looking for the
