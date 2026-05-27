@@ -1182,11 +1182,14 @@ def main(argv):
         ]
         # Resolve dependencies lazily (on first call) so we don't
         # eagerly translate ``PyInit_posix`` -- a HUGE function whose
-        # translation noticeably slows down startup.
+        # translation noticeably slows down startup.  Note we bypass
+        # ``getFunc`` for the ``orig`` lookup: the wrapper has already
+        # been installed into ``_func_cache["PyInit_posix"]`` below,
+        # so ``getFunc`` would return the wrapper itself and recurse.
         _resolved = {}
         def _wrapped_posix_init():
             if not _resolved:
-                _resolved["orig"] = interpreter.getFunc("PyInit_posix")
+                _resolved["orig"] = interpreter._translateFuncToPy("PyInit_posix")
                 _resolved["addint"] = interpreter.getFunc("PyModule_AddIntConstant")
             mod = _resolved["orig"]()
             if mod:
