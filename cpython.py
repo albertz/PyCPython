@@ -988,6 +988,35 @@ def main(argv):
             PySys_SetObject(ctypes.cast(key_buf, BytePtrT), mod)
             interpreter._stream_keepalive.append(key_buf)
 
+    # ``init_sys_streams`` in pylifecycle.c does:
+    #     PyImport_ImportModule("encodings.utf_8")
+    #     PyImport_ImportModule("encodings.latin_1")
+    #     PyImport_ImportModule("builtins")
+    #     PyImport_ImportModule("io")
+    #     ...wrap stdin/stdout/stderr in io.TextIOWrapper...
+    # None of those imports work in our stripped-down init (no
+    # filesystem importer, no compiled io module).  Override with
+    # our Python-level stream-stub installer and return a zero-init
+    # ``_PyInitError`` so the C-side ``_Py_INIT_FAILED(err)`` check
+    # (which tests ``err.msg != NULL``) treats this as success.
+    _init_error_type = interpreter.getCType(state.typedefs["_PyInitError"])
+    def _py_init_sys_streams(interp_ptr):
+        _install_sys_streams()
+        return _init_error_type()  # zero-initialized -> _Py_INIT_OK
+    _py_init_sys_streams.C_argTypes = None
+    _py_init_sys_streams.C_resType = _init_error_type
+    interpreter._func_cache["_static_pylifecycle_init_sys_streams"] = _py_init_sys_streams
+
+    # ``initsite`` does ``PyImport_ImportModule("site")``.  Without a
+    # working filesystem importer ``site`` can't be loaded.  Skip
+    # equivalent to running with ``-S`` -- harmless for ``-c "..."``
+    # programs that use only builtins.
+    def _py_initsite():
+        return _init_error_type()  # _Py_INIT_OK
+    _py_initsite.C_argTypes = None
+    _py_initsite.C_resType = _init_error_type
+    interpreter._func_cache["_static_pylifecycle_initsite"] = _py_initsite
+
     # NOTE on ``pymain_init_python_main``: the real implementation
     # calls ``_Py_InitializeMainInterpreter`` which does
     # ``initfsencoding`` -> ``get_locale_encoding`` -> ``_PyCodec_Lookup``
