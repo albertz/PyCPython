@@ -466,6 +466,12 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Python/traceback.c", self) # _Py_DumpTracebackThreads
         self.macros.pop("PUTS", None)  # traceback.c and faulthandler.c both define PUTS identically
         self.macros.pop("OFF", None)   # traceback.c and faulthandler.c both define OFF differently
+        # pytime.c and faulthandler.c both define these unit-conversion
+        # constants; pop so faulthandler.c can redefine cleanly.
+        for _m in ("SEC_TO_MS", "MS_TO_US", "SEC_TO_US",
+                   "US_TO_NS", "MS_TO_NS", "SEC_TO_NS",
+                   "NS_TO_MS", "NS_TO_US"):
+            self.macros.pop(_m, None)
         cparser.parse(CPythonDir + "/Modules/faulthandler.c", self) # _PyFaulthandler_Fini
         # Modules imported by ``importlib._bootstrap._setup`` at
         # startup -- without these, initimport fails fatally.
