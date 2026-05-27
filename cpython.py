@@ -882,14 +882,27 @@ def main(argv):
     # stripped-down init doesn't bootstrap.  Override with a wrapper
     # that returns a strdup'd locale-encoding string directly so
     # ``initfsencoding`` succeeds without hitting the codec machinery.
+    #
+    # The real ``get_codec_name`` returns a buffer from
+    # ``_PyMem_RawStrdup``, and ``Py_FileSystemDefaultEncoding`` is
+    # later freed via ``PyMem_RawFree`` during ``Py_FinalizeEx``.
+    # Mirror that ownership contract: allocate via the interpreter's
+    # ``_malloc`` (which tracks the buffer in ``self.mallocs``) so
+    # the eventual ``_free`` recognizes the pointer.  Using
+    # ``_make_string`` here would leak the buffer outside our
+    # alloc-tracker and trip ``_free``'s "not allocated by us" check.
     import locale as _locale_mod
+    from cparser.interpreter import _ctype_ptr_get_value as _gv_locale
     def _py_get_locale_encoding():
         try:
             enc = _locale_mod.nl_langinfo(_locale_mod.CODESET) or "utf-8"
         except OSError:
             enc = "utf-8"
-        buf = interpreter._make_string(enc)
-        return ctypes.addressof(buf)
+        enc_bytes = enc.encode("ascii", "replace") + b"\0"
+        buf_ptr = interpreter._malloc(len(enc_bytes))
+        addr = _gv_locale(buf_ptr)
+        ctypes.memmove(addr, enc_bytes, len(enc_bytes))
+        return addr
     _py_get_locale_encoding.C_argTypes = None
     _py_get_locale_encoding.C_resType = ctypes.c_void_p
     interpreter._func_cache["_static_pylifecycle_get_locale_encoding"] = _py_get_locale_encoding
