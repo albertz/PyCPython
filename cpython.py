@@ -65,6 +65,12 @@ class CPythonState(cparser.State):
                 self.macros["HAVE_SYS_STAT_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_SYS_TYPES_H"] = cparser.Macro(rightside="1")
                 self.macros["HAVE_UNISTD_H"] = cparser.Macro(rightside="1")
+                # ``HAVE_CLOCK_GETTIME`` -- POSIX clock_gettime is
+                # available; the wrapper is bound in
+                # globalincludewrappers.handle_time_h.  Needed so
+                # pytime.c's pymonotonic / pyget_system_clock /
+                # pytime_fromtimespec are actually parsed.
+                self.macros["HAVE_CLOCK_GETTIME"] = cparser.Macro(rightside="1")
                 # Force strict ANSI mode so pymacro.h uses the simple Py_ARRAY_LENGTH
                 # (without GCC-extension typeof/__builtin_types_compatible_p).
                 self.macros["__STRICT_ANSI__"] = cparser.Macro(rightside="1")
@@ -325,6 +331,7 @@ class CPythonState(cparser.State):
         self.macros.pop("OFF", None)
         cparser.parse(CPythonDir + "/Objects/funcobject.c", self) # PyStaticMethod_New, PyFunction_Type
         cparser.parse(CPythonDir + "/Objects/longobject.c", self) # PyLong_FromVoidPtr, PyLong_FromLong etc.
+        cparser.parse(CPythonDir + "/Python/pytime.c", self) # _PyLong_FromTime_t etc.
         # bytes_methods.c provides the _Py_<method>__doc__ docstring
         # globals that both bytearrayobject.c and bytesobject.c reference
         # in their PyMethodDef tables (declared in Include/bytes_methods.h).
@@ -857,22 +864,9 @@ def main(argv):
     _py_PyGILState_Check.C_argTypes = []
     _py_PyGILState_Check.C_resType = ctypes.c_int
 
-    # ``_PyLong_FromTime_t(time_t t)``: a one-liner in pytime.c that
-    # wraps ``PyLong_FromLong(L)``.  We don't parse pytime.c (it pulls
-    # in clock_gettime / CLOCK_MONOTONIC / struct timespec that we
-    # don't yet bind), so it stays body-less and returns Python ``None``
-    # by default -- which makes ``posixmodule.c::_pystat_fromstructstat``
-    # populate ``stat_result.st_atime / st_mtime / st_ctime`` with
-    # ``None``, and importlib's bootstrap then dies on
-    # ``int(st['mtime'])`` for the bytecode-cache freshness check.
-    # Surgical override: just call PyLong_FromLong directly.
-    _PyLong_FromLong = interpreter.getFunc("PyLong_FromLong")
-    def _py_PyLong_FromTime_t(t):
-        t_val = t.value if hasattr(t, "value") else int(t)
-        return _PyLong_FromLong(ctypes.c_long(int(t_val)))
-    _py_PyLong_FromTime_t.C_argTypes = None
-    _py_PyLong_FromTime_t.C_resType = ctypes.c_void_p
-    interpreter._func_cache["_PyLong_FromTime_t"] = _py_PyLong_FromTime_t
+    # ``_PyLong_FromTime_t`` is now provided as inline C in
+    # ``parse_cpython`` (right after longobject.c is parsed) -- no
+    # wrapper needed.
     interpreter._func_cache["PyGILState_Check"] = _py_PyGILState_Check
 
     # ``get_locale_encoding`` is a static helper in pylifecycle.c that
