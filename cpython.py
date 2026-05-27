@@ -1030,63 +1030,6 @@ def main(argv):
     _py_initsite.C_resType = _init_error_type
     interpreter._func_cache["_static_pylifecycle_initsite"] = _py_initsite
 
-    # NOTE on ``pymain_init_python_main``: the real implementation
-    # calls ``_Py_InitializeMainInterpreter`` which does
-    # ``initfsencoding`` -> ``get_locale_encoding`` -> ``_PyCodec_Lookup``
-    # -> ``_PyCodecRegistry_Init`` -> ``PyImport_ImportModuleNoBlock("encodings")``
-    # which needs the FULL importlib bootstrap (the same one the
-    # ``initexternalimport`` stub bypasses due to the
-    # ``MarkupIterator_next`` postfix-++ infinite loop).  So we
-    # keep a *partial* implementation here that does what
-    # ``add_main_module`` would (set ``__main__.__builtins__``) so
-    # user code can find ``print`` etc.  Removing this completely
-    # is blocked on fixing the importlib bootstrap.
-    def _py_pymain_init_python_main(pymain, interp_arg):
-        """pymain_init_python_main: minimal substitute for
-        ``_Py_InitializeMainInterpreter``.  Sets up
-        ``__main__.__builtins__`` (otherwise ``print`` lookup raises
-        NameError) via direct sys.modules access, skipping the slow
-        ``PyImport_ImportModule("builtins")`` path.  Also installs the
-        ``sys.stdout``/``sys.stderr`` stubs that ``init_sys_streams``
-        would normally set up.
-        """
-        py_add_module = interpreter.getFunc("PyImport_AddModule")
-        py_module_getdict = interpreter.getFunc("PyModule_GetDict")
-        py_dict_setitem_string = interpreter.getFunc("PyDict_SetItemString")
-        main_name = interpreter._make_string("__main__")
-        main_name_ptr = ctypes.cast(main_name, ctypes.POINTER(ctypes.c_byte))
-        builtins_name = interpreter._make_string("builtins")
-        builtins_name_ptr = ctypes.cast(builtins_name, ctypes.POINTER(ctypes.c_byte))
-        builtins_key = interpreter._make_string("__builtins__")
-        builtins_key_ptr = ctypes.cast(builtins_key, ctypes.POINTER(ctypes.c_byte))
-        main_mod = py_add_module(main_name_ptr)
-        builtins_mod = py_add_module(builtins_name_ptr)
-        main_dict = py_module_getdict(main_mod)
-        py_dict_setitem_string(main_dict, builtins_key_ptr, builtins_mod)
-        _install_sys_streams()
-        # Provide an empty ``sys.path`` so the REAL ``pymain_init_sys_path``
-        # (called immediately after this override in ``pymain_init``) can
-        # do its ``PyList_Insert(sys.path, 0, argv0)``.  Without this we
-        # had to additionally stub ``pymain_init_sys_path``.
-        _PySys_SetObject = interpreter.getFunc("PySys_SetObject")
-        _PyList_New = interpreter.getFunc("PyList_New")
-        _path_name = interpreter._make_string("path")
-        _path_name_ptr = ctypes.cast(_path_name, ctypes.POINTER(ctypes.c_byte))
-        _empty_list = _PyList_New(ctypes.c_long(0))
-        _PySys_SetObject(_path_name_ptr, ctypes.cast(_empty_list, ctypes.c_void_p))
-        # NOTE: the real ``initexternalimport`` -> Python-level
-        # ``importlib._install_external_importers`` no longer
-        # infinite-loops (``MarkupIterator_next`` was unblocked by
-        # other fixes), but the path translates a huge amount of
-        # importlib bytecode on demand and takes several minutes per
-        # run.  Until we have translation caching across runs, skip
-        # it -- ``-c "..."`` programs that only use builtins don't
-        # need the filesystem importers anyway.
-        return 0
-    _py_pymain_init_python_main.C_argTypes = None
-    _py_pymain_init_python_main.C_resType = ctypes.c_int
-    interpreter._func_cache["pymain_init_python_main"] = _py_pymain_init_python_main
-
     # Many of the C modules listed in `_PyImport_Inittab` (PC/config.c) --
     # `_thread`, `_io`, `itertools`, ... -- live in C source files we
     # don't parse.  Their `PyInit_xxx` is therefore a body-less function
@@ -1126,36 +1069,19 @@ def main(argv):
         _stub.C_resType = ctypes.c_void_p
         return _stub
 
-    # Wrap ``initexternalimport`` to also set ``sys.dont_write_bytecode
-    # = True`` once the external importers are installed.  With
-    # O_EXCL/O_CREAT/O_WRONLY now correctly defined on the ``posix``
-    # module (see ``PyInit_posix`` wrap below), importlib's
-    # ``_write_atomic`` can technically open .pyc cache files -- but
-    # we'd actually persist bytecode caches into CPython's stdlib tree
-    # on disk, which is undesirable side-effect.  Disable bytecode
-    # writes to keep the run hermetic.
-    if "initexternalimport" in state.funcs:
-        # Lazy resolution to avoid eagerly translating ``initexternal\
-        # import`` and ``PySys_SetObject`` at setup time -- those
-        # translations don't pay off when the higher-level
-        # ``pymain_init_python_main`` override is active (the wrapped
-        # function is bypassed entirely).
-        _resolved_initext = {}
-        _dont_write_name_buf = interpreter._make_string("dont_write_bytecode")
-        _dont_write_name_ptr = ctypes.cast(_dont_write_name_buf,
-                                           ctypes.POINTER(ctypes.c_byte))
-        _true_obj = interpreter.globalScope.getVar("_Py_TrueStruct")
-        _true_addr = ctypes.addressof(_true_obj)
-        def _wrapped_initext(interp_arg):
-            if not _resolved_initext:
-                _resolved_initext["orig"] = interpreter.getFunc("initexternalimport")
-                _resolved_initext["setobj"] = interpreter.getFunc("PySys_SetObject")
-            r = _resolved_initext["orig"](interp_arg)
-            _resolved_initext["setobj"](_dont_write_name_ptr, ctypes.c_void_p(_true_addr))
-            return r
-        _wrapped_initext.C_argTypes = None
-        _wrapped_initext.C_resType = ctypes.c_int
-        interpreter._func_cache["initexternalimport"] = _wrapped_initext
+    # ``initexternalimport`` (static in pylifecycle.c -> auto-scoped to
+    # ``_static_pylifecycle_initexternalimport``) calls importlib's
+    # ``_install_external_importers``, which translates a huge amount
+    # of importlib bytecode on demand -- minutes per run -- and only
+    # matters for filesystem imports, which ``-c "..."`` programs don't
+    # use.  Stub it to a no-op success.  Without this, the real
+    # ``_Py_InitializeMainInterpreter`` path is unusably slow.
+    _init_err_type = interpreter.getCType(state.typedefs["_PyInitError"])
+    def _py_initexternalimport(interp_arg):
+        return _init_err_type()  # _Py_INIT_OK
+    _py_initexternalimport.C_argTypes = None
+    _py_initexternalimport.C_resType = _init_err_type
+    interpreter._func_cache["_static_pylifecycle_initexternalimport"] = _py_initexternalimport
 
     # Wrap ``PyInit_posix`` to backfill constants whose names got
     # mangled by ``PyModule_AddIntMacro(m, X) ->
