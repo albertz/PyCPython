@@ -875,6 +875,25 @@ def main(argv):
     interpreter._func_cache["_PyLong_FromTime_t"] = _py_PyLong_FromTime_t
     interpreter._func_cache["PyGILState_Check"] = _py_PyGILState_Check
 
+    # ``get_locale_encoding`` is a static helper in pylifecycle.c that
+    # uses ``nl_langinfo(CODESET)`` and then ``get_codec_name`` to
+    # normalize the encoding via ``_PyCodec_Lookup``.  The codec
+    # lookup goes through ``encodings.__init__`` etc., which our
+    # stripped-down init doesn't bootstrap.  Override with a wrapper
+    # that returns a strdup'd locale-encoding string directly so
+    # ``initfsencoding`` succeeds without hitting the codec machinery.
+    import locale as _locale_mod
+    def _py_get_locale_encoding():
+        try:
+            enc = _locale_mod.nl_langinfo(_locale_mod.CODESET) or "utf-8"
+        except OSError:
+            enc = "utf-8"
+        buf = interpreter._make_string(enc)
+        return ctypes.addressof(buf)
+    _py_get_locale_encoding.C_argTypes = None
+    _py_get_locale_encoding.C_resType = ctypes.c_void_p
+    interpreter._func_cache["_static_pylifecycle_get_locale_encoding"] = _py_get_locale_encoding
+
     # Build minimal ``sys.stdout`` / ``sys.stderr`` stubs so the real
     # ``builtin_print`` works.  CPython's normal path sets these via
     # ``init_sys_streams`` (in pylifecycle.c) which imports the ``io``
