@@ -908,114 +908,29 @@ def main(argv):
     _py_get_locale_encoding.C_resType = ctypes.c_void_p
     interpreter._func_cache["_static_pylifecycle_get_locale_encoding"] = _py_get_locale_encoding
 
-    # Build minimal ``sys.stdout`` / ``sys.stderr`` stubs so the real
-    # ``builtin_print`` works.  CPython's normal path sets these via
-    # ``init_sys_streams`` (in pylifecycle.c) which imports the ``io``
-    # module (huge, also depends on importlib).  We skip that and
-    # instead install a ``PyModule`` with ``write`` and ``flush``
-    # methods backed by ctypes callbacks that hit host
-    # ``sys.stdout`` / ``sys.stderr``.  The real ``builtin_print``
-    # then does ``PyFile_WriteObject`` -> ``write(s)`` on these.
-    PyCFunction_NewEx = interpreter.getFunc("PyCFunction_NewEx")
-    PyModule_New = interpreter.getFunc("PyModule_New")
-    PyObject_SetAttrString = interpreter.getFunc("PyObject_SetAttrString")
-    PySys_SetObject = interpreter.getFunc("PySys_SetObject")
-    PyUnicode_AsUTF8 = interpreter.getFunc("PyUnicode_AsUTF8")
-    PyMethodDef_t = interpreter.getCType(state.structs['PyMethodDef'])
-    METH_O = 0x0008
-    METH_NOARGS = 0x0004
-    _none_obj = interpreter.globalScope.getVar("_Py_NoneStruct")
-    _none_addr = ctypes.addressof(_none_obj)
-
-    def _ret_none():
-        # ``Py_RETURN_NONE`` convention: bump refcount and return Py_None.
-        _none_obj.ob_refcnt.value = _none_obj.ob_refcnt.value + 1
-        return _none_addr
-
-    # ctypes signature for ``PyCFunction``:
-    # ``PyObject *(*)(PyObject *self, PyObject *arg)``.
-    _PYCFUNC_T = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
-
-    # Keep ctypes callbacks and PyMethodDef arrays alive for the
-    # lifetime of the interpreter -- the C side stores raw pointers.
-    interpreter._stream_keepalive = []
-
-    def _make_stream_module(name, host_stream):
-        def _do_write(arg_addr):
-            if not arg_addr:
-                return
-            s_addr_ptr = PyUnicode_AsUTF8(ctypes.c_void_p(arg_addr))
-            s_addr = s_addr_ptr.value if hasattr(s_addr_ptr, "value") else int(s_addr_ptr)
-            if not s_addr:
-                interpreter.getFunc("PyErr_Clear")()
-                return
-            host_stream.write(ctypes.string_at(s_addr).decode("utf-8", errors="replace"))
-
-        @_PYCFUNC_T
-        def _write_cb(self_addr, arg_addr):
-            _do_write(arg_addr)
-            return _ret_none()
-
-        @_PYCFUNC_T
-        def _flush_cb(self_addr, arg_addr):
-            host_stream.flush()
-            return _ret_none()
-
-        # PyMethodDef sentinel-terminated array: write, flush, NULL.
-        methods = (PyMethodDef_t * 3)()
-        name_w = interpreter._make_string("write")
-        name_f = interpreter._make_string("flush")
-        BytePtrT = type(methods[0].ml_name)
-        DocPtrT = type(methods[0].ml_doc)
-        MethSlotT = type(methods[0].ml_meth)
-        methods[0].ml_name = ctypes.cast(name_w, BytePtrT)
-        methods[0].ml_meth = ctypes.cast(_write_cb, MethSlotT)
-        methods[0].ml_flags.value = METH_O
-        methods[0].ml_doc = ctypes.cast(0, DocPtrT)
-        methods[1].ml_name = ctypes.cast(name_f, BytePtrT)
-        methods[1].ml_meth = ctypes.cast(_flush_cb, MethSlotT)
-        methods[1].ml_flags.value = METH_NOARGS
-        methods[1].ml_doc = ctypes.cast(0, DocPtrT)
-        # methods[2] zero-initialized = sentinel.
-
-        # Create module object, attach write/flush methods.
-        mod_name_buf = interpreter._make_string(name)
-        mod = PyModule_New(ctypes.cast(mod_name_buf, BytePtrT))
-        for i, mname_buf in [(0, name_w), (1, name_f)]:
-            fn_obj = PyCFunction_NewEx(
-                ctypes.cast(ctypes.addressof(methods[i]),
-                            ctypes.POINTER(PyMethodDef_t)),
-                ctypes.c_void_p(0),
-                ctypes.c_void_p(0))
-            PyObject_SetAttrString(mod, ctypes.cast(mname_buf, BytePtrT), fn_obj)
-
-        # Keep refs alive.
-        interpreter._stream_keepalive.extend(
-            [_write_cb, _flush_cb, methods, name_w, name_f, mod_name_buf])
-        return mod
-
-    def _install_sys_streams():
-        BytePtrT = type(PyMethodDef_t().ml_name)
-        for name, host_stream in [("stdout", sys.stdout), ("stderr", sys.stderr)]:
-            mod = _make_stream_module("<pycpython-%s>" % name, host_stream)
-            key_buf = interpreter._make_string(name)
-            PySys_SetObject(ctypes.cast(key_buf, BytePtrT), mod)
-            interpreter._stream_keepalive.append(key_buf)
-
-    # ``init_sys_streams`` in pylifecycle.c does:
-    #     PyImport_ImportModule("encodings.utf_8")
-    #     PyImport_ImportModule("encodings.latin_1")
-    #     PyImport_ImportModule("builtins")
-    #     PyImport_ImportModule("io")
-    #     ...wrap stdin/stdout/stderr in io.TextIOWrapper...
-    # None of those imports work in our stripped-down init (no
-    # filesystem importer, no compiled io module).  Override with
-    # our Python-level stream-stub installer and return a zero-init
-    # ``_PyInitError`` so the C-side ``_Py_INIT_FAILED(err)`` check
-    # (which tests ``err.msg != NULL``) treats this as success.
+    # ``init_sys_streams`` in pylifecycle.c imports
+    # ``encodings.utf_8`` / ``encodings.latin_1`` / ``io`` and wraps
+    # stdin/stdout/stderr in ``io.TextIOWrapper``.  None of those
+    # imports work in our stripped-down init.  But CPython's earlier
+    # ``_Py_InitializeCore`` already created a ``stdprinter`` for
+    # ``sys.stderr`` / ``sys.__stderr__`` (pylifecycle.c:791) -- a
+    # primitive fd-backed file object whose ``write`` calls libc
+    # write(2) directly, exactly the bootstrap fallback CPython
+    # designed for this situation.  It also provides ``PyStdPrinter_Type``
+    # via ``_Py_ReadyTypes``.  So we can sidestep the io module
+    # entirely: just create the missing ``stdout`` printer the same
+    # way and we're done.  ``__stdin__`` / ``stdin`` we leave unset
+    # (REPL input is read via the C FILE* in ``PyOS_StdioReadline``,
+    # not via ``sys.stdin``).
     _init_error_type = interpreter.getCType(state.typedefs["_PyInitError"])
     def _py_init_sys_streams(interp_ptr):
-        _install_sys_streams()
+        _NewStdPrinter = interpreter.getFunc("PyFile_NewStdPrinter")
+        _SysSetObject = interpreter.getFunc("PySys_SetObject")
+        pstdout = _NewStdPrinter(ctypes.c_int(1))
+        for _name in ("stdout", "__stdout__"):
+            buf = interpreter._make_string(_name)
+            buf_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+            _SysSetObject(buf_ptr, ctypes.cast(pstdout, ctypes.c_void_p))
         return _init_error_type()  # zero-initialized -> _Py_INIT_OK
     _py_init_sys_streams.C_argTypes = None
     _py_init_sys_streams.C_resType = _init_error_type
