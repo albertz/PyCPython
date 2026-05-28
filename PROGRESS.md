@@ -1,9 +1,172 @@
 # Progress notes: making `cpython.py -c "print('hello')"` work
 
-## Current state (2026-05-24)
+## Current state (2026-05-28)
 
-🎉 **`./cpython.py -c "print('hello')"` now prints "hello" and
-exits with status 0** -- via the real interpreted CPython chain:
+🎉 **Interactive REPL works.** Running `./cpython.py` drops into a `>>>`
+prompt; `print(...)`, expression evaluation, `sys.stderr.write`,
+f-strings, list comprehensions, etc. all work end-to-end through the real
+interpreted C chain (tokenizer → parser → AST → compile → ceval). EOF /
+Ctrl-D closes cleanly. See `README.md` for a screencast and `demo.cast`
+for an asciinema recording.
+
+`-c "..."` invocations also work; `cpython.py -c "print('hello')"`
+exits with rc=0 after printing `hello`.
+
+## Round 13 -- REPL works via Parser/myreadline.c (2026-05-28)
+
+Running `./cpython.py` (no args) ought to give an interactive REPL but
+was failing with ``TODO (missing C source code file): PyOS_Readline is
+not loaded yet``.  Root cause: ``Parser/myreadline.c`` was never parsed,
+so ``PyOS_Readline`` had only the header forward decl (no body).
+
+### Fix
+Add one line in ``cpython.py``'s ``parse_cpython``:
+
+```python
+cparser.parse(CPythonDir + "/Parser/myreadline.c", self)
+```
+
+myreadline.c parses cleanly -- no missing wrappers needed -- and
+``PyOS_Readline`` immediately gets a real body that calls
+``PyOS_StdioReadline`` → ``fgets``.
+
+### Verification
+```
+$ printf 'print("hi")\n1+2*3\n[i*i for i in range(6)]\n' | \
+    ./cpython.py -i
+>>> hi
+>>> 7
+>>> [0, 1, 4, 9, 16, 25]
+>>>
+```
+
+## Round 12 -- Replace stream-stub wrapper with stdprinter (2026-05-28)
+
+`sys.__stderr__` was a CPython `stdprinter` (fd-backed file object) even
+though our `_install_sys_streams` had replaced `sys.stderr` with a
+`<pycpython-stderr>` module.  `_Py_InitializeCore` (pylifecycle.c:791)
+already creates a `stdprinter` for stderr early -- exactly the
+bootstrap fallback CPython was designed for.  So we don't need our
+ctypes-callback-based replacement; we just need to create the
+corresponding `stdprinter` for stdout (which CPython doesn't do early).
+
+### Fix
+`_py_init_sys_streams` now just calls `PyFile_NewStdPrinter(1)` and
+sets `sys.stdout` / `sys.__stdout__`.  The stderr `stdprinter` is left
+in place.  Removed ~95 lines of `_make_stream_module` /
+`_install_sys_streams` / `_stream_keepalive` plumbing (ctypes
+callbacks, `PyMethodDef` arrays, `PyCFunction_NewEx` wiring).
+
+Bonus: output now goes through real `write(2)` instead of being
+marshaled back through host Python's `sys.stdout.write()`.
+
+## Round 11 -- Remove `pymain_init_python_main` wrapper (2026-05-27)
+
+The override was a ~40-line Python substitute that bypassed the real
+`_Py_InitializeMainInterpreter`.  Documented as "blocked on fixing the
+importlib bootstrap" but the four lifecycle sub-overrides
+(`init_sys_streams`, `initsite`, `initexternalimport`,
+`get_locale_encoding`) now cover everything the real path needs.
+
+Also discovered: the prior `_wrapped_initext` block was dead code --
+its `if "initexternalimport" in state.funcs:` check was looking up the
+bare name, but auto-scoping had renamed the function to
+`_static_pylifecycle_initexternalimport`.  Replaced with a proper fast
+stub at the renamed name (returns `_Py_INIT_OK` without invoking the
+slow importlib bytecode translation).
+
+With those in place, the real C `pymain_init_python_main` →
+`_Py_InitializeMainInterpreter` chain runs end-to-end.  Removed the
+override entirely.
+
+## Round 10 -- Remove `_PyLong_FromTime_t` wrapper via real pytime.c (2026-05-27)
+
+`_PyLong_FromTime_t` was Python-wrapped because pytime.c wasn't parsed
+(needed `clock_gettime` / `CLOCK_MONOTONIC` / `struct timespec`).  Added
+the missing pieces in `cparser/globalincludewrappers.py`:
+
+- `CHAR_BIT = 8` in `handle_limits_h`.
+- `clockid_t` typedef, `struct tm`, `CLOCK_REALTIME`/`MONOTONIC`/etc.
+  macros, `clock_gettime`/`clock_getres`/`localtime_r`/`gmtime_r` libc
+  bindings in `handle_time_h`.
+- `HAVE_CLOCK_GETTIME = 1` in `cpython.py`'s pyconfig.h setup.
+- Pop the shared `SEC_TO_*` unit macros between pytime.c and
+  faulthandler.c parses (both `#define` them identically).
+
+pytime.c now parses; `_PyLong_FromTime_t` gets a real body; wrapper
+removed.
+
+## Round 9 -- Fix shutdown crashes (2026-05-27)
+
+Three asks in one round:
+
+1.  **`TypeError: incompatible types` on FAM init.**
+    `static PyDictKeysObject empty_keys_struct = { ..., {DKIX_EMPTY,
+    ...} }` initializes a trailing C99 flexible array member with 8
+    bytes.  Our ctypes baseline laid out the FAM as `c_byte * 0` so
+    passing a `c_byte * 8` to the constructor mismatched.  Added
+    `Helpers.make_struct_with_fam(base, elem, N)` which builds a
+    specialized `ctypes.Structure` subclass with the FAM resized.
+    `getAstNode_curlyArrayArgsInit` detects FAM-with-init and uses the
+    specialized class.  `GlobalScope.getVar` notices the post-init
+    type mismatch with the placeholder and rebinds the dict entry to
+    the specialized value.
+
+2.  **Cross-dict `structseq_new` warning.**  A static function
+    (`clinic/structseq.c.h`) collides with a same-named static var
+    (`posixmodule.c`).  Per-TU local lookup already handles the
+    resolution correctly; the warning was a false positive.  Compare
+    `defPos` source files in `_addToParent`'s cross-dict check; only
+    warn if both decls come from the same TU.
+
+3.  **`SEC_TO_US` already defined.**  pytime.c and faulthandler.c both
+    `#define SEC_TO_US` identically.  Pop the eight shared unit-
+    conversion macros between parses.
+
+4.  **`_free: address ... not allocated by us`.**  Discovered after
+    the FAM fix unblocked more shutdown code.  `Py_FinalizeEx` →
+    `PyMem_RawFree(Py_FileSystemDefaultEncoding)` was freeing a buffer
+    our `_py_get_locale_encoding` override had set via `_make_string`
+    (which doesn't register the buffer in `mallocs`).  Changed the
+    override to use `interpreter._malloc()` instead, matching the
+    real CPython contract (the encoding is `_PyMem_RawStrdup`'d and
+    freed at shutdown).
+
+`cpython.py -c "print('hello')"` now exits cleanly with rc=0.
+
+## Round 8 -- Per-TU local lookup for cross-dict shadowing (2026-05-26)
+
+A header `static int foo(void)` in TU-A and a same-named
+`static int foo;` variable in TU-B are SEPARATE C symbols (internal
+linkage), but cparser merges all TUs into one `state.funcs` /
+`state.vars`.  The auto-scoping rename handles same-dict collisions,
+but cross-dict collisions (function in one TU vs. variable in another)
+still strand TU-B's body references on the wrong target (the global
+`getObjInBody` searched `funcs` before `vars` regardless of which TU
+asked).
+
+### Fix
+- New `State._tu_local_lookup: dict[name -> obj]` populated by
+  `_addToParent` whenever a state-level dict entry is newly bound
+  during this parse.
+- `cparser.parse(filename, state)` resets `_tu_local_lookup = {}` on
+  entry, restores on exit.
+- `getObjInBody(state, name)` consults `_tu_local_lookup` FIRST when
+  called on the State itself, before falling through to the global
+  `funcs > typedefs > vars > ...` chain.
+
+This mimics real-C scoping: within a translation unit, an identifier
+resolves to that TU's own decl first.
+
+### Side effect
+The clinic/structseq.c.h vs. posixmodule.c collision (which had been
+"fixed" by a brittle filename-matching heuristic skipping rename for
+clinic headers) is now handled correctly by the principled per-TU
+lookup, and the heuristic was removed.
+
+## Round 7 -- (see original notes below for INT_MIN fix, etc.)
+
+
 
 1. **Tokenizer** (interpreted `Parser/tokenizer.c`) lexes the input.
 2. **Parser** (interpreted `Parser/parser.c` + `parsetok.c`) builds
