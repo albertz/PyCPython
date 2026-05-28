@@ -188,6 +188,7 @@ class CPythonState(cparser.State):
         cparser.parse(CPythonDir + "/Parser/tokenizer.c", self) # PyTokenizer_*
         cparser.parse(CPythonDir + "/Parser/parser.c", self) # PyParser_New, PyParser_AddToken
         cparser.parse(CPythonDir + "/Parser/parsetok.c", self) # PyParser_ParseStringObject
+        cparser.parse(CPythonDir + "/Parser/myreadline.c", self) # PyOS_Readline (interactive REPL)
         cparser.parse(CPythonDir + "/Python/graminit.c", self) # _PyParser_Grammar
         # ``graminit.h`` (transitively included via ``parsetok.c``) defines
         # very generic grammar-symbol names like ``test``, ``expr``,
