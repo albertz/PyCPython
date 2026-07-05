@@ -131,6 +131,15 @@ Look for `_func_cache[...]`:
   the full-body version. Don't break this — the parser will
   otherwise hit `AttributeError: 'NoneType' has no contentlist` on
   enum range queries.
+- **`cwrapper.CStateWrapper` map() booby trap.** `__getattr__` for the
+  wrapped dicts (`funcs`, `vars`, ...) deliberately returns a
+  `CStateDictWrapper` over a *lazy `map()` iterator* — exhausted after
+  the first lookup. "Fixing" it to a list makes the dicts persistently
+  visible and sends cpython.py's `Py_Main` translation into a
+  practically endless loop (>400s vs ~60s). Root cause of that
+  dependency is not understood yet; the cparser test suite does NOT
+  catch it (all 468 pass either way) — only a full `cpython.py -c`
+  run does. See the comment at the site.
 - **`raise Exception` style.** The user dislikes broad
   `try/except Exception:` and `try/except AttributeError:` —
   prefer `hasattr`/type checks. See `CLAUDE.md` for full style notes.
