@@ -3,7 +3,6 @@
 # by Albert Zeyer, 2011
 # code under BSD 2-Clause License
 
-from __future__ import print_function
 
 import argparse
 import os
@@ -21,7 +20,7 @@ import cparser.interpreter
 class CPythonState(cparser.State):
 
     def __init__(self):
-        super(CPythonState, self).__init__()
+        super().__init__()
         self.autoSetupSystemMacros()
         self.autoSetupGlobalIncludeWrappers()
         self.included_files = set()  # type: set[str]
@@ -651,6 +650,7 @@ def register_sigusr1_print_backtrace():
 
     def sigusr1_handler(sig, frame):
         print("--- SIGUSR1 handler")
+        import better_exchook
         better_exchook.print_tb(tb=frame)
 
     import signal
@@ -1165,6 +1165,7 @@ def main(argv):
 
     if args_ns.interactive_py:
         print("Interactive Python mode")
+        import better_exchook
         better_exchook.debug_shell(locals(), globals())
         sys.exit()
 
